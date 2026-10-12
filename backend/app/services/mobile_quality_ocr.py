@@ -17,7 +17,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 from typing import Any
 
-from app.db.sql_helpers import execute, fetchall, retry_on_deadlock
+from app.db.sql_helpers import execute, fetchall
 
 log = logging.getLogger("mobile_quality_ocr")
 OCR_QUALITY_POLICY = "v68-text-likelihood"
@@ -177,103 +177,6 @@ def _video_quality_temp(path: str) -> dict[str, Any]:
     except Exception as exc:
         return {"poor": False, "reason": "video_quality_check_error", "error": str(exc)[:250], "score": None}
 
-_QUALITY_LOCK_CHUNK = 80
-_NOISE_STATUS_SQL = "CASE WHEN ocr_status='pending' THEN 'skipped' ELSE ocr_status END"
-_NATIVE_STATUS_SQL = "CASE WHEN coalesce(ocr_status,'')='done' THEN ocr_status ELSE 'skipped' END"
-
-
-def _lock_artifact_ids(db, ids: list[Any]) -> list[Any]:
-    """Lock artifact rows in id order and skip any row another worker already holds.
-
-    Quality triage and parse used to UPDATE the same job_artifacts tuples in
-    different orders. Postgres then deadlocked on ShareLock: each transaction
-    held rows the other needed, including the jobs row checked by the foreign
-    key. SKIP LOCKED leaves a busy row unchecked so the next batch can retry it.
-    """
-    if not ids:
-        return []
-    ordered = sorted(ids, key=str)
-    rows = fetchall(
-        db,
-        """SELECT id
-           FROM job_artifacts
-           WHERE id = ANY(:ids)
-           ORDER BY id
-           FOR UPDATE SKIP LOCKED""",
-        {"ids": ordered},
-    )
-    return [row["id"] for row in rows]
-
-
-def _mark_uniform_quality(db, ids: list[Any], meta: dict[str, Any], status_sql: str) -> int:
-    """Apply one quality decision without holding a long chain of row locks."""
-    if not ids:
-        return 0
-    ordered = sorted(ids, key=str)
-    payload = json.dumps(meta)
-    written = 0
-
-    def _chunk(slice_ids: list[Any]) -> int:
-        locked = _lock_artifact_ids(db, slice_ids)
-        if not locked:
-            db.commit()
-            return 0
-        execute(
-            db,
-            f"""UPDATE job_artifacts
-                SET metadata=coalesce(metadata,'{{}}'::jsonb) || CAST(:m AS jsonb),
-                    ocr_status={status_sql},
-                    updated_at=NOW()
-                WHERE id = ANY(:ids)""",
-            {"m": payload, "ids": locked},
-        )
-        db.commit()
-        return len(locked)
-
-    for offset in range(0, len(ordered), _QUALITY_LOCK_CHUNK):
-        part = ordered[offset : offset + _QUALITY_LOCK_CHUNK]
-        written += retry_on_deadlock(db, lambda part=part: _chunk(part))
-    return written
-
-
-def _mark_quality_results(db, updates: list[tuple[Any, str, bool]]) -> int:
-    """Write quality outcomes in id order, skipping artifacts parse currently holds."""
-    if not updates:
-        return 0
-    ordered = sorted(updates, key=lambda item: str(item[0]))
-    written = 0
-
-    def _chunk(slice_updates: list[tuple[Any, str, bool]]) -> int:
-        from psycopg2.extras import execute_values
-
-        locked = {str(item) for item in _lock_artifact_ids(db, [item[0] for item in slice_updates])}
-        writable = [item for item in slice_updates if str(item[0]) in locked]
-        if not writable:
-            db.commit()
-            return 0
-        with db.connection().connection.cursor() as cur:
-            execute_values(
-                cur,
-                """UPDATE job_artifacts AS ja
-                   SET metadata=coalesce(ja.metadata,'{}'::jsonb) || v.meta::jsonb,
-                       ocr_status=CASE WHEN v.poor THEN 'pending'
-                                       WHEN lower(coalesce(ja.ocr_status,'')) IN ('pending','na','') THEN 'skipped'
-                                       ELSE ja.ocr_status END,
-                       updated_at=NOW()
-                   FROM (VALUES %s) AS v(id,meta,poor)
-                   WHERE ja.id=v.id::uuid""",
-                writable,
-                page_size=len(writable),
-            )
-        db.commit()
-        return len(writable)
-
-    for offset in range(0, len(ordered), _QUALITY_LOCK_CHUNK):
-        part = ordered[offset : offset + _QUALITY_LOCK_CHUNK]
-        written += retry_on_deadlock(db, lambda part=part: _chunk(part))
-    return written
-
-
 def route_forensic_quality_to_ocr(db, job_id, *, limit=None, dispatch=True):
     """Serialize quality producers across synchronous stages and queued sidecars."""
     from app.services.forensic_serial_pipeline import pipeline_execution_lock, StageWaiting
@@ -319,14 +222,9 @@ def _route_forensic_quality_to_ocr_impl(
     )
     if not rows:
         return {"checked": 0, "queued": 0, "clear": 0, "errors": 0}
-    # Drop the read transaction before taking artifact locks. Holding the
-    # snapshot open while parse updates the same rows is what cycled ShareLock.
-    db.commit()
 
     # Remove known cache/vendor noise before spending CPU/GPU on quality checks.
     candidates: list[dict[str, Any]] = []
-    native_ids: list[Any] = []
-    noise_ids: list[Any] = []
     for row in rows:
         ext = str(row.get("extension") or Path(str(row.get("file_path") or "")).suffix).lower()
         if ext and not ext.startswith("."):
@@ -336,26 +234,23 @@ def _route_forensic_quality_to_ocr_impl(
             try: meta=json.loads(meta)
             except Exception: meta={}
         if ext in _DOC_EXT and _normalized_text_is_usable(meta):
-            native_ids.append(row["id"])
+            execute(db, """UPDATE job_artifacts SET metadata=coalesce(metadata,'{}'::jsonb)||CAST(:m AS jsonb),
+                       ocr_status=CASE WHEN coalesce(ocr_status,'')='done' THEN ocr_status ELSE 'skipped' END, updated_at=NOW() WHERE id=:id""",
+                    {"id":row["id"],"m":json.dumps({"ocr_quality_checked":True,"ocr_quality_bucket":False,"ocr_quality_reason":"native_text_readable"})})
             continue
         if is_ocr_noise_path(str(row.get("file_path") or ""), size_bytes=int(row.get("size_bytes") or 0), extension=ext):
-            noise_ids.append(row["id"])
+            execute(
+                db,
+                """UPDATE job_artifacts SET metadata=coalesce(metadata,'{}'::jsonb) || CAST(:m AS jsonb),
+                       ocr_status=CASE WHEN ocr_status='pending' THEN 'skipped' ELSE ocr_status END,
+                       updated_at=NOW() WHERE id=:id""",
+                {"id": row["id"], "m": json.dumps({"ocr_quality_checked": True, "ocr_quality_bucket": False, "ocr_quality_reason": "known_noise"})},
+            )
             continue
         item = dict(row)
         item["_ext"] = ext
         candidates.append(item)
-    checked = _mark_uniform_quality(
-        db,
-        native_ids,
-        {"ocr_quality_checked": True, "ocr_quality_bucket": False, "ocr_quality_reason": "native_text_readable"},
-        _NATIVE_STATUS_SQL,
-    )
-    checked += _mark_uniform_quality(
-        db,
-        noise_ids,
-        {"ocr_quality_checked": True, "ocr_quality_bucket": False, "ocr_quality_reason": "known_noise"},
-        _NOISE_STATUS_SQL,
-    )
+    db.commit()
 
     # V58: coalesce quality reads by extracted tar.zst shard. The old path
     # called _read_artifact_bytes() once per image/document, which can decompress
@@ -476,9 +371,25 @@ def _route_forensic_quality_to_ocr_impl(
         }
         updates.append((str(row["id"]), json.dumps(meta), poor))
 
-    # One id-ordered write per small chunk. A single unordered UPDATE of the
-    # whole batch deadlocked with parse on job_artifacts ShareLock.
-    checked += _mark_quality_results(db, updates)
+    # V58: one set-based PostgreSQL write per quality batch instead of one
+    # UPDATE statement per evidence item. This matters at 100k+ artifacts.
+    if updates:
+        from psycopg2.extras import execute_values
+        with db.connection().connection.cursor() as cur:
+            execute_values(
+                cur,
+                """UPDATE job_artifacts AS ja
+                   SET metadata=coalesce(ja.metadata,'{}'::jsonb) || v.meta::jsonb,
+                       ocr_status=CASE WHEN v.poor THEN 'pending'
+                                       WHEN lower(coalesce(ja.ocr_status,'')) IN ('pending','na','') THEN 'skipped'
+                                       ELSE ja.ocr_status END,
+                       updated_at=NOW()
+                   FROM (VALUES %s) AS v(id,meta,poor)
+                   WHERE ja.id=v.id::uuid""",
+                updates,
+                page_size=500,
+            )
+    db.commit()
 
     if queued:
         try:
@@ -498,7 +409,7 @@ def _route_forensic_quality_to_ocr_impl(
             except Exception as exc:
                 log.warning("Could not dispatch OCR immediately for %s: %s", job_id, exc)
 
-    return {"checked": checked, "queued": queued, "clear": clear, "errors": errors}
+    return {"checked": len(rows), "queued": queued, "clear": clear, "errors": errors}
 
 
 def route_mobile_quality_to_ocr(db, job_id: str, *, limit: int | None = None, dispatch: bool = True) -> dict[str, int]:

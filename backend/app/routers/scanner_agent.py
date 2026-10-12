@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -20,6 +21,7 @@ from app.services.scanner_agent_jobs import (
     update_job_progress,
 )
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/scanner-agent", tags=["scanner-agent"])
 
 
@@ -202,6 +204,20 @@ def agent_job_progress(
             agent_instance_id=(x_aetheris_agent_instance or agent_instance_id),
         )
         if not updated:
+            # Distinguish absent job from wrong scanner assignment without
+            # disclosing the other scanner ID to the remote agent.
+            row = fetchone(
+                db,
+                "SELECT scanner_id FROM vuln_scan_jobs WHERE id = CAST(:id AS uuid)",
+                {"id": job_id},
+            )
+            log.error(
+                "edge_job_progress_not_found job_id=%s scanner_id=%s firm=%s "
+                "reason=%s agent_instance=%s",
+                job_id, agent.scanner_id, agent.firm_slug,
+                "scanner_mismatch" if row else "absent_in_tenant_schema",
+                x_aetheris_agent_instance or agent_instance_id or "missing",
+            )
             raise HTTPException(
                 status_code=404,
                 detail={"error": {"code": "not_found", "message": "Job not found for this scanner"}},

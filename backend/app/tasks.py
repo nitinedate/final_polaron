@@ -2654,7 +2654,7 @@ def quality_ocr_triage_task(schema_name: str, job_id: str) -> dict:
         # Retire a previous OCR policy in id order. A single UPDATE of every
         # artifact deadlocks with parse, and clearing the policy key made the
         # same rows match again on the next pass.
-        from app.db.sql_helpers import is_retryable_db_error, retry_on_deadlock
+        from app.db.sql_helpers import retry_on_deadlock
 
         def _retire_stale_quality_policy() -> int:
             row = fetchone(
@@ -2693,17 +2693,6 @@ def quality_ocr_triage_task(schema_name: str, job_id: str) -> dict:
             db.rollback()
             quality_ocr_triage_task.apply_async(args=(schema_name, job_id), countdown=2)
             return {'status':'waiting','reason':'Quality triage producer is still writing in'}
-        except Exception as exc:
-            if not is_retryable_db_error(exc):
-                raise
-            # Parse and quality can still cross on the jobs foreign key after the
-            # artifact locks are ordered. Requeue instead of failing the task.
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            quality_ocr_triage_task.apply_async(args=(schema_name, job_id), countdown=3)
-            return {'status':'waiting','reason':'Quality triage hit a database deadlock and will retry'}
         stage = fetchone(
             db,
             """SELECT status FROM pipeline_stage_runs

@@ -208,7 +208,11 @@ def seal_tail_harvest(details: dict[str, Any], host: str, *, reason: str) -> boo
 
 
 def _patch_job_best_effort(api: CentralApi, job_id: str, payload: dict[str, Any]) -> bool | None:
-    """Return True on success, False when the update should be retried, None when the job is gone."""
+    """Return True on success or False on uncertain central state.
+
+    A 404 is not proof of cancellation: routing, tenant schemas and scanner
+    assignment can change during an outage. Preserve local OpenVAS tasks.
+    """
     try:
         api.patch_job(job_id, payload)
         return True
@@ -216,10 +220,11 @@ def _patch_job_best_effort(api: CentralApi, job_id: str, payload: dict[str, Any]
         status = exc.response.status_code if exc.response is not None else 0
         if status == 404:
             log.error(
-                "Central API has no job %s for this scanner; progress cannot be saved",
+                "Central returned 404 for job %s progress; preserving local OpenVAS "
+                "tasks while central job/tenant/ownership is investigated",
                 job_id,
             )
-            return None
+            return False
         log.warning(
             "Central API progress update failed for job %s; scan will continue and retry on the next poll",
             job_id,
@@ -1276,7 +1281,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 last_high_progress_notice = now
 
-        if _patch_job_best_effort(
+        patch_result = _patch_job_best_effort(
             api,
             job_id,
             {
@@ -1287,14 +1292,12 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 "chunk_tasks": _chunk_tasks_blob(),
                 "target_progress": target_progress,
             },
-        ) is None:
-            log.error(
-                "Job %s is not on the central server for this scanner; stopping the local OpenVAS tasks",
-                job_id,
+        )
+        if not patch_result:
+            log.warning(
+                "Central progress for job %s is not confirmed; local OpenVAS "
+                "tasks are preserved and will be polled again", job_id,
             )
-            for tid in list(in_flight.values()):
-                openvas.stop(tid)
-            return
 
         if all_terminal:
             # Re-merge only finished chunks for upload.
