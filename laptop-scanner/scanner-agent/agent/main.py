@@ -1658,7 +1658,19 @@ def main() -> None:
                     )
                     time.sleep(queue_poll)
                     continue
-                log.exception("Dispatcher loop error")
+                # Central outages must not terminate active OpenVAS workers or
+                # flood logs with identical transport tracebacks. Only a
+                # successful claim may launch another local scan.
+                if api.is_retryable(exc):
+                    log.warning(
+                        "Central scanner API temporarily unavailable (%s%s); "
+                        "retaining %d running job(s), will retry",
+                        exc.__class__.__name__,
+                        f" HTTP {status}" if status is not None else "",
+                        len(active),
+                    )
+                else:
+                    log.exception("Dispatcher loop error")
                 time.sleep(queue_poll)
 
 
