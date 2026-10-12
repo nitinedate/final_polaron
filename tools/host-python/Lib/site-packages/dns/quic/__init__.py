@@ -1,6 +1,6 @@
 # Copyright (C) Dnspython Contributors, see LICENSE for text of ISC license
 
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import dns._features
 import dns.asyncbackend
@@ -32,7 +32,7 @@ if dns._features.have("doq"):
     # We have a context factory and a manager factory as for trio we need to have
     # a nursery.
 
-    _async_factories: Dict[str, Tuple[Any, Any]] = {
+    _async_factories: dict[str, tuple[Any, Any]] = {
         "asyncio": (null_factory, _asyncio_manager_factory)
     }
 
@@ -60,19 +60,19 @@ if dns._features.have("doq"):
 else:  # pragma: no cover
     have_quic = False
 
-    class AsyncQuicStream:  # type: ignore
+    class AsyncQuicStream:  # pyright: ignore
         pass
 
-    class AsyncQuicConnection:  # type: ignore
+    class AsyncQuicConnection:  # pyright: ignore
         async def make_stream(self) -> Any:
             raise NotImplementedError
 
-    class SyncQuicStream:  # type: ignore
+    class SyncQuicStream:  # pyright: ignore
         pass
 
-    class SyncQuicConnection:  # type: ignore
+    class SyncQuicConnection:  # pyright: ignore
         def make_stream(self) -> Any:
             raise NotImplementedError
 
 
-Headers = List[Tuple[bytes, bytes]]
+Headers = list[tuple[bytes, bytes]]

@@ -67,7 +67,7 @@ class Set:
 
     def pop(self):
         """Remove an arbitrary item from the set."""
-        (k, _) = self.items.popitem()
+        k, _ = self.items.popitem()
         return k
 
     def _clone(self) -> "Set":
@@ -84,10 +84,10 @@ class Set:
         """
 
         if hasattr(self, "_clone_class"):
-            cls = self._clone_class  # type: ignore
+            cls = self._clone_class  # pyright: ignore
         else:
             cls = self.__class__
-        obj = cls.__new__(cls)
+        obj = cls.__new__(cls)  # type: ignore
         obj.items = dict()
         obj.items.update(self.items)
         return obj
@@ -276,7 +276,7 @@ class Set:
     def issubset(self, other):
         """Is this set a subset of *other*?
 
-        Returns a ``bool``.
+        :rtype: bool
         """
 
         if not isinstance(other, Set):
@@ -289,7 +289,7 @@ class Set:
     def issuperset(self, other):
         """Is this set a superset of *other*?
 
-        Returns a ``bool``.
+        :rtype: bool
         """
 
         if not isinstance(other, Set):

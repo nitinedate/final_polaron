@@ -260,7 +260,7 @@ $script:AcquireJobs = @{}
 $script:RefreshStatusFile = Join-Path $env:TEMP ("aetheris_drive_refresh_{0}.json" -f $PID)
 $script:RefreshProcess = $null
 $refreshJobScript = Join-Path $root "scripts\refresh-drive-mounts-job.ps1"
-$script:HelperVersion = "5.50"
+$script:HelperVersion = "5.51"
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -1686,13 +1686,21 @@ function Get-ConnectedMobileDevices-LegacyUnused {
 }
 
 function Get-WorkstationDriveVolumes {
-    if ($script:DriveCache -and ((Get-Date) - $script:DriveCacheAt).TotalSeconds -lt 8) {
+    $cacheFresh = $script:DriveCache -and ((Get-Date) - $script:DriveCacheAt).TotalSeconds -lt 3
+    if ($cacheFresh) {
+        $stateFile = Join-Path $env:LOCALAPPDATA "Aetheris\helper-drive-letters.txt"
+        if (Test-Path -LiteralPath $stateFile) {
+            $stateWrite = (Get-Item -LiteralPath $stateFile).LastWriteTime
+            if ($stateWrite -gt $script:DriveCacheAt) { $cacheFresh = $false }
+        }
+    }
+    if ($cacheFresh) {
         return $script:DriveCache
     }
     $byLetter = @{}
 
     function Add-DetectedVolume {
-        param($Letter, $Label = '', $DriveType = 'fixed', $Size = 0, $Free = 0, $FileSystem = '')
+        param($Letter, $Label = '', $DriveType = '', $Size = 0, $Free = 0, $FileSystem = '')
         $L = ("$Letter").Trim().TrimEnd(':').ToUpper()
         if ($L -notmatch '^[A-Z]$') { return }
         if (-not $byLetter.ContainsKey($L)) {
@@ -1758,6 +1766,33 @@ function Get-WorkstationDriveVolumes {
             -DriveType $(if ($info) { [string]$info.DriveType.ToString().ToLower() } else { 'other' }) `
             -Size $(if ($info -and $info.IsReady) { [int64]$info.TotalSize } else { 0 }) `
             -Free $(if ($info -and $info.IsReady) { [int64]$info.TotalFreeSpace } else { 0 })
+    }
+
+    # USB enclosures often report DriveType=Fixed. BusType is what makes an
+    # external HDD/SSD/pendrive distinct from an internal disk.
+    try {
+        $diskByNumber = @{}
+        Get-Disk -ErrorAction SilentlyContinue | ForEach-Object {
+            $diskByNumber[[string]$_.Number] = $_
+        }
+        Get-Partition -ErrorAction SilentlyContinue |
+            Where-Object { $_.DriveLetter -and "$($_.DriveLetter)" -match '^[A-Z]$' } |
+            ForEach-Object {
+                $L = "$($_.DriveLetter)".Trim().ToUpper()
+                if (-not $byLetter.ContainsKey($L)) { return }
+                $disk = $diskByNumber[[string]$_.DiskNumber]
+                if (-not $disk) { return }
+                $bus = ([string]$disk.BusType).ToLower()
+                $media = ([string]$disk.MediaType).ToLower()
+                $row = $byLetter[$L]
+                if ($bus) { $row.bus_type = $bus }
+                if ($media -eq 'ssd' -or $media -eq 'hdd') { $row.media_type = $media }
+                if ($bus -in @('usb', '1394', 'sd')) { $row.external = $true }
+            }
+    }
+    catch { }
+    foreach ($key in @($byLetter.Keys)) {
+        if ($byLetter[$key].drive_type -eq 'removable') { $byLetter[$key].external = $true }
     }
 
     $script:DriveCache = @($byLetter.Values | Sort-Object { $_.letter })

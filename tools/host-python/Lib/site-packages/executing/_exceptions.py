@@ -1,4 +1,3 @@
-
 class KnownIssue(Exception):
     """
     Raised in case of an known problem. Mostly because of cpython bugs.
@@ -14,9 +13,8 @@ class VerifierFailure(Exception):
     Executing.node gets set to None in this case.
     """
 
-    def __init__(self, title, node, instruction):
-        # type: (object, object, object) -> None
+    def __init__(self, title: object, node: object, instruction: object) -> None:
         self.node = node
         self.instruction = instruction
 
-        super().__init__(title) # type: ignore[call-arg]
+        super().__init__(title)  # type: ignore[call-arg]

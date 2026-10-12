@@ -50,8 +50,8 @@ class NAPTR(dns.rdata.Rdata):
         self.preference = self._as_uint16(preference)
         self.replacement = self._as_name(replacement)
 
-    def to_text(self, origin=None, relativize=True, **kw):
-        replacement = self.replacement.choose_relativity(origin, relativize)
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
+        replacement = self.replacement.to_styled_text(style)
         return (
             f"{self.order} {self.preference} "
             f'"{dns.rdata._escapify(self.flags)}" '
@@ -66,9 +66,9 @@ class NAPTR(dns.rdata.Rdata):
     ):
         order = tok.get_uint16()
         preference = tok.get_uint16()
-        flags = tok.get_string()
-        service = tok.get_string()
-        regexp = tok.get_string()
+        flags = tok.get_bytes(max_length=255)
+        service = tok.get_bytes(max_length=255)
+        regexp = tok.get_bytes(max_length=255)
         replacement = tok.get_name(origin, relativize, relativize_to)
         return cls(
             rdclass, rdtype, order, preference, flags, service, regexp, replacement
@@ -80,11 +80,11 @@ class NAPTR(dns.rdata.Rdata):
         _write_string(file, self.flags)
         _write_string(file, self.service)
         _write_string(file, self.regexp)
-        self.replacement.to_wire(file, compress, origin, canonicalize)
+        self.replacement.to_wire(file, None, origin, canonicalize)
 
     @classmethod
     def from_wire_parser(cls, rdclass, rdtype, parser, origin=None):
-        (order, preference) = parser.get_struct("!HH")
+        order, preference = parser.get_struct("!HH")
         strings = []
         for _ in range(3):
             s = parser.get_counted_bytes()

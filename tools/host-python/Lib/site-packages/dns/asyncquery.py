@@ -19,13 +19,15 @@
 
 import base64
 import contextlib
+import os
 import random
 import socket
 import struct
 import time
 import urllib.parse
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, cast
 
+import dns._file_util
 import dns.asyncbackend
 import dns.exception
 import dns.inet
@@ -54,10 +56,10 @@ from dns.query import (
 try:
     import ssl
 except ImportError:
-    import dns._no_ssl as ssl  # type: ignore
+    import dns._no_ssl as ssl  # pyright: ignore
 
 if have_doh:
-    import httpx
+    import httpx2
 
 # for brevity
 _lltuple = dns.inet.low_level_address_tuple
@@ -93,22 +95,21 @@ async def send_udp(
     what: dns.message.Message | bytes,
     destination: Any,
     expiration: float | None = None,
-) -> Tuple[int, float]:
+) -> tuple[int, float]:
     """Send a DNS message to the specified UDP socket.
 
-    *sock*, a ``dns.asyncbackend.DatagramSocket``.
-
-    *what*, a ``bytes`` or ``dns.message.Message``, the message to send.
-
-    *destination*, a destination tuple appropriate for the address family
-    of the socket, specifying where to send the query.
-
-    *expiration*, a ``float`` or ``None``, the absolute time at which
-    a timeout exception should be raised.  If ``None``, no timeout will
-    occur.  The expiration value is meaningless for the asyncio backend, as
-    asyncio's transport sendto() never blocks.
-
-    Returns an ``(int, float)`` tuple of bytes sent and the sent time.
+    :param sock: The socket to use.
+    :type sock: :py:class:`dns.asyncbackend.DatagramSocket`
+    :param what: The message to send.
+    :type what: bytes or :py:class:`dns.message.Message`
+    :param destination: A destination tuple appropriate for the address
+        family of the socket.
+    :param expiration: The absolute time at which to raise a timeout
+        exception.  ``None`` means no timeout (and is meaningless for the
+        asyncio backend, as ``sendto()`` never blocks there).
+    :type expiration: float or ``None``
+    :returns: A ``(bytes_sent, sent_time)`` tuple.
+    :rtype: tuple[int, float]
     """
 
     if isinstance(what, dns.message.Message):
@@ -124,7 +125,7 @@ async def receive_udp(
     expiration: float | None = None,
     ignore_unexpected: bool = False,
     one_rr_per_rrset: bool = False,
-    keyring: Dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
     request_mac: bytes | None = b"",
     ignore_trailing: bool = False,
     raise_on_truncation: bool = False,
@@ -133,18 +134,19 @@ async def receive_udp(
 ) -> Any:
     """Read a DNS message from a UDP socket.
 
-    *sock*, a ``dns.asyncbackend.DatagramSocket``.
+    :param sock: The socket to read from.
+    :type sock: :py:class:`dns.asyncbackend.DatagramSocket`
 
-    See :py:func:`dns.query.receive_udp()` for the documentation of the other
-    parameters, and exceptions.
+    See :py:func:`dns.query.receive_udp` for the documentation of the other
+    parameters and exceptions.
 
-    Returns a ``(dns.message.Message, float, tuple)`` tuple of the received message, the
-    received time, and the address where the message arrived from.
+    :returns: A ``(message, received_time, from_address)`` tuple.
+    :rtype: tuple
     """
 
     wire = b""
     while True:
-        (wire, from_address) = await sock.recvfrom(65535, _timeout(expiration))
+        wire, from_address = await sock.recvfrom(65535, _timeout(expiration))
         if not _matches_destination(
             sock.family, from_address, destination, ignore_unexpected
         ):
@@ -196,19 +198,19 @@ async def udp(
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via UDP.
 
-    *sock*, a ``dns.asyncbackend.DatagramSocket``, or ``None``,
-    the socket to use for the query.  If ``None``, the default, a
-    socket is created.  Note that if a socket is provided, the
-    *source*, *source_port*, and *backend* are ignored.
-
-    *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-    the default, then dnspython will use the default backend.
+    :param sock: The socket to use. If ``None`` (the default), a socket is
+        created. Note that if a socket is provided, *source*, *source_port*,
+        and *backend* are ignored.
+    :type sock: :py:class:`dns.asyncbackend.DatagramSocket` or ``None``
+    :param backend: The async backend. If ``None`` (the default), dnspython
+        will use the default backend.
+    :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.udp()` for the documentation of the other
     parameters, exceptions, and return type of this method.
     """
     wire = q.to_wire()
-    (begin_time, expiration) = _compute_times(timeout)
+    begin_time, expiration = _compute_times(timeout)
     af = dns.inet.af_for_address(where)
     destination = _lltuple((where, port), af)
     if sock:
@@ -224,7 +226,7 @@ async def udp(
         cm = await backend.make_socket(af, socket.SOCK_DGRAM, 0, stuple, dtuple)
     async with cm as s:
         await send_udp(s, wire, destination, expiration)  # pyright: ignore
-        (r, received_time, _) = await receive_udp(
+        r, received_time, _ = await receive_udp(
             s,  # pyright: ignore
             destination,
             expiration,
@@ -259,22 +261,22 @@ async def udp_with_fallback(
     tcp_sock: dns.asyncbackend.StreamSocket | None = None,
     backend: dns.asyncbackend.Backend | None = None,
     ignore_errors: bool = False,
-) -> Tuple[dns.message.Message, bool]:
+) -> tuple[dns.message.Message, bool]:
     """Return the response to the query, trying UDP first and falling back
     to TCP if UDP results in a truncated response.
 
-    *udp_sock*, a ``dns.asyncbackend.DatagramSocket``, or ``None``,
-    the socket to use for the UDP query.  If ``None``, the default, a
-    socket is created.  Note that if a socket is provided the *source*,
-    *source_port*, and *backend* are ignored for the UDP query.
-
-    *tcp_sock*, a ``dns.asyncbackend.StreamSocket``, or ``None``, the
-    socket to use for the TCP query.  If ``None``, the default, a
-    socket is created.  Note that if a socket is provided *where*,
-    *source*, *source_port*, and *backend*  are ignored for the TCP query.
-
-    *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-    the default, then dnspython will use the default backend.
+    :param udp_sock: The socket to use for the UDP query. If ``None``
+        (the default), a socket is created. Note that if a socket is provided,
+        *source*, *source_port*, and *backend* are ignored for the UDP query.
+    :type udp_sock: :py:class:`dns.asyncbackend.DatagramSocket` or ``None``
+    :param tcp_sock: The socket to use for the TCP query. If ``None``
+        (the default), a socket is created. Note that if a socket is provided,
+        *where*, *source*, *source_port*, and *backend* are ignored for the
+        TCP query.
+    :type tcp_sock: :py:class:`dns.asyncbackend.StreamSocket` or ``None``
+    :param backend: The async backend. If ``None`` (the default), dnspython
+        will use the default backend.
+    :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.udp_with_fallback()` for the documentation
     of the other parameters, exceptions, and return type of this
@@ -317,10 +319,11 @@ async def send_tcp(
     sock: dns.asyncbackend.StreamSocket,
     what: dns.message.Message | bytes,
     expiration: float | None = None,
-) -> Tuple[int, float]:
+) -> tuple[int, float]:
     """Send a DNS message to the specified TCP socket.
 
-    *sock*, a ``dns.asyncbackend.StreamSocket``.
+    :param sock: The socket to use.
+    :type sock: :py:class:`dns.asyncbackend.StreamSocket`
 
     See :py:func:`dns.query.send_tcp()` for the documentation of the other
     parameters, exceptions, and return type of this method.
@@ -356,13 +359,14 @@ async def receive_tcp(
     sock: dns.asyncbackend.StreamSocket,
     expiration: float | None = None,
     one_rr_per_rrset: bool = False,
-    keyring: Dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
     request_mac: bytes | None = b"",
     ignore_trailing: bool = False,
-) -> Tuple[dns.message.Message, float]:
+) -> tuple[dns.message.Message, float]:
     """Read a DNS message from a TCP socket.
 
-    *sock*, a ``dns.asyncbackend.StreamSocket``.
+    :param sock: The socket to use.
+    :type sock: :py:class:`dns.asyncbackend.StreamSocket`
 
     See :py:func:`dns.query.receive_tcp()` for the documentation of the other
     parameters, exceptions, and return type of this method.
@@ -396,20 +400,20 @@ async def tcp(
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via TCP.
 
-    *sock*, a ``dns.asyncbacket.StreamSocket``, or ``None``, the
-    socket to use for the query.  If ``None``, the default, a socket
-    is created.  Note that if a socket is provided
-    *where*, *port*, *source*, *source_port*, and *backend* are ignored.
-
-    *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-    the default, then dnspython will use the default backend.
+    :param sock: The socket to use. If ``None`` (the default), a socket is
+        created. Note that if a socket is provided, *where*, *port*,
+        *source*, *source_port*, and *backend* are ignored.
+    :type sock: :py:class:`dns.asyncbackend.StreamSocket` or ``None``
+    :param backend: The async backend. If ``None`` (the default), dnspython
+        will use the default backend.
+    :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.tcp()` for the documentation of the other
     parameters, exceptions, and return type of this method.
     """
 
     wire = q.to_wire()
-    (begin_time, expiration) = _compute_times(timeout)
+    begin_time, expiration = _compute_times(timeout)
     if sock:
         # Verify that the socket is connected, as if it's not connected,
         # it's not writable, and the polling in send_tcp() will time out or
@@ -429,7 +433,7 @@ async def tcp(
         )
     async with cm as s:
         await send_tcp(s, wire, expiration)  # pyright: ignore
-        (r, received_time) = await receive_tcp(
+        r, received_time = await receive_tcp(
             s,  # pyright: ignore
             expiration,
             one_rr_per_rrset,
@@ -456,24 +460,23 @@ async def tls(
     backend: dns.asyncbackend.Backend | None = None,
     ssl_context: ssl.SSLContext | None = None,
     server_hostname: str | None = None,
-    verify: bool | str = True,
+    verify: bool | str | os.PathLike = True,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via TLS.
 
-    *sock*, an ``asyncbackend.StreamSocket``, or ``None``, the socket
-    to use for the query.  If ``None``, the default, a socket is
-    created.  Note that if a socket is provided, it must be a
-    connected SSL stream socket, and *where*, *port*,
-    *source*, *source_port*, *backend*, *ssl_context*, and *server_hostname*
-    are ignored.
-
-    *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-    the default, then dnspython will use the default backend.
+    :param sock: The socket to use. If ``None`` (the default), a socket is
+        created. Note that if a socket is provided, it must be a connected
+        SSL stream socket, and *where*, *port*, *source*, *source_port*,
+        *backend*, *ssl_context*, and *server_hostname* are ignored.
+    :type sock: :py:class:`dns.asyncbackend.StreamSocket` or ``None``
+    :param backend: The async backend. If ``None`` (the default), dnspython
+        will use the default backend.
+    :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.tls()` for the documentation of the other
     parameters, exceptions, and return type of this method.
     """
-    (begin_time, expiration) = _compute_times(timeout)
+    begin_time, expiration = _compute_times(timeout)
     if sock:
         cm: contextlib.AbstractAsyncContextManager = NullContext(sock)
     else:
@@ -514,7 +517,7 @@ async def tls(
 
 
 def _maybe_get_resolver(
-    resolver: Optional["dns.asyncresolver.Resolver"],  # pyright: ignore
+    resolver: "dns.asyncresolver.Resolver | None",  # pyright: ignore
 ) -> "dns.asyncresolver.Resolver":  # pyright: ignore
     # We need a separate method for this to avoid overriding the global
     # variable "dns" with the as-yet undefined local variable "dns"
@@ -536,27 +539,29 @@ async def https(
     source_port: int = 0,  # pylint: disable=W0613
     one_rr_per_rrset: bool = False,
     ignore_trailing: bool = False,
-    client: Optional["httpx.AsyncClient|dns.quic.AsyncQuicConnection"] = None,
+    client: "httpx2.AsyncClient|dns.quic.AsyncQuicConnection | None" = None,
     path: str = "/dns-query",
     post: bool = True,
-    verify: bool | str | ssl.SSLContext = True,
+    verify: bool | str | os.PathLike | ssl.SSLContext = True,
     bootstrap_address: str | None = None,
-    resolver: Optional["dns.asyncresolver.Resolver"] = None,  # pyright: ignore
+    resolver: "dns.asyncresolver.Resolver | None" = None,  # pyright: ignore
     family: int = socket.AF_UNSPEC,
     http_version: HTTPVersion = HTTPVersion.DEFAULT,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via DNS-over-HTTPS.
 
-    *client*, a ``httpx.AsyncClient``.  If provided, the client to use for
-    the query.
-
-    Unlike the other dnspython async functions, a backend cannot be provided
-    in this function because httpx always auto-detects the async backend.
+    :param client: If provided, the client to use for the query. Unlike the
+        other dnspython async functions, a backend cannot be provided here
+        because httpx2 always auto-detects the async backend.
+    :type client: ``httpx2.AsyncClient`` or ``None``
 
     See :py:func:`dns.query.https()` for the documentation of the other
     parameters, exceptions, and return type of this method.
     """
 
+    verify_filename = dns._file_util.as_filename(verify)
+    if verify_filename is not None:
+        verify = verify_filename
     try:
         af = dns.inet.af_for_address(where)
     except ValueError:
@@ -614,8 +619,8 @@ async def https(
     if not have_doh:
         raise NoDOH  # pragma: no cover
     # pylint: disable=possibly-used-before-assignment
-    if client and not isinstance(client, httpx.AsyncClient):  # pyright: ignore
-        raise ValueError("client parameter must be an httpx.AsyncClient")
+    if client and not isinstance(client, httpx2.AsyncClient):  # pyright: ignore
+        raise ValueError("client parameter must be an httpx2.AsyncClient")
     # pylint: enable=possibly-used-before-assignment
 
     wire = q.to_wire()
@@ -647,7 +652,7 @@ async def https(
             family=family,
         )
 
-        cm = httpx.AsyncClient(  # pyright: ignore
+        cm = httpx2.AsyncClient(  # pyright: ignore
             http1=h1, http2=h2, verify=verify, transport=transport  # type: ignore
         )
 
@@ -672,7 +677,7 @@ async def https(
             )
         else:
             wire = base64.urlsafe_b64encode(wire).rstrip(b"=")
-            twire = wire.decode()  # httpx does a repr() if we give it bytes
+            twire = wire.decode()  # httpx2 does a repr() if we give it bytes
             response = await backend.wait_for(
                 the_client.get(  # pyright: ignore
                     url,
@@ -713,7 +718,7 @@ async def _http3(
     source_port: int = 0,
     one_rr_per_rrset: bool = False,
     ignore_trailing: bool = False,
-    verify: bool | str | ssl.SSLContext = True,
+    verify: bool | str | os.PathLike | ssl.SSLContext = True,
     backend: dns.asyncbackend.Backend | None = None,
     post: bool = True,
     connection: dns.quic.AsyncQuicConnection | None = None,
@@ -734,7 +739,7 @@ async def _http3(
         cfactory = dns.quic.null_factory
         mfactory = dns.quic.null_factory
     else:
-        (cfactory, mfactory) = dns.quic.factories_for_backend(backend)
+        cfactory, mfactory = dns.quic.factories_for_backend(backend)
 
     async with cfactory() as context:
         async with mfactory(
@@ -746,8 +751,8 @@ async def _http3(
                 the_connection = the_manager.connect(  # pyright: ignore
                     where, port, source, source_port
                 )
-            (start, expiration) = _compute_times(timeout)
-            stream = await the_connection.make_stream(timeout)  # pyright: ignore
+            start, expiration = _compute_times(timeout)
+            stream = await the_connection.make_stream(timeout)  # type: ignore
             async with stream:
                 # note that send_h3() does not need await
                 stream.send_h3(url, wire, post)
@@ -777,7 +782,7 @@ async def quic(
     one_rr_per_rrset: bool = False,
     ignore_trailing: bool = False,
     connection: dns.quic.AsyncQuicConnection | None = None,
-    verify: bool | str = True,
+    verify: bool | str | os.PathLike = True,
     backend: dns.asyncbackend.Backend | None = None,
     hostname: str | None = None,
     server_hostname: str | None = None,
@@ -785,8 +790,9 @@ async def quic(
     """Return the response obtained after sending an asynchronous query via
     DNS-over-QUIC.
 
-    *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-    the default, then dnspython will use the default backend.
+    :param backend: The async backend. If ``None`` (the default), dnspython
+        will use the default backend.
+    :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.quic()` for the documentation of the other
     parameters, exceptions, and return type of this method.
@@ -806,7 +812,7 @@ async def quic(
         mfactory = dns.quic.null_factory
         the_connection = connection
     else:
-        (cfactory, mfactory) = dns.quic.factories_for_backend(backend)
+        cfactory, mfactory = dns.quic.factories_for_backend(backend)
 
     async with cfactory() as context:
         async with mfactory(
@@ -818,8 +824,8 @@ async def quic(
                 the_connection = the_manager.connect(  # pyright: ignore
                     where, port, source, source_port
                 )
-            (start, expiration) = _compute_times(timeout)
-            stream = await the_connection.make_stream(timeout)  # pyright: ignore
+            start, expiration = _compute_times(timeout)
+            stream = await the_connection.make_stream(timeout)  # type: ignore
             async with stream:
                 await stream.send(wire, True)
                 wire = await stream.receive(_remaining(expiration))
@@ -843,7 +849,8 @@ async def _inbound_xfr(
     query: dns.message.Message,
     serial: int | None,
     timeout: float | None,
-    expiration: float,
+    expiration: float | None,
+    raise_on_serial_went_backwards: bool,
 ) -> Any:
     """Given a socket, does the zone transfer."""
     rdtype = query.question[0].rdtype
@@ -858,19 +865,20 @@ async def _inbound_xfr(
         tcp_sock = cast(dns.asyncbackend.StreamSocket, s)
         tcpmsg = struct.pack("!H", len(wire)) + wire
         await tcp_sock.sendall(tcpmsg, expiration)
-    with dns.xfr.Inbound(txn_manager, rdtype, serial, is_udp) as inbound:
+    with dns.xfr.Inbound(
+        txn_manager, rdtype, serial, is_udp, raise_on_serial_went_backwards
+    ) as inbound:
         done = False
         tsig_ctx = None
-        r: dns.message.Message | None = None
         while not done:
-            (_, mexpiration) = _compute_times(timeout)
+            _, mexpiration = _compute_times(timeout)
             if mexpiration is None or (
                 expiration is not None and mexpiration > expiration
             ):
                 mexpiration = expiration
             if is_udp:
                 timeout = _timeout(mexpiration)
-                (rwire, _) = await udp_sock.recvfrom(65535, timeout)  # pyright: ignore
+                rwire, _ = await udp_sock.recvfrom(65535, timeout)  # pyright: ignore
             else:
                 ldata = await _read_exactly(tcp_sock, 2, mexpiration)  # pyright: ignore
                 (l,) = struct.unpack("!H", ldata)
@@ -888,8 +896,6 @@ async def _inbound_xfr(
             done = inbound.process_message(r)
             yield r
             tsig_ctx = r.tsig_ctx
-        if query.keyring and r is not None and not r.had_tsig:
-            raise dns.exception.FormError("missing TSIG")
 
 
 async def inbound_xfr(
@@ -903,18 +909,20 @@ async def inbound_xfr(
     source_port: int = 0,
     udp_mode: UDPMode = UDPMode.NEVER,
     backend: dns.asyncbackend.Backend | None = None,
+    raise_on_serial_went_backwards: bool = True,
 ) -> None:
     """Conduct an inbound transfer and apply it via a transaction from the
     txn_manager.
 
-    *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-    the default, then dnspython will use the default backend.
+    :param backend: The async backend. If ``None`` (the default), dnspython
+        will use the default backend.
+    :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
     See :py:func:`dns.query.inbound_xfr()` for the documentation of
     the other parameters, exceptions, and return type of this method.
     """
     if query is None:
-        (query, serial) = dns.xfr.make_query(txn_manager)
+        query, serial = dns.xfr.make_query(txn_manager)
     else:
         serial = dns.xfr.extract_serial_from_query(query)
     af = dns.inet.af_for_address(where)
@@ -922,7 +930,7 @@ async def inbound_xfr(
     dtuple = (where, port)
     if not backend:
         backend = dns.asyncbackend.get_default_backend()
-    (_, expiration) = _compute_times(lifetime)
+    _, expiration = _compute_times(lifetime)
     if query.question[0].rdtype == dns.rdatatype.IXFR and udp_mode != UDPMode.NEVER:
         s = await backend.make_socket(
             af, socket.SOCK_DGRAM, 0, stuple, dtuple, _timeout(expiration)
@@ -935,7 +943,8 @@ async def inbound_xfr(
                     query,
                     serial,
                     timeout,
-                    expiration,  # pyright: ignore
+                    expiration,  # pyright: ignore,
+                    raise_on_serial_went_backwards,
                 ):
                     pass
                 return
@@ -948,6 +957,12 @@ async def inbound_xfr(
     )
     async with s:
         async for _ in _inbound_xfr(  # pyright: ignore
-            txn_manager, s, query, serial, timeout, expiration  # pyright: ignore
+            txn_manager,
+            s,
+            query,
+            serial,
+            timeout,
+            expiration,  # pyright: ignore
+            raise_on_serial_went_backwards,
         ):
             pass

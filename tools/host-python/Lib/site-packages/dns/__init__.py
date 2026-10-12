@@ -53,6 +53,7 @@ __all__ = [
     "rrset",
     "serial",
     "set",
+    "style",
     "tokenizer",
     "transaction",
     "tsig",
@@ -63,10 +64,11 @@ __all__ = [
     "version",
     "versioned",
     "wire",
+    "wirebase",
     "xfr",
     "zone",
-    "zonetypes",
     "zonefile",
+    "zonetypes",
 ]
 
 from dns.version import version as __version__  # noqa

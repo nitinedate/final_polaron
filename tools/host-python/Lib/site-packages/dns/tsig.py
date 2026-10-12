@@ -199,6 +199,7 @@ class HMACTSig:
         # defer to the HMAC digest() function for that digestmod
         digest = self.hmac_context.digest()
         if self.size:
+            assert isinstance(self.size, int)
             digest = digest[: (self.size // 8)]
         return digest
 
@@ -302,14 +303,14 @@ def validate(
             raise PeerBadTruncation
         else:
             raise PeerError(f"unknown TSIG error code {rdata.error}")
-    if abs(rdata.time_signed - now) > rdata.fudge:
-        raise BadTime
     if key.name != owner:
         raise BadKey
     if key.algorithm != rdata.algorithm:
         raise BadAlgorithm
     ctx = _digest(new_wire, key, rdata, None, request_mac, ctx, multi)
     ctx.verify(rdata.mac)
+    if abs(rdata.time_signed - now) > rdata.fudge:
+        raise BadTime
     return _maybe_start_digest(key, rdata.mac, multi)
 
 

@@ -19,7 +19,8 @@
 
 import re
 import sys
-from typing import Any, Iterable, List, Set, Tuple, cast
+from collections.abc import Iterable
+from typing import Any, cast
 
 import dns.exception
 import dns.grange
@@ -66,7 +67,7 @@ def _check_cname_and_other_data(txn, name, rdataset):
     # adding the rdataset is ok
 
 
-SavedStateType = Tuple[
+SavedStateType = tuple[
     dns.tokenizer.Tokenizer,
     dns.name.Name | None,  # current_origin
     dns.name.Name | None,  # last_name
@@ -74,8 +75,9 @@ SavedStateType = Tuple[
     int,  # last_ttl
     bool,  # last_ttl_known
     int,  # default_ttl
-    bool,
-]  # default_ttl_known
+    bool,  # default_ttl_known
+    bool,  # default_ttl_from_soa
+]
 
 
 def _upper_dollarize(s):
@@ -100,12 +102,15 @@ class Reader:
         force_rdclass: dns.rdataclass.RdataClass | None = None,
         force_rdtype: dns.rdatatype.RdataType | None = None,
         default_ttl: int | None = None,
+        rfc2308_ttl: bool = True,
     ):
         self.tok = tok
-        (self.zone_origin, self.relativize, _) = txn.manager.origin_information()
+        self.zone_origin, self.relativize, _ = txn.manager.origin_information()
         self.current_origin = self.zone_origin
         self.last_ttl = 0
         self.last_ttl_known = False
+        self.rfc2308_ttl = rfc2308_ttl
+        self.default_ttl_from_soa = False
         if force_ttl is not None:
             default_ttl = force_ttl
         if default_ttl is None:
@@ -117,11 +122,11 @@ class Reader:
         self.last_name = self.current_origin
         self.zone_rdclass = rdclass
         self.txn = txn
-        self.saved_state: List[SavedStateType] = []
+        self.saved_state: list[SavedStateType] = []
         self.current_file: Any | None = None
-        self.allowed_directives: Set[str]
+        self.allowed_directives: set[str]
         if allow_directives is True:
-            self.allowed_directives = {"$GENERATE", "$ORIGIN", "$TTL"}
+            self.allowed_directives = {"$GENERATE", "$ORIGIN", "$TTL", "$UNICODE"}
             if allow_include:
                 self.allowed_directives.add("$INCLUDE")
         elif allow_directives is False:
@@ -150,9 +155,31 @@ class Reader:
             raise dns.exception.SyntaxError
         return token
 
-    def _rr_line(self):
+    def _implicit_ttl(self) -> int | None:
+        """Return the TTL to use for a record which did not specify one, or
+        ``None`` if no TTL can be determined yet.
+
+        An explicit default (from ``$TTL``, or from the *default_ttl* /
+        *force_ttl* constructor parameters) always wins.  Otherwise, in
+        ``rfc2308_ttl`` mode, the most recently stated TTL (RFC 1035 section
+        5.1) is preferred over a default synthesized from the SOA MINIMUM
+        field, whose overloaded "default TTL" meaning RFC 2308 section 4
+        removed.  In legacy mode the SOA-derived default wins, as it did
+        before RFC 2308.
+        """
+        if self.last_ttl_known and (  # only if the default doesn't take precedence
+            not self.default_ttl_known
+            or (self.rfc2308_ttl and self.default_ttl_from_soa)
+        ):
+            return self.last_ttl
+        if self.default_ttl_known:
+            return self.default_ttl
+        return None
+
+    def _rr_line(self) -> None:
         """Process one line from a DNS zone file."""
-        token = None
+        token: dns.tokenizer.Token
+        name: dns.name.Name | None
         # Name
         if self.force_name is not None:
             name = self.force_name
@@ -190,7 +217,6 @@ class Reader:
                 ttl = dns.ttl.from_text(token.value)
                 self.last_ttl = ttl
                 self.last_ttl_known = True
-                token = None
             except dns.ttl.BadTTL:
                 self.tok.unget(token)
 
@@ -212,17 +238,12 @@ class Reader:
         if ttl is None:
             # support for <class> <ttl> <type> syntax
             token = self._get_identifier()
-            ttl = None
             try:
                 ttl = dns.ttl.from_text(token.value)
                 self.last_ttl = ttl
                 self.last_ttl_known = True
-                token = None
             except dns.ttl.BadTTL:
-                if self.default_ttl_known:
-                    ttl = self.default_ttl
-                elif self.last_ttl_known:
-                    ttl = self.last_ttl
+                ttl = self._implicit_ttl()
                 self.tok.unget(token)
 
         # Type
@@ -253,7 +274,7 @@ class Reader:
             # correct, but it is correct almost all of the time.
             # We convert them to syntax errors so that we can emit
             # helpful filename:line info.
-            (ty, va) = sys.exc_info()[:2]
+            ty, va = sys.exc_info()[:2]
             raise dns.exception.SyntaxError(f"caught exception {str(ty)}: {str(va)}")
 
         if not self.default_ttl_known and rdtype == dns.rdatatype.SOA:
@@ -263,9 +284,10 @@ class Reader:
             soa_rd = cast(dns.rdtypes.ANY.SOA.SOA, rd)
             self.default_ttl = soa_rd.minimum
             self.default_ttl_known = True
+            self.default_ttl_from_soa = True
             if ttl is None:
                 # if we didn't have a TTL on the SOA, set it!
-                ttl = soa_rd.minimum
+                ttl = self._implicit_ttl()
 
         # TTL check.  We had to wait until now to do this as the SOA RR's
         # own TTL can be inferred from its minimum.
@@ -274,7 +296,7 @@ class Reader:
 
         self.txn.add(name, ttl, rd)
 
-    def _parse_modify(self, side: str) -> Tuple[str, str, int, int, str]:
+    def _parse_modify(self, side: str) -> tuple[str, str, int, int, str]:
         # Here we catch everything in '{' '}' in a group so we can replace it
         # with ''.
         is_generate1 = re.compile(r"^.*\$({(\+|-?)(\d+),(\d+),(.)}).*$")
@@ -354,16 +376,11 @@ class Reader:
             if not token.is_identifier():
                 raise dns.exception.SyntaxError
         except dns.ttl.BadTTL:
-            if not (self.last_ttl_known or self.default_ttl_known):
-                raise dns.exception.SyntaxError("Missing default TTL value")
-            if self.default_ttl_known:
-                ttl = self.default_ttl
-            elif self.last_ttl_known:
-                ttl = self.last_ttl
-            else:
-                # We don't go to the extra "look at the SOA" level of effort for
-                # $GENERATE, because the user really ought to have defined a TTL
-                # somehow!
+            # We don't go to the extra "look at the SOA" level of effort for
+            # $GENERATE, because the user really ought to have defined a TTL
+            # somehow!
+            ttl = self._implicit_ttl()
+            if ttl is None:
                 raise dns.exception.SyntaxError("Missing default TTL value")
 
         # Class
@@ -452,7 +469,7 @@ class Reader:
                 # correct, but it is correct almost all of the time.
                 # We convert them to syntax errors so that we can emit
                 # helpful filename:line info.
-                (ty, va) = sys.exc_info()[:2]
+                ty, va = sys.exc_info()[:2]
                 raise dns.exception.SyntaxError(
                     f"caught exception {str(ty)}: {str(va)}"
                 )
@@ -462,8 +479,8 @@ class Reader:
     def read(self) -> None:
         """Read a DNS zone file and build a zone object.
 
-        @raises dns.zone.NoSOA: No SOA RR was found at the zone origin
-        @raises dns.zone.NoNS: No NS RRset was found at the zone origin
+        :raises dns.zone.NoSOA: if there is no SOA RR at the zone origin.
+        :raises dns.zone.NoNS: if there is no NS RRset at the zone origin.
         """
 
         try:
@@ -482,6 +499,7 @@ class Reader:
                             self.last_ttl_known,
                             self.default_ttl,
                             self.default_ttl_known,
+                            self.default_ttl_from_soa,
                         ) = self.saved_state.pop(-1)
                         continue
                     break
@@ -490,7 +508,11 @@ class Reader:
                 elif token.is_comment():
                     self.tok.get_eol()
                     continue
-                elif token.value[0] == "$" and len(self.allowed_directives) > 0:
+                elif (
+                    token.is_identifier()
+                    and token.value[0] == "$"
+                    and len(self.allowed_directives) > 0
+                ):
                     # Note that we only run directive processing code if at least
                     # one directive is allowed in order to be backwards compatible
                     c = token.value.upper()
@@ -504,9 +526,15 @@ class Reader:
                             raise dns.exception.SyntaxError("bad $TTL")
                         self.default_ttl = dns.ttl.from_text(token.value)
                         self.default_ttl_known = True
+                        self.default_ttl_from_soa = False
                         self.tok.get_eol()
                     elif c == "$ORIGIN":
-                        self.current_origin = self.tok.get_name()
+                        # A relative $ORIGIN is relative to the current origin
+                        # (RFC 1035 section 5.1).
+                        origin = self.tok.get_name(self.current_origin)
+                        if not origin.is_absolute():
+                            raise UnknownOrigin
+                        self.current_origin = origin
                         self.tok.get_eol()
                         if self.zone_origin is None:
                             self.zone_origin = self.current_origin
@@ -535,6 +563,7 @@ class Reader:
                                 self.last_ttl_known,
                                 self.default_ttl,
                                 self.default_ttl_known,
+                                self.default_ttl_from_soa,
                             )
                         )
                         self.current_file = open(filename, encoding="utf-8")
@@ -542,6 +571,18 @@ class Reader:
                         self.current_origin = new_origin
                     elif c == "$GENERATE":
                         self._generate_line()
+                    elif c == "$UNICODE":
+                        while True:
+                            token = self.tok.get()
+                            if token.is_eol_or_eof():
+                                break
+                            if not token.is_identifier():
+                                raise dns.exception.SyntaxError("bad $UNICODE")
+                            self.txn.add_unicode(token.value)
+                            if token.value == "2008":
+                                self.tok.idna_codec = dns.name.IDNA_2008_Practical
+                            elif token.value == "2003":
+                                self.tok.idna_codec = dns.name.IDNA_2003_Practical
                     else:
                         raise dns.exception.SyntaxError(
                             f"Unknown zone file directive '{c}'"
@@ -550,7 +591,7 @@ class Reader:
                 self.tok.unget(token)
                 self._rr_line()
         except dns.exception.SyntaxError as detail:
-            (filename, line_number) = self.tok.where()
+            filename, line_number = self.tok.where()
             if detail is None:
                 detail = "syntax error"
             ex = dns.exception.SyntaxError(f"{filename}:{line_number}: {detail}")
@@ -615,7 +656,8 @@ class RRsetsReaderTransaction(dns.transaction.Transaction):
                 )
                 rrset.update(rdataset)
                 rrsets.append(rrset)
-            self.manager.set_rrsets(rrsets)  # pyright: ignore
+            manager = cast(RRSetsReaderManager, self.manager)
+            manager.set_rrsets(rrsets)
 
     def _set_origin(self, origin):
         pass
@@ -637,7 +679,7 @@ class RRSetsReaderManager(dns.transaction.TransactionManager):
         self.origin = origin
         self.relativize = relativize
         self.rdclass = rdclass
-        self.rrsets: List[dns.rrset.RRset] = []
+        self.rrsets: list[dns.rrset.RRset] = []
 
     def reader(self):  # pragma: no cover
         raise NotImplementedError
@@ -656,7 +698,7 @@ class RRSetsReaderManager(dns.transaction.TransactionManager):
             effective = self.origin
         return (self.origin, self.relativize, effective)
 
-    def set_rrsets(self, rrsets: List[dns.rrset.RRset]) -> None:
+    def set_rrsets(self, rrsets: list[dns.rrset.RRset]) -> None:
         self.rrsets = rrsets
 
 
@@ -671,55 +713,51 @@ def read_rrsets(
     idna_codec: dns.name.IDNACodec | None = None,
     origin: dns.name.Name | str | None = dns.name.root,
     relativize: bool = False,
-) -> List[dns.rrset.RRset]:
+    rfc2308_ttl: bool = True,
+) -> list[dns.rrset.RRset]:
     """Read one or more rrsets from the specified text, possibly subject
     to restrictions.
 
-    *text*, a file object or a string, is the input to process.
-
-    *name*, a string, ``dns.name.Name``, or ``None``, is the owner name of
-    the rrset.  If not ``None``, then the owner name is "forced", and the
-    input must not specify an owner name.  If ``None``, then any owner names
-    are allowed and must be present in the input.
-
-    *ttl*, an ``int``, string, or None.  If not ``None``, the the TTL is
-    forced to be the specified value and the input must not specify a TTL.
-    If ``None``, then a TTL may be specified in the input.  If it is not
-    specified, then the *default_ttl* will be used.
-
-    *rdclass*, a ``dns.rdataclass.RdataClass``, string, or ``None``.  If
-    not ``None``, then the class is forced to the specified value, and the
-    input must not specify a class.  If ``None``, then the input may specify
-    a class that matches *default_rdclass*.  Note that it is not possible to
-    return rrsets with differing classes; specifying ``None`` for the class
-    simply allows the user to optionally type a class as that may be convenient
-    when cutting and pasting.
-
-    *default_rdclass*, a ``dns.rdataclass.RdataClass`` or string.  The class
-    of the returned rrsets.
-
-    *rdtype*, a ``dns.rdatatype.RdataType``, string, or ``None``.  If not
-    ``None``, then the type is forced to the specified value, and the
-    input must not specify a type.  If ``None``, then a type must be present
-    for each RR.
-
-    *default_ttl*, an ``int``, string, or ``None``.  If not ``None``, then if
-    the TTL is not forced and is not specified, then this value will be used.
-    if ``None``, then if the TTL is not forced an error will occur if the TTL
-    is not specified.
-
-    *idna_codec*, a ``dns.name.IDNACodec``, specifies the IDNA
-    encoder/decoder.  If ``None``, the default IDNA 2003 encoder/decoder
-    is used.  Note that codecs only apply to the owner name; dnspython does
-    not do IDNA for names in rdata, as there is no IDNA zonefile format.
-
-    *origin*, a string, ``dns.name.Name``, or ``None``, is the origin for any
-    relative names in the input, and also the origin to relativize to if
-    *relativize* is ``True``.
-
-    *relativize*, a bool.  If ``True``, names are relativized to the *origin*;
-    if ``False`` then any relative names in the input are made absolute by
-    appending the *origin*.
+    :param text: The input to process, either a file object or a string.
+    :param name: The owner name of the rrset.  If not ``None``, the owner
+        name is forced and the input must not specify one.  If ``None``,
+        any owner names are allowed and must be present in the input.
+    :type name: str, :py:class:`dns.name.Name`, or ``None``
+    :param ttl: If not ``None``, the TTL is forced to the specified value
+        and the input must not specify a TTL.  If ``None``, a TTL may be
+        specified in the input; if not specified, *default_ttl* will be used.
+    :type ttl: int, str, or ``None``
+    :param rdclass: If not ``None``, the class is forced to the specified
+        value and the input must not specify a class.  If ``None``, the input
+        may optionally specify a class matching *default_rdclass*.  Note that
+        rrsets with differing classes cannot be returned; ``None`` here simply
+        allows the user to optionally write a class in the input.
+    :type rdclass: :py:class:`dns.rdataclass.RdataClass`, str, or ``None``
+    :param default_rdclass: The class of the returned rrsets.
+    :type default_rdclass: :py:class:`dns.rdataclass.RdataClass` or str
+    :param rdtype: If not ``None``, the type is forced to the specified value
+        and the input must not specify a type.  If ``None``, a type must be
+        present for each RR.
+    :type rdtype: :py:class:`dns.rdatatype.RdataType`, str, or ``None``
+    :param default_ttl: If not ``None``, and the TTL is not forced and not
+        specified in the input, this value will be used.  If ``None``, an
+        error will occur if the TTL is not forced and not specified.
+    :type default_ttl: int, str, or ``None``
+    :param idna_codec: The IDNA encoder/decoder.  If ``None``, the default
+        IDNA encoder/decoder is used.  Note that codecs only apply to the
+        owner name; dnspython does not do IDNA for names in rdata.
+    :type idna_codec: :py:class:`dns.name.IDNACodec` or ``None``
+    :param origin: The origin for any relative names in the input, and also
+        the origin to relativize to if *relativize* is ``True``.
+    :type origin: str, :py:class:`dns.name.Name`, or ``None``
+    :param bool relativize: If ``True``, names are relativized to *origin*;
+        if ``False``, relative names in the input are made absolute by
+        appending *origin*.
+    :param bool rfc2308_ttl: If ``True``, a TTL-less record inherits the most
+        recently stated TTL in preference to a default derived from the SOA
+        MINIMUM field, per RFC 2308 section 4.  The default is ``True``.  If
+        ``False``, the historical pre-RFC 2308 behavior is used.
+    :rtype: list[:py:class:`dns.rrset.RRset`]
     """
     if isinstance(origin, str):
         origin = dns.name.from_text(origin, dns.name.root, idna_codec)
@@ -751,6 +789,7 @@ def read_rrsets(
             force_rdclass=rdclass,
             force_rdtype=rdtype,
             default_ttl=default_ttl,
+            rfc2308_ttl=rfc2308_ttl,
         )
         reader.read()
     return manager.rrsets

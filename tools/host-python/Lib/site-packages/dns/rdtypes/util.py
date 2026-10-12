@@ -18,8 +18,10 @@
 import collections
 import random
 import struct
-from typing import Any, Iterable, List, Tuple
+from collections.abc import Iterable
+from typing import Any
 
+import dns._text_util
 import dns.exception
 import dns.ipv4
 import dns.ipv6
@@ -36,8 +38,8 @@ class Gateway:
     name = ""
 
     def __init__(self, type: Any, gateway: str | dns.name.Name | None = None):
-        self.type = dns.rdata.Rdata._as_uint8(type)
-        self.gateway = gateway
+        self.type: int = dns.rdata.Rdata._as_uint8(type)
+        self.gateway: str | dns.name.Name | None = gateway
         self._check()
 
     @classmethod
@@ -63,14 +65,18 @@ class Gateway:
         else:
             raise SyntaxError(self._invalid_type(self.type))
 
-    def to_text(self, origin=None, relativize=True):
+    def to_text(self, origin=None, relativize=True) -> str:
+        return self.to_styled_text(dns.rdata.RdataStyle(origin=origin, relativize=True))
+
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
         if self.type == 0:
             return "."
         elif self.type in (1, 2):
+            assert isinstance(self.gateway, str)
             return self.gateway
         elif self.type == 3:
             assert isinstance(self.gateway, dns.name.Name)
-            return str(self.gateway.choose_relativity(origin, relativize))
+            return self.gateway.to_styled_text(style)
         else:
             raise ValueError(self._invalid_type(self.type))  # pragma: no cover
 
@@ -126,7 +132,7 @@ class Bitmap:
 
     type_name = ""
 
-    def __init__(self, windows: Iterable[Tuple[int, bytes]] | None = None):
+    def __init__(self, windows: Iterable[tuple[int, bytes]] | None = None):
         last_window = -1
         if windows is None:
             windows = []
@@ -143,6 +149,11 @@ class Bitmap:
                 raise ValueError(f"bad {self.type_name} octets type")
             if len(bitmap) == 0 or len(bitmap) > 32:
                 raise ValueError(f"bad {self.type_name} octets")
+            if bitmap[-1] == 0:
+                # RFC 4034 section 4.1.2: blocks with no types present must not
+                # be included and trailing zero octets must be omitted, so the
+                # last octet of a window's bitmap is always non-zero.
+                raise ValueError(f"bad {self.type_name} octets: trailing zero octet")
 
     def to_text(self) -> str:
         text = ""
@@ -167,7 +178,7 @@ class Bitmap:
         return cls.from_rdtypes(rdtypes)
 
     @classmethod
-    def from_rdtypes(cls, rdtypes: List[dns.rdatatype.RdataType]) -> "Bitmap":
+    def from_rdtypes(cls, rdtypes: list[dns.rdatatype.RdataType]) -> "Bitmap":
         rdtypes = sorted(rdtypes)
         window = 0
         octets = 0
@@ -247,10 +258,10 @@ def weighted_processing_order(iterable):
                 if weight > r:
                     break
                 r -= weight
-            total -= weight  # pyright: ignore[reportPossiblyUnboundVariable]
+            total -= weight  # pyright: ignore
             # pylint: disable=undefined-loop-variable
-            ordered.append(rdata)  # pyright: ignore[reportPossiblyUnboundVariable]
-            del rdatas[n]  # pyright: ignore[reportPossiblyUnboundVariable]
+            ordered.append(rdata)  # pyright: ignore
+            del rdatas[n]  # pyright: ignore
         ordered.append(rdatas[0])
     return ordered
 
@@ -261,6 +272,10 @@ def parse_formatted_hex(formatted, num_chunks, chunk_size, separator):
     value = b""
     for _ in range(num_chunks):
         chunk = formatted[0:chunk_size]
+        # int() would also accept a sign, underscores, or surrounding
+        # whitespace; the presentation format is hex digits only.
+        if not dns._text_util.is_ascii_digits(chunk, 16):
+            raise ValueError("invalid formatted hex string")
         value += int(chunk, 16).to_bytes(chunk_size // 2, "big")
         formatted = formatted[chunk_size:]
         if len(formatted) > 0 and formatted[0] != separator:

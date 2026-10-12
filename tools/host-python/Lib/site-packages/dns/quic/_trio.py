@@ -5,11 +5,8 @@ import ssl
 import struct
 import time
 
-import aioquic.h3.connection  # type: ignore
-import aioquic.h3.events  # type: ignore
-import aioquic.quic.configuration  # type: ignore
-import aioquic.quic.connection  # type: ignore
-import aioquic.quic.events  # type: ignore
+import aioquic.h3.events  # pyright: ignore
+import aioquic.quic.events  # pyright: ignore
 import trio
 
 import dns.exception
@@ -102,7 +99,7 @@ class TrioQuicConnection(AsyncQuicConnection):
                 )
             await self._socket.connect(self._peer)
             while not self._done:
-                (expiration, interval) = self._get_timer_values(False)
+                expiration, interval = self._get_timer_values(False)
                 if self._send_pending:
                     # Do not block forever if sends are pending.  Even though we
                     # have a wake-up mechanism if we've already started the blocking
@@ -231,7 +228,7 @@ class TrioQuicManager(AsyncQuicManager):
     def connect(
         self, address, port=853, source=None, source_port=0, want_session_ticket=True
     ):
-        (connection, start) = self._connect(
+        connection, start = self._connect(
             address, port, source, source_port, want_session_ticket
         )
         if start:

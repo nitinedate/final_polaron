@@ -41,9 +41,13 @@ class PublicDSA(CryptographyPublicKey):
     def from_dnskey(cls, key: DNSKEY) -> "PublicDSA":
         cls._ensure_algorithm_key_combination(key)
         keyptr = key.key
+        if len(keyptr) < 1:
+            raise ValueError("key material is empty")
         (t,) = struct.unpack("!B", keyptr[0:1])
         keyptr = keyptr[1:]
         octets = 64 + t * 8
+        if len(keyptr) < 20 + 3 * octets:
+            raise ValueError("truncated DSA key material")
         dsa_q = keyptr[0:20]
         keyptr = keyptr[20:]
         dsa_p = keyptr[0:octets]
@@ -52,7 +56,7 @@ class PublicDSA(CryptographyPublicKey):
         keyptr = keyptr[octets:]
         dsa_y = keyptr[0:octets]
         return cls(
-            key=dsa.DSAPublicNumbers(  # type: ignore
+            key=dsa.DSAPublicNumbers(  # pyright: ignore
                 int.from_bytes(dsa_y, "big"),
                 dsa.DSAParameterNumbers(
                     int.from_bytes(dsa_p, "big"),
@@ -78,9 +82,7 @@ class PrivateDSA(CryptographyPrivateKey):
         public_dsa_key = self.key.public_key()
         if public_dsa_key.key_size > 1024:
             raise ValueError("DSA key size overflow")
-        der_signature = self.key.sign(
-            data, self.public_cls.chosen_hash  # pyright: ignore
-        )
+        der_signature = self.key.sign(data, self.public_cls.chosen_hash)  # type: ignore
         dsa_r, dsa_s = utils.decode_dss_signature(der_signature)
         dsa_t = (public_dsa_key.key_size // 8 - 64) // 8
         octets = 20

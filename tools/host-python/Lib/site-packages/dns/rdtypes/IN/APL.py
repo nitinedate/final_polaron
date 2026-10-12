@@ -43,14 +43,21 @@ class APLItem:
             self.address = dns.rdata.Rdata._as_ipv6_address(address)
             self.prefix = dns.rdata.Rdata._as_int(prefix, 0, 128)
         else:
-            self.address = dns.rdata.Rdata._as_bytes(address, max_length=127)
+            # The address is kept as hex, so it may be up to 254 characters.
+            self.address = dns.rdata.Rdata._as_bytes(
+                address, encode=True, max_length=254
+            )
+            binascii.unhexlify(self.address)
             self.prefix = dns.rdata.Rdata._as_uint8(prefix)
 
     def __str__(self):
+        address = self.address
+        if isinstance(address, bytes):
+            address = address.decode()
         if self.negation:
-            return f"!{self.family}:{self.address}/{self.prefix}"
+            return f"!{self.family}:{address}/{self.prefix}"
         else:
-            return f"{self.family}:{self.address}/{self.prefix}"
+            return f"{self.family}:{address}/{self.prefix}"
 
     def to_wire(self, file):
         if self.family == 1:
@@ -92,7 +99,7 @@ class APL(dns.rdata.Rdata):
                 raise ValueError("item not an APLItem")
         self.items = tuple(items)
 
-    def to_text(self, origin=None, relativize=True, **kw):
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
         return " ".join(map(str, self.items))
 
     @classmethod
@@ -107,9 +114,9 @@ class APL(dns.rdata.Rdata):
                 item = item[1:]
             else:
                 negation = False
-            (family, rest) = item.split(":", 1)
+            family, rest = item.split(":", 1)
             family = int(family)
-            (address, prefix) = rest.split("/", 1)
+            address, prefix = rest.split("/", 1)
             prefix = int(prefix)
             item = APLItem(family, negation, address, prefix)
             items.append(item)
@@ -133,6 +140,12 @@ class APL(dns.rdata.Rdata):
                 negation = False
             address = parser.get_bytes(afdlen)
             l = len(address)
+            if l > 0 and address[-1] == 0:
+                # RFC 3123 sections 4.1 and 4.2: the sender MUST NOT include
+                # trailing zero octets in the AFDPART, as DNSSEC requires a
+                # single canonical wire encoding.  Since to_wire() strips them,
+                # accepting them here would silently rewrite the rdata.
+                raise dns.exception.FormError("APL address has trailing zero octet")
             if header[0] == 1:
                 if l < 4:
                     address += b"\x00" * (4 - l)

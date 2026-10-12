@@ -19,19 +19,10 @@ import base64
 import binascii
 import struct
 
-import dns.exception
 import dns.immutable
 import dns.name
 import dns.rdata
-import dns.rdatatype
 import dns.rdtypes.util
-
-b32_hex_to_normal = bytes.maketrans(
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUV", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-)
-b32_normal_to_hex = bytes.maketrans(
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", b"0123456789ABCDEFGHIJKLMNOPQRSTUV"
-)
 
 # hash algorithm constants
 SHA1 = 1
@@ -65,15 +56,16 @@ class NSEC3(dns.rdata.Rdata):
         self.windows = tuple(windows.windows)
 
     def _next_text(self):
-        next = base64.b32encode(self.next).translate(b32_normal_to_hex).lower().decode()
+        next = base64.b32hexencode(self.next).lower().decode()
         next = next.rstrip("=")
         return next
 
-    def to_text(self, origin=None, relativize=True, **kw):
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
         next = self._next_text()
         if self.salt == b"":
             salt = "-"
         else:
+            # Not styled
             salt = binascii.hexlify(self.salt).decode()
         text = Bitmap(self.windows).to_text()
         return f"{self.algorithm} {self.flags} {self.iterations} {salt} {next}{text}"
@@ -90,12 +82,12 @@ class NSEC3(dns.rdata.Rdata):
             salt = b""
         else:
             salt = binascii.unhexlify(salt.encode("ascii"))
-        next = tok.get_string().encode("ascii").upper().translate(b32_hex_to_normal)
+        next = tok.get_string().encode("ascii").upper()
         if next.endswith(b"="):
             raise binascii.Error("Incorrect padding")
         if len(next) % 8 != 0:
             next += b"=" * (8 - len(next) % 8)
-        next = base64.b32decode(next)
+        next = base64.b32hexdecode(next)
         bitmap = Bitmap.from_text(tok)
         return cls(rdclass, rdtype, algorithm, flags, iterations, salt, next, bitmap)
 
@@ -110,7 +102,7 @@ class NSEC3(dns.rdata.Rdata):
 
     @classmethod
     def from_wire_parser(cls, rdclass, rdtype, parser, origin=None):
-        (algorithm, flags, iterations) = parser.get_struct("!BBH")
+        algorithm, flags, iterations = parser.get_struct("!BBH")
         salt = parser.get_counted_bytes()
         next = parser.get_counted_bytes()
         bitmap = Bitmap.from_wire_parser(parser)

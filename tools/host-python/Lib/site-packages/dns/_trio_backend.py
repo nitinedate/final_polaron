@@ -5,7 +5,7 @@
 import socket
 
 import trio
-import trio.socket  # type: ignore
+import trio.socket  # pyright: ignore
 
 import dns._asyncbackend
 import dns._features
@@ -103,12 +103,12 @@ class StreamSocket(dns._asyncbackend.StreamSocket):
 
 
 if dns._features.have("doh"):
-    import httpcore
-    import httpcore._backends.trio
-    import httpx
+    import httpcore2
+    import httpcore2._backends.trio
+    import httpx2
 
-    _CoreAsyncNetworkBackend = httpcore.AsyncNetworkBackend
-    _CoreTrioStream = httpcore._backends.trio.TrioStream
+    _CoreAsyncNetworkBackend = httpcore2.AsyncNetworkBackend
+    _CoreTrioStream = httpcore2._backends.trio.TrioStream
 
     from dns.query import _compute_times, _expiration_for_this_attempt, _remaining
 
@@ -155,7 +155,7 @@ if dns._features.have("doh"):
                     return _CoreTrioStream(sock.stream)
                 except Exception:
                     continue
-            raise httpcore.ConnectError
+            raise httpcore2.ConnectError
 
         async def connect_unix_socket(
             self, path, timeout=None, socket_options=None
@@ -165,7 +165,7 @@ if dns._features.have("doh"):
         async def sleep(self, seconds):  # pylint: disable=signature-differs
             await trio.sleep(seconds)
 
-    class _HTTPTransport(httpx.AsyncHTTPTransport):
+    class _HTTPTransport(httpx2.AsyncHTTPTransport):
         def __init__(
             self,
             *args,
@@ -181,12 +181,12 @@ if dns._features.have("doh"):
 
                 resolver = dns.asyncresolver.Resolver()
             super().__init__(*args, **kwargs)
-            self._pool._network_backend = _NetworkBackend(
+            self._pool._network_backend = _NetworkBackend(  # type: ignore
                 resolver, local_port, bootstrap_address, family
             )
 
 else:
-    _HTTPTransport = dns._asyncbackend.NullTransport  # type: ignore
+    _HTTPTransport = dns._asyncbackend.NullTransport  # pyright: ignore
 
 
 class Backend(dns._asyncbackend.Backend):

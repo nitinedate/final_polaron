@@ -58,13 +58,15 @@ class TKEY(dns.rdata.Rdata):
         self.key = self._as_bytes(key)
         self.other = self._as_bytes(other)
 
-    def to_text(self, origin=None, relativize=True, **kw):
-        _algorithm = self.algorithm.choose_relativity(origin, relativize)
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
+        algorithm = self.algorithm.to_styled_text(style)
+        # Not styled
         key = dns.rdata._base64ify(self.key, 0)
         other = ""
         if len(self.other) > 0:
+            # Not styled
             other = " " + dns.rdata._base64ify(self.other, 0)
-        return f"{_algorithm} {self.inception} {self.expiration} {self.mode} {self.error} {key}{other}"
+        return f"{algorithm} {self.inception} {self.expiration} {self.mode} {self.error} {key}{other}"
 
     @classmethod
     def from_text(
@@ -85,7 +87,7 @@ class TKEY(dns.rdata.Rdata):
         )
 
     def _to_wire(self, file, compress=None, origin=None, canonicalize=False):
-        self.algorithm.to_wire(file, compress, origin)
+        self.algorithm.to_wire(file, None, origin)
         file.write(
             struct.pack("!IIHH", self.inception, self.expiration, self.mode, self.error)
         )

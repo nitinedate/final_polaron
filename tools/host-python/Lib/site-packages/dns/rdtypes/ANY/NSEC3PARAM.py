@@ -36,10 +36,11 @@ class NSEC3PARAM(dns.rdata.Rdata):
         self.iterations = self._as_uint16(iterations)
         self.salt = self._as_bytes(salt, True, 255)
 
-    def to_text(self, origin=None, relativize=True, **kw):
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
         if self.salt == b"":
             salt = "-"
         else:
+            # Not styled
             salt = binascii.hexlify(self.salt).decode()
         return f"{self.algorithm} {self.flags} {self.iterations} {salt}"
 
@@ -64,6 +65,6 @@ class NSEC3PARAM(dns.rdata.Rdata):
 
     @classmethod
     def from_wire_parser(cls, rdclass, rdtype, parser, origin=None):
-        (algorithm, flags, iterations) = parser.get_struct("!BBH")
+        algorithm, flags, iterations = parser.get_struct("!BBH")
         salt = parser.get_counted_bytes()
         return cls(rdclass, rdtype, algorithm, flags, iterations, salt)

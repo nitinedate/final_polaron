@@ -5,6 +5,7 @@ import struct
 import dns.enum
 import dns.exception
 import dns.immutable
+import dns.name
 import dns.rdata
 import dns.rdatatype
 import dns.rdtypes.util
@@ -38,13 +39,13 @@ class DSYNC(dns.rdata.Rdata):
 
     def __init__(self, rdclass, rdtype, rrtype, scheme, port, target):
         super().__init__(rdclass, rdtype)
-        self.rrtype = self._as_rdatatype(rrtype)
-        self.scheme = Scheme.make(scheme)
-        self.port = self._as_uint16(port)
-        self.target = self._as_name(target)
+        self.rrtype: dns.rdatatype.RdataType = self._as_rdatatype(rrtype)
+        self.scheme: Scheme = Scheme.make(scheme)
+        self.port: int = self._as_uint16(port)
+        self.target: dns.name.Name = self._as_name(target)
 
-    def to_text(self, origin=None, relativize=True, **kw):
-        target = self.target.choose_relativity(origin, relativize)
+    def to_styled_text(self, style: dns.rdata.RdataStyle) -> str:
+        target = self.target.to_styled_text(style)
         return (
             f"{dns.rdatatype.to_text(self.rrtype)} {Scheme.to_text(self.scheme)} "
             f"{self.port} {target}"
@@ -67,6 +68,6 @@ class DSYNC(dns.rdata.Rdata):
 
     @classmethod
     def from_wire_parser(cls, rdclass, rdtype, parser, origin=None):
-        (rrtype, scheme, port) = parser.get_struct("!HBH")
+        rrtype, scheme, port = parser.get_struct("!HBH")
         target = parser.get_name(origin)
         return cls(rdclass, rdtype, rrtype, scheme, port, target)

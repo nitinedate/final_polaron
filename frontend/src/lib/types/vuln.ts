@@ -189,6 +189,7 @@ export interface ScanJobSeveritySummary {
     verified: boolean;
     label: string;
     clean_eligible: boolean;
+    service_coverage_complete?: boolean;
     plugin_error_count?: number;
   };
 }

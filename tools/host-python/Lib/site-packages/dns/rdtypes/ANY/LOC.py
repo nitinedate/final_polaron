@@ -17,6 +17,7 @@
 
 import struct
 
+import dns._text_util
 import dns.exception
 import dns.immutable
 import dns.rdata
@@ -90,9 +91,15 @@ def _decode_size(what, desc):
     return base * pow(10, exponent)
 
 
-def _check_coordinate_list(value, low, high):
-    if value[0] < low or value[0] > high:
-        raise ValueError(f"not in range [{low}, {high}]")
+def _check_coordinate_list(value, high):
+    if len(value) != 5:
+        raise ValueError("a coordinate tuple must have five elements")
+    if value[0] < 0:
+        raise ValueError(
+            "the degrees value must be positive, use the sign field to specify a hemisphere"
+        )
+    if value[0] > high:
+        raise ValueError(f"degrees not in range [0, {high}]")
     if value[1] < 0 or value[1] > 59:
         raise ValueError("bad minutes value")
     if value[2] < 0 or value[2] > 59:
@@ -131,8 +138,8 @@ class LOC(dns.rdata.Rdata):
     ):
         """Initialize a LOC record instance.
 
-        The parameters I{latitude} and I{longitude} may be either a 4-tuple
-        of integers specifying (degrees, minutes, seconds, milliseconds),
+        The parameters I{latitude} and I{longitude} may be either a 5-tuple
+        of integers specifying (degrees, minutes, seconds, milliseconds, sign),
         or they may be floating point values specifying the number of
         degrees. The other parameters are floats. Size, horizontal precision,
         and vertical precision are specified in centimeters."""
@@ -142,20 +149,20 @@ class LOC(dns.rdata.Rdata):
             latitude = float(latitude)
         if isinstance(latitude, float):
             latitude = _float_to_tuple(latitude)
-        _check_coordinate_list(latitude, -90, 90)
+        _check_coordinate_list(latitude, 90)
         self.latitude = tuple(latitude)  # pyright: ignore
         if isinstance(longitude, int):
             longitude = float(longitude)
         if isinstance(longitude, float):
             longitude = _float_to_tuple(longitude)
-        _check_coordinate_list(longitude, -180, 180)
+        _check_coordinate_list(longitude, 180)
         self.longitude = tuple(longitude)  # pyright: ignore
         self.altitude = float(altitude)
         self.size = float(size)
         self.horizontal_precision = float(hprec)
         self.vertical_precision = float(vprec)
 
-    def to_text(self, origin=None, relativize=True, **kw):
+    def to_styled_text(self, style: dns.rdata.RdataStyle):
         if self.latitude[4] > 0:
             lat_hemisphere = "N"
         else:
@@ -196,16 +203,16 @@ class LOC(dns.rdata.Rdata):
 
         latitude[0] = tok.get_int()
         t = tok.get_string()
-        if t.isdigit():
+        if dns._text_util.is_ascii_digits(t):
             latitude[1] = int(t)
             t = tok.get_string()
             if "." in t:
-                (seconds, milliseconds) = t.split(".")
-                if not seconds.isdigit():
+                seconds, milliseconds = t.split(".")
+                if not dns._text_util.is_ascii_digits(seconds):
                     raise dns.exception.SyntaxError("bad latitude seconds value")
                 latitude[2] = int(seconds)
                 l = len(milliseconds)
-                if l == 0 or l > 3 or not milliseconds.isdigit():
+                if l == 0 or l > 3 or not dns._text_util.is_ascii_digits(milliseconds):
                     raise dns.exception.SyntaxError("bad latitude milliseconds value")
                 if l == 1:
                     m = 100
@@ -215,7 +222,7 @@ class LOC(dns.rdata.Rdata):
                     m = 1
                 latitude[3] = m * int(milliseconds)
                 t = tok.get_string()
-            elif t.isdigit():
+            elif dns._text_util.is_ascii_digits(t):
                 latitude[2] = int(t)
                 t = tok.get_string()
         if t == "S":
@@ -225,16 +232,16 @@ class LOC(dns.rdata.Rdata):
 
         longitude[0] = tok.get_int()
         t = tok.get_string()
-        if t.isdigit():
+        if dns._text_util.is_ascii_digits(t):
             longitude[1] = int(t)
             t = tok.get_string()
             if "." in t:
-                (seconds, milliseconds) = t.split(".")
-                if not seconds.isdigit():
+                seconds, milliseconds = t.split(".")
+                if not dns._text_util.is_ascii_digits(seconds):
                     raise dns.exception.SyntaxError("bad longitude seconds value")
                 longitude[2] = int(seconds)
                 l = len(milliseconds)
-                if l == 0 or l > 3 or not milliseconds.isdigit():
+                if l == 0 or l > 3 or not dns._text_util.is_ascii_digits(milliseconds):
                     raise dns.exception.SyntaxError("bad longitude milliseconds value")
                 if l == 1:
                     m = 100
@@ -244,7 +251,7 @@ class LOC(dns.rdata.Rdata):
                     m = 1
                 longitude[3] = m * int(milliseconds)
                 t = tok.get_string()
-            elif t.isdigit():
+            elif dns._text_util.is_ascii_digits(t):
                 longitude[2] = int(t)
                 t = tok.get_string()
         if t == "W":

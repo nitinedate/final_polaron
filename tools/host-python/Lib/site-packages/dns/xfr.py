@@ -15,7 +15,8 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 # OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-from typing import Any, List, Tuple, cast
+from collections.abc import Callable
+from typing import Any, cast
 
 import dns.edns
 import dns.exception
@@ -27,13 +28,10 @@ import dns.rdataset
 import dns.rdatatype
 import dns.rdtypes
 import dns.rdtypes.ANY
-import dns.rdtypes.ANY.SMIMEA
 import dns.rdtypes.ANY.SOA
-import dns.rdtypes.svcbbase
 import dns.serial
 import dns.transaction
 import dns.tsig
-import dns.zone
 
 
 class TransferError(dns.exception.DNSException):
@@ -64,6 +62,8 @@ class Inbound:
         rdtype: dns.rdatatype.RdataType = dns.rdatatype.AXFR,
         serial: int | None = None,
         is_udp: bool = False,
+        raise_on_serial_went_backwards: bool = True,
+        transaction_setup: Callable[[dns.transaction.Transaction], None] | None = None,
     ):
         """Initialize an inbound zone transfer.
 
@@ -74,8 +74,14 @@ class Inbound:
         *serial* is the base serial number for IXFRs, and is required in
         that case.
 
-        *is_udp*, a ``bool`` indidicates if UDP is being used for this
-        XFR.
+        :param is_udp: Whether UDP is being used for this XFR.
+        :type is_udp: bool
+
+        :param transaction_setup: If not ``None``, call the object's setup()
+            method with the just-created writer transaction.  This lets the caller
+            alter the transaction's configuration before it is used, for example adding
+            checking policies.
+        :type transaction_setup: None or dns.transaction.TransactionSetup
         """
         self.txn_manager = txn_manager
         self.txn: dns.transaction.Transaction | None = None
@@ -92,11 +98,24 @@ class Inbound:
             raise ValueError("rdtype is not IXFR or AXFR")
         self.serial = serial
         self.is_udp = is_udp
-        (_, _, self.origin) = txn_manager.origin_information()
+        _, _, origin = txn_manager.origin_information()
+        if origin is None:
+            raise ValueError("transaction manager must supply an origin for XFRs")
+        self.origin = origin
         self.soa_rdataset: dns.rdataset.Rdataset | None = None
         self.done = False
         self.expecting_SOA = False
         self.delete_mode = False
+        self.raise_on_serial_went_backwards = raise_on_serial_went_backwards
+        self.transaction_setup = transaction_setup
+
+    def _check_tsig(self, message: dns.message.Message) -> None:
+        # RFC 8945 section 5.3.1 lets the messages in the middle of a signed
+        # transfer be unsigned, as the next TSIG covers them, but the first and
+        # the last message must have a TSIG.  This has to be checked before the
+        # transaction is committed, or unauthenticated data ends up in the zone.
+        if message.request_mac and not message.had_tsig:
+            raise dns.exception.FormError("missing TSIG")
 
     def process_message(self, message: dns.message.Message) -> bool:
         """Process one message in the transfer.
@@ -105,10 +124,16 @@ class Inbound:
         the `dns.xfr.Inbound` was created.  The message should also have been
         created with `one_rr_per_rrset=True` because order matters.
 
+        If the request was TSIG-signed, i.e. the message was parsed with a
+        nonempty *request_mac*, then the first and the last message of the
+        transfer must have a TSIG, and nothing is committed otherwise.
+
         Returns `True` if the transfer is complete, and `False` otherwise.
         """
         if self.txn is None:
             self.txn = self.txn_manager.writer(not self.incremental)
+            if self.transaction_setup is not None:
+                self.transaction_setup(self.txn)
         rcode = message.rcode()
         if rcode != dns.rcode.NOERROR:
             raise TransferError(rcode)
@@ -127,6 +152,7 @@ class Inbound:
             # This is the first message.  We're expecting an SOA at
             # the origin.
             #
+            self._check_tsig(message)
             if not message.answer or message.answer[0].name != self.origin:
                 raise dns.exception.FormError("No answer or RRset not for zone origin")
             rrset = message.answer[0]
@@ -145,7 +171,9 @@ class Inbound:
                     self.done = True
                 elif dns.serial.Serial(soa.serial) < self.serial:
                     # It went backwards!
-                    raise SerialWentBackwards
+                    if self.raise_on_serial_went_backwards:
+                        raise SerialWentBackwards
+                    self.done = True
                 else:
                     if self.is_udp and len(message.answer[answer_index:]) == 0:
                         #
@@ -192,6 +220,7 @@ class Inbound:
                         raise dns.exception.FormError("empty IXFR sequence")
                     if self.incremental and self.serial != soa.serial:
                         raise dns.exception.FormError("unexpected end of IXFR sequence")
+                    self._check_tsig(message)
                     self.txn.replace(name, rdataset)
                     self.txn.commit()
                     self.txn = None
@@ -228,10 +257,18 @@ class Inbound:
                 self.delete_mode = False
                 self.txn.rollback()
                 self.txn = self.txn_manager.writer(True)
+                if self.transaction_setup is not None:
+                    self.transaction_setup(self.txn)
                 #
                 # Note we are falling through into the code below
                 # so whatever rdataset this was gets written.
                 #
+            # Ignore glue that is not a subdomain of the origin.  For pathological
+            # cases it would be good if we could keep it in some side location, but
+            # dnspython zones don't have a place or an API for that, so we just ignore
+            # it at this time.
+            if not name.is_subdomain(self.origin):
+                continue
             # Add or remove the data
             if self.delete_mode:
                 self.txn.delete_exact(name, rdataset)
@@ -265,31 +302,31 @@ def make_query(
     ednsflags: int | None = None,
     payload: int | None = None,
     request_payload: int | None = None,
-    options: List[dns.edns.Option] | None = None,
+    options: list[dns.edns.Option] | None = None,
     keyring: Any = None,
     keyname: dns.name.Name | None = None,
     keyalgorithm: dns.name.Name | str = dns.tsig.default_algorithm,
-) -> Tuple[dns.message.QueryMessage, int | None]:
+) -> tuple[dns.message.QueryMessage, int | None]:
     """Make an AXFR or IXFR query.
 
-    *txn_manager* is a ``dns.transaction.TransactionManager``, typically a
-    ``dns.zone.Zone``.
-
-    *serial* is an ``int`` or ``None``.  If 0, then IXFR will be
-    attempted using the most recent serial number from the
-    *txn_manager*; it is the caller's responsibility to ensure there
-    are no write transactions active that could invalidate the
-    retrieved serial.  If a serial cannot be determined, AXFR will be
-    forced.  Other integer values are the starting serial to use.
-    ``None`` forces an AXFR.
+    :param txn_manager: The transaction manager for this transfer, typically
+        a :py:class:`dns.zone.Zone`.
+    :type txn_manager: :py:class:`dns.transaction.TransactionManager`
+    :param serial: If ``0``, IXFR is attempted using the most recent serial
+        from *txn_manager* (caller must ensure no write transactions are
+        active that could invalidate the retrieved serial).  If a serial
+        cannot be determined, AXFR is forced.  Other integer values are the
+        starting serial to use.  ``None`` forces an AXFR.
+    :type serial: int or ``None``
 
     Please see the documentation for :py:func:`dns.message.make_query` and
     :py:func:`dns.message.Message.use_tsig` for details on the other parameters
     to this function.
 
-    Returns a `(query, serial)` tuple.
+    :returns: A ``(query, serial)`` tuple.
+    :rtype: tuple
     """
-    (zone_origin, _, origin) = txn_manager.origin_information()
+    zone_origin, _, origin = txn_manager.origin_information()
     if zone_origin is None:
         raise ValueError("no zone origin")
     if serial is None:

@@ -931,6 +931,10 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                     <span className={summary.assessment.verified ? "font-semibold text-emerald-700" : "font-semibold text-red-700"}>
                       {summary.assessment.label}
                     </span>
+                    <span className="font-semibold text-ink-700">Service coverage verified</span>
+                    <span className={summary.assessment.service_coverage_complete ? "font-semibold text-emerald-700" : "font-semibold text-amber-700"}>
+                      {summary.assessment.service_coverage_complete ? "YES" : "NO - incomplete or not recorded"}
+                    </span>
                     <span className="font-semibold text-ink-700">Engine clean eligible</span>
                     <span className={summary.assessment.clean_eligible ? "font-semibold text-emerald-700" : "font-semibold text-amber-700"}>
                       {summary.assessment.clean_eligible ? "YES" : "NO"}

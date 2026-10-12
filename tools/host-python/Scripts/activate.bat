@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set "VIRTUAL_ENV=E:\polaron-forensic\tools\host-python"
+set "VIRTUAL_ENV=F:\GIT\final_polaron\tools\host-python"
 
 if not defined PROMPT set PROMPT=$P$G
 

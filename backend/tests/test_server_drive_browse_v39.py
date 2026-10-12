@@ -22,8 +22,8 @@ def test_same_host_drive_listing_prefers_windows_helper_before_api():
 def test_server_browse_ui_is_explicit_and_zero_copy():
     src = _read("frontend/src/components/forensic/BrowseFolderDialog.tsx")
     assert "Server drives — HDD / SSD / USB / network — process in place" in src
-    assert "Detection is read-only" in src
-    assert "Use this folder" in src
+    assert "Detection and browsing are read-only" in src
+    assert "Use this directory" in src
     assert "Refresh server drives" in src
     assert "Start HostDrive helper" in src
 
@@ -64,8 +64,8 @@ def test_browse_registration_marks_mounting_before_helper_remount():
 def test_v39_helper_versions_force_old_windows_process_restart():
     helper = _read("scripts/host-drive-helper.ps1")
     ensure = _read("scripts/ensure-host-drive-helper.ps1")
-    assert '$script:HelperVersion = "5.39"' in helper
-    assert '$ExpectedHelperVersion = "5.39"' in ensure
+    assert '$script:HelperVersion = "5.51"' in helper
+    assert '$ExpectedHelperVersion = "5.51"' in ensure
 
 
 def test_start_stack_replaces_legacy_auto_remount_agent():

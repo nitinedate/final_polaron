@@ -17,14 +17,14 @@
 
 """DNS RRsets (an RRset is a named rdataset)"""
 
-from typing import Any, Collection, Dict, cast
+from collections.abc import Collection
+from typing import Any, cast
 
 import dns.name
 import dns.rdata
 import dns.rdataclass
 import dns.rdataset
 import dns.rdatatype
-import dns.renderer
 
 
 class RRset(dns.rdataset.Rdataset):
@@ -93,7 +93,7 @@ class RRset(dns.rdataset.Rdataset):
             return False
         return super().__eq__(other)
 
-    def match(self, *args: Any, **kwargs: Any) -> bool:  # type: ignore[override]
+    def match(self, *args: Any, **kwargs: Any) -> bool:
         """Does this rrset match the specified attributes?
 
         Behaves as :py:func:`full_match()` if the first argument is a
@@ -106,9 +106,9 @@ class RRset(dns.rdataset.Rdataset):
         compatibility.)
         """
         if isinstance(args[0], dns.name.Name):
-            return self.full_match(*args, **kwargs)  # type: ignore[arg-type]
+            return self.full_match(*args, **kwargs)
         else:
-            return super().match(*args, **kwargs)  # type: ignore[arg-type]
+            return super().match(*args, **kwargs)
 
     def full_match(
         self,
@@ -129,11 +129,13 @@ class RRset(dns.rdataset.Rdataset):
 
     # pylint: disable=arguments-differ
 
-    def to_text(  # type: ignore[override]
+    def to_text(  # type: ignore
         self,
         origin: dns.name.Name | None = None,
         relativize: bool = True,
-        **kw: Dict[str, Any],
+        want_comments: bool = False,
+        style: dns.rdataset.RdatasetStyle | None = None,
+        **kw: Any,
     ) -> str:
         """Convert the RRset into DNS zone file format.
 
@@ -144,42 +146,63 @@ class RRset(dns.rdataset.Rdataset):
         Any additional keyword arguments are passed on to the rdata
         ``to_text()`` method.
 
-        *origin*, a ``dns.name.Name`` or ``None``, the origin for relative
-        names.
-
-        *relativize*, a ``bool``.  If ``True``, names will be relativized
-        to *origin*.
+        :param origin: The origin for relative names.
+        :type origin: :py:class:`dns.name.Name` or ``None``
+        :param relativize: If ``True``, names will be relativized to *origin*.
+        :type relativize: bool
+        :param want_comments: If ``True``, emit comments for rdata which have
+            them. The default is ``False``.
+        :type want_comments: bool
+        :param style: If specified, overrides the other parameters.
+        :type style: :py:class:`dns.rdataset.RdatasetStyle` or ``None``
         """
+        if style is None:
+            kw = kw.copy()
+            kw["origin"] = origin
+            kw["relativize"] = relativize
+            kw["want_comments"] = want_comments
+            style = dns.rdataset.RdatasetStyle.from_keywords(kw)
+        return self.to_styled_text(style)
 
-        return super().to_text(
-            self.name, origin, relativize, self.deleting, **kw  # type: ignore
-        )
+    def to_styled_text(self, style: dns.rdataset.RdatasetStyle) -> str:  # type: ignore
+        """Convert the RRset to styled text.
 
-    def to_wire(  # type: ignore[override]
+        A new style is made from the specified style setting the ``override_rdclass``
+        attribute appropriately for the deleting status of the RRset.
+
+        *style*, a :py:class:`dns.rdataset.RdatasetStyle` or ``None`` (the default).  If
+        specified, the style overrides the other parameters.
+
+        :rtype: str
+        """
+        if self.deleting is not None:
+            style = style.replace(override_rdclass=self.deleting)
+        return super().to_styled_text(style, self.name)
+
+    def to_wire(  # type: ignore
         self,
         file: Any,
-        compress: dns.name.CompressType | None = None,  # type: ignore
+        compress: dns.name.CompressType | None = None,
         origin: dns.name.Name | None = None,
-        **kw: Dict[str, Any],
+        **kw: Any,
     ) -> int:
         """Convert the RRset to wire format.
 
         All keyword arguments are passed to ``dns.rdataset.to_wire()``; see
         that function for details.
 
-        Returns an ``int``, the number of records emitted.
+        :returns: The number of records emitted.
+        :rtype: int
         """
 
-        return super().to_wire(
-            self.name, file, compress, origin, self.deleting, **kw  # type:ignore
-        )
+        return super().to_wire(self.name, file, compress, origin, self.deleting, **kw)
 
     # pylint: enable=arguments-differ
 
     def to_rdataset(self) -> dns.rdataset.Rdataset:
         """Convert an RRset into an Rdataset.
 
-        Returns a ``dns.rdataset.Rdataset``.
+        :rtype: :py:class:`dns.rdataset.Rdataset`
         """
         return dns.rdataset.from_rdata_list(self.ttl, list(self))
 
@@ -198,19 +221,17 @@ def from_text_list(
     """Create an RRset with the specified name, TTL, class, and type, and with
     the specified list of rdatas in text format.
 
-    *idna_codec*, a ``dns.name.IDNACodec``, specifies the IDNA
-    encoder/decoder to use; if ``None``, the default IDNA 2003
-    encoder/decoder is used.
-
-    *origin*, a ``dns.name.Name`` (or ``None``), the
-    origin to use for relative names.
-
-    *relativize*, a ``bool``.  If true, name will be relativized.
-
-    *relativize_to*, a ``dns.name.Name`` (or ``None``), the origin to use
-    when relativizing names.  If not set, the *origin* value will be used.
-
-    Returns a ``dns.rrset.RRset`` object.
+    :param idna_codec: Specifies the IDNA encoder/decoder. If ``None``, the
+        default IDNA 2003 encoder/decoder is used.
+    :type idna_codec: :py:class:`dns.name.IDNACodec` or ``None``
+    :param origin: The origin to use for relative names.
+    :type origin: :py:class:`dns.name.Name` or ``None``
+    :param relativize: If ``True``, names will be relativized.
+    :type relativize: bool
+    :param relativize_to: The origin to use when relativizing names. If not
+        set, *origin* is used.
+    :type relativize_to: :py:class:`dns.name.Name` or ``None``
+    :rtype: :py:class:`dns.rrset.RRset`
     """
 
     if isinstance(name, str):
@@ -237,7 +258,7 @@ def from_text(
     """Create an RRset with the specified name, TTL, class, and type and with
     the specified rdatas in text format.
 
-    Returns a ``dns.rrset.RRset`` object.
+    :rtype: :py:class:`dns.rrset.RRset`
     """
 
     return from_text_list(
@@ -254,12 +275,10 @@ def from_rdata_list(
     """Create an RRset with the specified name and TTL, and with
     the specified list of rdata objects.
 
-    *idna_codec*, a ``dns.name.IDNACodec``, specifies the IDNA
-    encoder/decoder to use; if ``None``, the default IDNA 2003
-    encoder/decoder is used.
-
-    Returns a ``dns.rrset.RRset`` object.
-
+    :param idna_codec: Specifies the IDNA encoder/decoder. If ``None``, the
+        default IDNA 2003 encoder/decoder is used.
+    :type idna_codec: :py:class:`dns.name.IDNACodec` or ``None``
+    :rtype: :py:class:`dns.rrset.RRset`
     """
 
     if isinstance(name, str):
@@ -281,7 +300,7 @@ def from_rdata(name: dns.name.Name | str, ttl: int, *rdatas: Any) -> RRset:
     """Create an RRset with the specified name and TTL, and with
     the specified rdata objects.
 
-    Returns a ``dns.rrset.RRset`` object.
+    :rtype: :py:class:`dns.rrset.RRset`
     """
 
     return from_rdata_list(name, ttl, cast(Collection[dns.rdata.Rdata], rdatas))

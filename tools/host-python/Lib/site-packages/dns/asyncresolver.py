@@ -19,12 +19,11 @@
 
 import socket
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 import dns._ddr
 import dns.asyncbackend
 import dns.asyncquery
-import dns.exception
 import dns.inet
 import dns.name
 import dns.nameserver
@@ -60,8 +59,9 @@ class Resolver(dns.resolver.BaseResolver):
     ) -> dns.resolver.Answer:
         """Query nameservers asynchronously to find the answer to the question.
 
-        *backend*, a ``dns.asyncbackend.Backend``, or ``None``.  If ``None``,
-        the default, then dnspython will use the default backend.
+        :param backend: The async backend. If ``None`` (the default), dnspython
+            will use the default backend.
+        :type backend: :py:class:`dns.asyncbackend.Backend` or ``None``
 
         See :py:func:`dns.resolver.Resolver.resolve()` for the
         documentation of the other parameters, exceptions, and return
@@ -75,7 +75,7 @@ class Resolver(dns.resolver.BaseResolver):
             backend = dns.asyncbackend.get_default_backend()
         start = time.time()
         while True:
-            (request, answer) = resolution.next_request()
+            request, answer = resolution.next_request()
             # Note we need to say "if answer is not None" and not just
             # "if answer" because answer implements __len__, and python
             # will call that.  We want to return if we have an answer
@@ -86,7 +86,7 @@ class Resolver(dns.resolver.BaseResolver):
             assert request is not None  # needed for type checking
             done = False
             while not done:
-                (nameserver, tcp, backoff) = resolution.next_nameserver()
+                nameserver, tcp, backoff = resolution.next_nameserver()
                 if backoff:
                     await backend.sleep(backoff)
                 timeout = self._compute_timeout(start, lifetime, resolution.errors)
@@ -100,9 +100,9 @@ class Resolver(dns.resolver.BaseResolver):
                         backend=backend,
                     )
                 except Exception as ex:
-                    (_, done) = resolution.query_result(None, ex)
+                    _, done = resolution.query_result(None, ex)
                     continue
-                (answer, done) = resolution.query_result(response, None)
+                answer, done = resolution.query_result(response, None)
                 # Note we need to say "if answer is not None" and not just
                 # "if answer" because answer implements __len__, and python
                 # will call that.  We want to return if we have an answer
@@ -119,8 +119,8 @@ class Resolver(dns.resolver.BaseResolver):
         This utilizes the resolve() method to perform a PTR lookup on the
         specified IP address.
 
-        *ipaddr*, a ``str``, the IPv4 or IPv6 address you want to get
-        the PTR record for.
+        :param ipaddr: The IPv4 or IPv6 address to look up.
+        :type ipaddr: str
 
         All other arguments that can be passed to the resolve() function
         except for rdtype and rdclass are also supported by this
@@ -130,7 +130,7 @@ class Resolver(dns.resolver.BaseResolver):
         # We make a modified kwargs for type checking happiness, as otherwise
         # we get a legit warning about possibly having rdtype and rdclass
         # in the kwargs more than once.
-        modified_kwargs: Dict[str, Any] = {}
+        modified_kwargs: dict[str, Any] = {}
         modified_kwargs.update(kwargs)
         modified_kwargs["rdtype"] = dns.rdatatype.PTR
         modified_kwargs["rdclass"] = dns.rdataclass.IN
@@ -149,10 +149,11 @@ class Resolver(dns.resolver.BaseResolver):
         This utilizes the resolve() method to perform A and/or AAAA lookups on
         the specified name.
 
-        *qname*, a ``dns.name.Name`` or ``str``, the name to resolve.
-
-        *family*, an ``int``, the address family.  If socket.AF_UNSPEC
-        (the default), both A and AAAA records will be retrieved.
+        :param name: The name to resolve.
+        :type name: :py:class:`dns.name.Name` or str
+        :param family: The address family. If ``socket.AF_UNSPEC`` (the
+            default), both A and AAAA records will be retrieved.
+        :type family: int
 
         All other arguments that can be passed to the resolve() function
         except for rdtype and rdclass are also supported by this
@@ -161,7 +162,7 @@ class Resolver(dns.resolver.BaseResolver):
         # We make a modified kwargs for type checking happiness, as otherwise
         # we get a legit warning about possibly having rdtype and rdclass
         # in the kwargs more than once.
-        modified_kwargs: Dict[str, Any] = {}
+        modified_kwargs: dict[str, Any] = {}
         modified_kwargs.update(kwargs)
         modified_kwargs.pop("rdtype", None)
         modified_kwargs["rdclass"] = dns.rdataclass.IN
@@ -213,13 +214,13 @@ class Resolver(dns.resolver.BaseResolver):
         The canonical name is the name the resolver uses for queries
         after all CNAME and DNAME renamings have been applied.
 
-        *name*, a ``dns.name.Name`` or ``str``, the query name.
+        :param name: The query name.
+        :type name: :py:class:`dns.name.Name` or str
+        :rtype: :py:class:`dns.name.Name`
 
-        This method can raise any exception that ``resolve()`` can
-        raise, other than ``dns.resolver.NoAnswer`` and
-        ``dns.resolver.NXDOMAIN``.
-
-        Returns a ``dns.name.Name``.
+        This method can raise any exception that
+        :py:meth:`~dns.asyncresolver.Resolver.resolve` can raise, other than
+        :py:exc:`dns.resolver.NoAnswer` and :py:exc:`dns.resolver.NXDOMAIN`.
         """
         try:
             answer = await self.resolve(name, raise_on_no_answer=False)
@@ -367,10 +368,11 @@ async def zone_for_name(
     tcp: bool = False,
     resolver: Resolver | None = None,
     backend: dns.asyncbackend.Backend | None = None,
+    lifetime: float | None = None,
 ) -> dns.name.Name:
     """Find the name of the zone which contains the specified name.
 
-    See :py:func:`dns.resolver.Resolver.zone_for_name` for more
+    See :py:func:`dns.resolver.zone_for_name` for more
     information on the parameters and possible exceptions.
     """
 
@@ -380,17 +382,52 @@ async def zone_for_name(
         resolver = get_default_resolver()
     if not name.is_absolute():
         raise NotAbsolute(name)
+    start = time.time()
+    expiration: float | None
+    if lifetime is not None:
+        expiration = start + lifetime
+    else:
+        expiration = None
     while True:
         try:
+            rlifetime: float | None
+            if expiration is not None:
+                rlifetime = expiration - time.time()
+                if rlifetime <= 0:
+                    rlifetime = 0
+            else:
+                rlifetime = None
             answer = await resolver.resolve(
-                name, dns.rdatatype.SOA, rdclass, tcp, backend=backend
+                name,
+                dns.rdatatype.SOA,
+                rdclass,
+                tcp,
+                lifetime=rlifetime,
+                backend=backend,
             )
             assert answer.rrset is not None
             if answer.rrset.name == name:
                 return name
             # otherwise we were CNAMEd or DNAMEd and need to look higher
-        except (NXDOMAIN, NoAnswer):
-            pass
+        except (NXDOMAIN, NoAnswer) as e:
+            if isinstance(e, NXDOMAIN):
+                response = e.responses().get(name)
+            else:
+                response = e.response()  # pylint: disable=no-value-for-parameter
+            if response:
+                for rrs in response.authority:
+                    if rrs.rdtype == dns.rdatatype.SOA and rrs.rdclass == rdclass:
+                        nr, _, _ = rrs.name.fullcompare(name)
+                        if nr == dns.name.NAMERELN_SUPERDOMAIN:
+                            # We're doing a proper superdomain check as
+                            # if the name were equal we ought to have gotten
+                            # it in the answer section!  We are ignoring the
+                            # possibility that the authority is insane and
+                            # is including multiple SOA RRs for different
+                            # authorities.
+                            return rrs.name
+            # we couldn't extract anything useful from the response (e.g. it's
+            # a type 3 NXDOMAIN)
         try:
             name = name.parent()
         except dns.name.NoParent:  # pragma: no cover
@@ -405,24 +442,22 @@ async def make_resolver_at(
 ) -> Resolver:
     """Make a stub resolver using the specified destination as the full resolver.
 
-    *where*, a ``dns.name.Name`` or ``str`` the domain name or IP address of the
-    full resolver.
-
-    *port*, an ``int``, the port to use.  If not specified, the default is 53.
-
-    *family*, an ``int``, the address family to use.  This parameter is used if
-    *where* is not an address.  The default is ``socket.AF_UNSPEC`` in which case
-    the first address returned by ``resolve_name()`` will be used, otherwise the
-    first address of the specified family will be used.
-
-    *resolver*, a ``dns.asyncresolver.Resolver`` or ``None``, the resolver to use for
-    resolution of hostnames.  If not specified, the default resolver will be used.
-
-    Returns a ``dns.resolver.Resolver`` or raises an exception.
+    :param where: The domain name or IP address of the full resolver.
+    :type where: :py:class:`dns.name.Name` or str
+    :param port: The port to use.  Default is 53.
+    :type port: int
+    :param family: The address family.  Used only when *where* is not an
+        address literal.  ``socket.AF_UNSPEC`` (default) uses the first
+        address returned; otherwise the first address of the given family.
+    :type family: int
+    :param resolver: The resolver to use for hostname resolution.  If
+        ``None``, the default resolver is used.
+    :type resolver: :py:class:`dns.asyncresolver.Resolver` or ``None``
+    :rtype: :py:class:`dns.resolver.Resolver`
     """
     if resolver is None:
         resolver = get_default_resolver()
-    nameservers: List[str | dns.nameserver.Nameserver] = []
+    nameservers: list[str | dns.nameserver.Nameserver] = []
     if isinstance(where, str) and dns.inet.is_address(where):
         nameservers.append(dns.nameserver.Do53Nameserver(where, port))
     else:

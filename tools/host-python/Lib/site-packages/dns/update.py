@@ -17,7 +17,7 @@
 
 """DNS Dynamic Update Support"""
 
-from typing import Any, List
+from typing import Any
 
 import dns.enum
 import dns.exception
@@ -47,7 +47,7 @@ class UpdateSection(dns.enum.IntEnum):
 
 class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
     # ignore the mypy error here as we mean to use a different enum
-    _section_enum = UpdateSection  # type: ignore
+    _section_enum = UpdateSection  # pyright: ignore
 
     def __init__(
         self,
@@ -63,12 +63,12 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
         See the documentation of the Message class for a complete
         description of the keyring dictionary.
 
-        *zone*, a ``dns.name.Name``, ``str``, or ``None``, the zone
-        which is being updated.  ``None`` should only be used by dnspython's
-        message constructors, as a zone is required for the convenience
-        methods like ``add()``, ``replace()``, etc.
-
-        *rdclass*, an ``int`` or ``str``, the class of the zone.
+        :param zone: The zone which is being updated. ``None`` should only be
+            used by dnspython's message constructors, as a zone is required for
+            the convenience methods like ``add()``, ``replace()``, etc.
+        :type zone: :py:class:`dns.name.Name`, str, or ``None``
+        :param rdclass: The class of the zone.
+        :type rdclass: int or str
 
         The *keyring*, *keyname*, and *keyalgorithm* parameters are passed to
         ``use_tsig()``; see its documentation for details.
@@ -93,7 +93,7 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
             self.use_tsig(keyring, keyname, algorithm=keyalgorithm)
 
     @property
-    def zone(self) -> List[dns.rrset.RRset]:
+    def zone(self) -> list[dns.rrset.RRset]:
         """The zone section."""
         return self.sections[0]
 
@@ -102,7 +102,7 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
         self.sections[0] = v
 
     @property
-    def prerequisite(self) -> List[dns.rrset.RRset]:
+    def prerequisite(self) -> list[dns.rrset.RRset]:
         """The prerequisite section."""
         return self.sections[1]
 
@@ -111,7 +111,7 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
         self.sections[1] = v
 
     @property
-    def update(self) -> List[dns.rrset.RRset]:
+    def update(self) -> list[dns.rrset.RRset]:
         """The update section."""
         return self.sections[2]
 
@@ -240,7 +240,7 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
                         rd = dns.rdata.from_text(
                             self.zone_rdclass,
                             rdtype,
-                            s,  # type: ignore[arg-type]
+                            s,  # pyright: ignore[arg-type]
                             self.origin,
                         )
                         self._add_rr(name, 0, rd, dns.rdataclass.NONE)
@@ -299,7 +299,7 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
             if not isinstance(args[0], dns.rdataset.Rdataset):
                 # Add a 0 TTL
                 largs = list(args)
-                largs.insert(0, 0)  # type: ignore[arg-type]
+                largs.insert(0, 0)  # pyright: ignore[arg-type]
                 self._add(False, self.prerequisite, name, *largs)
             else:
                 self._add(False, self.prerequisite, name, *args)

@@ -21,7 +21,7 @@ import binascii
 import math
 import socket
 import struct
-from typing import Any, Dict
+from typing import Any
 
 import dns.enum
 import dns.inet
@@ -59,6 +59,14 @@ class OptionType(dns.enum.IntEnum):
     EDE = 15
     #: REPORTCHANNEL
     REPORTCHANNEL = 18
+    #: EDE-EXTRA-TEXT-LANGUAGE (Extended DNS Error EXTRA-TEXT language)
+    EDE_EXTRA_TEXT_LANGUAGE = 22
+    #: FILTERING-CONTACT
+    FILTERING_CONTACT = 23
+    #: FILTERING-ORGANIZATION
+    FILTERING_ORGANIZATION = 24
+    #: FILTERING-DB
+    FILTERING_DB = 25
 
     @classmethod
     def _maximum(cls):
@@ -71,15 +79,15 @@ class Option:
     def __init__(self, otype: OptionType | str):
         """Initialize an option.
 
-        *otype*, a ``dns.edns.OptionType``, is the option type.
+        :param otype: The option type.
+        :type otype: :py:class:`dns.edns.OptionType`
         """
         self.otype = OptionType.make(otype)
 
     def to_wire(self, file: Any | None = None) -> bytes | None:
         """Convert an option to wire format.
 
-        Returns a ``bytes`` or ``None``.
-
+        :rtype: bytes or ``None``
         """
         raise NotImplementedError  # pragma: no cover
 
@@ -87,9 +95,9 @@ class Option:
         raise NotImplementedError  # pragma: no cover
 
     def to_generic(self) -> "GenericOption":
-        """Creates a dns.edns.GenericOption equivalent of this rdata.
+        """Create a :py:class:`dns.edns.GenericOption` equivalent of this option.
 
-        Returns a ``dns.edns.GenericOption``.
+        :rtype: :py:class:`dns.edns.GenericOption`
         """
         wire = self.to_wire()
         assert wire is not None  # for mypy
@@ -99,12 +107,11 @@ class Option:
     def from_wire_parser(cls, otype: OptionType, parser: "dns.wire.Parser") -> "Option":
         """Build an EDNS option object from wire format.
 
-        *otype*, a ``dns.edns.OptionType``, is the option type.
-
-        *parser*, a ``dns.wire.Parser``, the parser, which should be
-        restructed to the option length.
-
-        Returns a ``dns.edns.Option``.
+        :param otype: The option type.
+        :type otype: :py:class:`dns.edns.OptionType`
+        :param parser: The parser, restricted to the option length.
+        :type parser: :py:class:`dns.wire.Parser`
+        :rtype: :py:class:`dns.edns.Option`
         """
         raise NotImplementedError  # pragma: no cover
 
@@ -194,14 +201,17 @@ class ECSOption(Option):  # lgtm[py/missing-equals]
     """EDNS Client Subnet (ECS, RFC7871)"""
 
     def __init__(self, address: str, srclen: int | None = None, scopelen: int = 0):
-        """*address*, a ``str``, is the client address information.
+        """Initialize an ECSOption.
 
-        *srclen*, an ``int``, the source prefix length, which is the
-        leftmost number of bits of the address to be used for the
-        lookup.  The default is 24 for IPv4 and 56 for IPv6.
-
-        *scopelen*, an ``int``, the scope prefix length.  This value
-        must be 0 in queries, and should be set in responses.
+        :param address: The client address information.
+        :type address: str
+        :param srclen: The source prefix length (leftmost number of bits of the
+            address to be used for the lookup). Defaults to 24 for IPv4 and 56
+            for IPv6.
+        :type srclen: int or ``None``
+        :param scopelen: The scope prefix length. Must be 0 in queries; should
+            be set in responses.
+        :type scopelen: int
         """
 
         super().__init__(OptionType.ECS)
@@ -265,9 +275,10 @@ class ECSOption(Option):  # lgtm[py/missing-equals]
         >>> dns.edns.ECSOption.from_text('2001:4b98::1/64/64')
         >>>
         >>> # it understands results from `dns.edns.ECSOption.to_text()`
-        >>> dns.edns.ECSOption.from_text('ECS 1.2.3.4/24/32')
+        >>> dns.edns.ECSOption.from_text('ECS 1.2.3.4/24 scope/32')
         """
         optional_prefix = "ECS"
+        scope_prefix = "scope/"
         tokens = text.split()
         ecs_text = None
         if len(tokens) == 1:
@@ -276,6 +287,14 @@ class ECSOption(Option):  # lgtm[py/missing-equals]
             if tokens[0] != optional_prefix:
                 raise ValueError(f'could not parse ECS from "{text}"')
             ecs_text = tokens[1]
+        elif (
+            len(tokens) == 3
+            and tokens[0] == optional_prefix
+            and tokens[1].count("/") == 1
+            and tokens[2].startswith(scope_prefix)
+        ):
+            # The form emitted by to_text().
+            ecs_text = f"{tokens[1]}/{tokens[2][len(scope_prefix) :]}"
         else:
             raise ValueError(f'could not parse ECS from "{text}"')
         n_slashes = ecs_text.count("/")
@@ -313,17 +332,30 @@ class ECSOption(Option):  # lgtm[py/missing-equals]
         cls, otype: OptionType | str, parser: "dns.wire.Parser"
     ) -> Option:
         family, src, scope = parser.get_struct("!HBB")
-        addrlen = int(math.ceil(src / 8.0))
-        prefix = parser.get_bytes(addrlen)
         if family == 1:
-            pad = 4 - addrlen
-            addr = dns.ipv4.inet_ntoa(prefix + b"\x00" * pad)
+            bits = 32
         elif family == 2:
-            pad = 16 - addrlen
-            addr = dns.ipv6.inet_ntoa(prefix + b"\x00" * pad)
+            bits = 128
         else:
             raise ValueError("unsupported family")
-
+        # RFC 7871 Section 6: the source and scope prefix lengths are the
+        # significant bits of ADDRESS and cannot exceed the width of the
+        # address family.
+        if src > bits or scope > bits:
+            raise ValueError("invalid ECS prefix length")
+        addrlen = int(math.ceil(src / 8.0))
+        prefix = parser.get_bytes(addrlen)
+        # RFC 7871 Sections 6 and 7.4: bits of ADDRESS beyond the source
+        # prefix length are padding and must be zero.  Reject a non-zero pad
+        # rather than letting the ECSOption constructor mask it off, which
+        # would make from_wire and to_wire disagree on the same option.
+        rest = src % 8
+        if rest != 0 and prefix[-1] & (0xFF >> rest):
+            raise ValueError("non-zero ECS address padding bits")
+        if family == 1:
+            addr = dns.ipv4.inet_ntoa(prefix + b"\x00" * (4 - addrlen))
+        else:
+            addr = dns.ipv6.inet_ntoa(prefix + b"\x00" * (16 - addrlen))
         return cls(addr, src, scope)
 
 
@@ -355,6 +387,14 @@ class EDECode(dns.enum.IntEnum):
     NO_REACHABLE_AUTHORITY = 22
     NETWORK_ERROR = 23
     INVALID_DATA = 24
+    SIGNATURE_EXPIRED_BEFORE_VALID = 25
+    TOO_EARLY = 26
+    UNSUPPORTED_NSEC3_ITERATIONS_VALUE = 27
+    UNABLE_TO_CONFORM_TO_POLICY = 28
+    SYNTHESIZED = 29
+    INVALID_QUERY_TYPE = 30
+    RATE_LIMITED = 31
+    OVER_QUOTA = 32
 
     @classmethod
     def _maximum(cls):
@@ -367,11 +407,12 @@ class EDEOption(Option):  # lgtm[py/missing-equals]
     _preserve_case = {"DNSKEY", "DS", "DNSSEC", "RRSIGs", "NSEC", "NXDOMAIN"}
 
     def __init__(self, code: EDECode | str, text: str | None = None):
-        """*code*, a ``dns.edns.EDECode`` or ``str``, the info code of the
-        extended error.
+        """Initialize an EDEOption.
 
-        *text*, a ``str`` or ``None``, specifying additional information about
-        the error.
+        :param code: The info code of the extended error.
+        :type code: :py:class:`dns.edns.EDECode` or str
+        :param text: Additional information about the error.
+        :type text: str or ``None``
         """
 
         super().__init__(OptionType.EDE)
@@ -502,12 +543,140 @@ class ReportChannelOption(Option):
         return cls(parser.get_name())
 
 
-_type_to_class: Dict[OptionType, Any] = {
+class EDEExtraTextLanguageOption(Option):
+    """Extended DNS Error EXTRA-TEXT language (EDE-EXTRA-TEXT-LANGUAGE)"""
+
+    def __init__(self, language: str):
+        """Initialize an EDEExtraTextLanguageOption.
+
+        :param language: The language of EXTRA-TEXT in the EDE option.
+        :type language: str
+        """
+
+        super().__init__(OptionType.EDE_EXTRA_TEXT_LANGUAGE)
+        self.language = language
+
+    def to_wire(self, file: Any = None) -> bytes | None:
+        if file:
+            file.write(self.language.encode("utf8"))
+            return None
+        else:
+            return self.language.encode()
+
+    def to_text(self) -> str:
+        return f"EDE-EXTRA-TEXT-LANGUAGE {self.language}"
+
+    @classmethod
+    def from_wire_parser(
+        cls, otype: OptionType | str, parser: dns.wire.Parser
+    ) -> Option:
+        return cls(parser.get_remaining().decode("utf8"))
+
+
+class FilteringContactOption(Option):
+    """Filtering contact (FILTERING-CONTACT)"""
+
+    def __init__(self, contact: str):
+        """Initialize a FilteringContactOption.
+
+        :param contact: A filtering contact URI as a string.
+        :type contact: str
+        """
+
+        super().__init__(OptionType.FILTERING_CONTACT)
+        self.contact = contact
+
+    def to_wire(self, file: Any = None) -> bytes | None:
+        if file:
+            file.write(self.contact.encode("utf8"))
+            return None
+        else:
+            return self.contact.encode()
+
+    def to_text(self) -> str:
+        return f"FILTERING-CONTACT {self.contact}"
+
+    @classmethod
+    def from_wire_parser(
+        cls, otype: OptionType | str, parser: dns.wire.Parser
+    ) -> Option:
+        return cls(parser.get_remaining().decode("utf8"))
+
+
+class FilteringOrganizationOption(Option):
+    """Filtering organization (FILTERING-ORGANIZATION)"""
+
+    def __init__(self, organization: str):
+        """Initialize a FilteringOrganizationOption.
+
+        :param organization: The filtering organization.
+        :type organization: str
+        """
+
+        super().__init__(OptionType.FILTERING_ORGANIZATION)
+        self.organization = organization
+
+    def to_wire(self, file: Any = None) -> bytes | None:
+        if file:
+            file.write(self.organization.encode("utf8"))
+            return None
+        else:
+            return self.organization.encode()
+
+    def to_text(self) -> str:
+        return f"FILTERING-ORGANIZATION {self.organization}"
+
+    @classmethod
+    def from_wire_parser(
+        cls, otype: OptionType | str, parser: dns.wire.Parser
+    ) -> Option:
+        return cls(parser.get_remaining().decode("utf8"))
+
+
+class FilteringDBOption(Option):
+    """Filtering DB (FILTERING-DB)"""
+
+    def __init__(self, db: str):
+        """Initialize a FilteringDBOption.
+
+        :param db: The filtering database containing the identifier,
+                   name, or description of the filtering database
+                   against which a matched query caused the filtering to
+                   occur.
+        :type db: str
+
+        """
+
+        super().__init__(OptionType.FILTERING_DB)
+        self.db = db
+
+    def to_wire(self, file: Any = None) -> bytes | None:
+        if file:
+            file.write(self.db.encode("utf8"))
+            return None
+        else:
+            return self.db.encode()
+
+    def to_text(self) -> str:
+        return f"FILTERING-DB {self.db}"
+
+    @classmethod
+    def from_wire_parser(
+        cls, otype: OptionType | str, parser: dns.wire.Parser
+    ) -> Option:
+        return cls(parser.get_remaining().decode("utf8"))
+
+
+_type_to_class: dict[OptionType, Any] = {
     OptionType.ECS: ECSOption,
     OptionType.EDE: EDEOption,
     OptionType.NSID: NSIDOption,
     OptionType.COOKIE: CookieOption,
     OptionType.REPORTCHANNEL: ReportChannelOption,
+    OptionType.EDE_EXTRA_TEXT_LANGUAGE: EDEExtraTextLanguageOption,
+    OptionType.FILTERING_CONTACT: FilteringContactOption,
+    OptionType.FILTERING_ORGANIZATION: FilteringOrganizationOption,
+    OptionType.FILTERING_DB: FilteringDBOption,
 }
 
 
@@ -529,12 +698,11 @@ def option_from_wire_parser(
 ) -> Option:
     """Build an EDNS option object from wire format.
 
-    *otype*, an ``int``, is the option type.
-
-    *parser*, a ``dns.wire.Parser``, the parser, which should be
-    restricted to the option length.
-
-    Returns an instance of a subclass of ``dns.edns.Option``.
+    :param otype: The option type.
+    :type otype: int or :py:class:`dns.edns.OptionType`
+    :param parser: The parser, restricted to the option length.
+    :type parser: :py:class:`dns.wire.Parser`
+    :rtype: :py:class:`dns.edns.Option`
     """
     otype = OptionType.make(otype)
     cls = get_option_class(otype)
@@ -546,16 +714,15 @@ def option_from_wire(
 ) -> Option:
     """Build an EDNS option object from wire format.
 
-    *otype*, an ``int``, is the option type.
-
-    *wire*, a ``bytes``, is the wire-format message.
-
-    *current*, an ``int``, is the offset in *wire* of the beginning
-    of the rdata.
-
-    *olen*, an ``int``, is the length of the wire-format option data
-
-    Returns an instance of a subclass of ``dns.edns.Option``.
+    :param otype: The option type.
+    :type otype: int or :py:class:`dns.edns.OptionType`
+    :param wire: The wire-format message.
+    :type wire: bytes
+    :param current: The offset in *wire* of the beginning of the rdata.
+    :type current: int
+    :param olen: The length of the wire-format option data.
+    :type olen: int
+    :rtype: :py:class:`dns.edns.Option`
     """
     parser = dns.wire.Parser(wire, current)
     with parser.restrict_to(olen):
@@ -565,9 +732,9 @@ def option_from_wire(
 def register_type(implementation: Any, otype: OptionType) -> None:
     """Register the implementation of an option type.
 
-    *implementation*, a ``class``, is a subclass of ``dns.edns.Option``.
-
-    *otype*, an ``int``, is the option type.
+    :param implementation: A subclass of :py:class:`dns.edns.Option`.
+    :param otype: The option type.
+    :type otype: :py:class:`dns.edns.OptionType`
     """
 
     _type_to_class[otype] = implementation
@@ -587,5 +754,9 @@ PADDING = OptionType.PADDING
 CHAIN = OptionType.CHAIN
 EDE = OptionType.EDE
 REPORTCHANNEL = OptionType.REPORTCHANNEL
+EDE_EXTRA_TEXT_LANGUAGE = OptionType.EDE_EXTRA_TEXT_LANGUAGE
+FILTERING_CONTACT = OptionType.FILTERING_CONTACT
+FILTERING_ORGANIZATION = OptionType.FILTERING_ORGANIZATION
+FILTERING_DB = OptionType.FILTERING_DB
 
 ### END generated OptionType constants

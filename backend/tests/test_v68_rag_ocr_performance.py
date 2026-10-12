@@ -7,6 +7,17 @@ def read(rel):
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
+def test_quality_artifact_writes_do_not_lock_rows_out_of_id_order():
+    src = read("backend/app/services/mobile_quality_ocr.py")
+    impl = src.split("def _route_forensic_quality_to_ocr_impl", 1)[1]
+    assert "FOR UPDATE SKIP LOCKED" in src
+    assert "ORDER BY id" in src
+    assert "retry_on_deadlock" in src
+    # The deadlock was this per-row update running while parse held other artifacts.
+    assert "WHERE id=:id" not in impl
+    assert "known_noise" in src
+
+
 def test_v68_ocr_quality_policy_rechecks_legacy_candidates():
     src = read("backend/app/services/mobile_quality_ocr.py")
     tasks = read("backend/app/tasks.py")

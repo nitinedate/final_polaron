@@ -32,5 +32,5 @@ def test_drive_watcher_is_passive_and_helper_version_bumped():
     block = helper.split("function Start-DrivePresenceWatcher {", 1)[1].split("function Resolve-MobileOsHint", 1)[0]
     assert "refresh-drive-mounts" not in block.lower()
     assert "Start-RefreshDriveMountsAsync" not in block
-    assert '$script:HelperVersion = "5.50"' in helper
-    assert '$ExpectedHelperVersion = "5.50"' in ensure
+    assert '$script:HelperVersion = "5.51"' in helper
+    assert '$ExpectedHelperVersion = "5.51"' in ensure

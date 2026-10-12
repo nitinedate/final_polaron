@@ -1523,11 +1523,29 @@ def get_scan_job_severity_summary(
         )
     else:
         verified = bool(row.get("status") == "completed" and result_meta and coverage_ok)
-    clean_eligible = bool(verified and skipped_count == 0 and plugin_error_count == 0)
+    # Engine completion is not proof that all service checks were executed.
+    # Fail closed if host-level service-family coverage is absent or incomplete.
+    service_evidence = (orch_obj.get("service_coverage")
+                        or (rj.get("service_coverage") if isinstance(rj, dict) else None)
+                        or {})
+    service_coverage_complete = bool(
+        target_count > 0
+        and all(str(t.get("target") or "").strip() in service_evidence for t in target_rows if not t.get("excluded"))
+        and all(
+            isinstance(entry, dict)
+            and entry.get("coverage_complete") is True
+            and not ((entry.get("counts") or {}).get("not-tested") or 0)
+            and not ((entry.get("counts") or {}).get("unsupported") or 0)
+            for entry in service_evidence.values()
+        )
+    )
+    clean_eligible = bool(verified and service_coverage_complete and skipped_count == 0 and plugin_error_count == 0)
     if verified and skipped_count > 0:
         assessment_label = "VERIFIED WITH SCOPE EXCEPTION"
     elif verified and plugin_error_count > 0:
         assessment_label = "VERIFIED WITH WARNINGS"
+    elif verified and not service_coverage_complete:
+        assessment_label = "ENGINE COMPLETE - SERVICE COVERAGE UNVERIFIED"
     elif verified:
         assessment_label = "VERIFIED"
     else:
@@ -1613,6 +1631,7 @@ def get_scan_job_severity_summary(
             "verified": verified,
             "label": assessment_label,
             "clean_eligible": clean_eligible,
+            "service_coverage_complete": service_coverage_complete,
             "plugin_error_count": plugin_error_count,
         },
     }
