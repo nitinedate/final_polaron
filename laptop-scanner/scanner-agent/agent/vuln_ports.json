@@ -86,6 +86,11 @@
       "priority": "High"
     },
     {
+      "ports": "502",
+      "service": "Modbus TCP / ICS",
+      "priority": "High"
+    },
+    {
       "ports": "512-514",
       "service": "rexec-rlogin-rsh",
       "priority": "High"
@@ -171,6 +176,26 @@
       "priority": "Critical"
     },
     {
+      "ports": "2375",
+      "service": "Docker API plaintext",
+      "priority": "High"
+    },
+    {
+      "ports": "2376",
+      "service": "Docker API TLS",
+      "priority": "High"
+    },
+    {
+      "ports": "2379",
+      "service": "etcd client",
+      "priority": "High"
+    },
+    {
+      "ports": "2380",
+      "service": "etcd peer",
+      "priority": "High"
+    },
+    {
       "ports": "3000",
       "service": "web-app",
       "priority": "High"
@@ -191,6 +216,11 @@
       "priority": "Critical"
     },
     {
+      "ports": "4369",
+      "service": "Erlang EPMD",
+      "priority": "High"
+    },
+    {
       "ports": "4443",
       "service": "https-alt",
       "priority": "Critical"
@@ -199,6 +229,11 @@
       "ports": "4786",
       "service": "cisco-smart-install",
       "priority": "Critical"
+    },
+    {
+      "ports": "4840",
+      "service": "OPC UA / ICS",
+      "priority": "High"
     },
     {
       "ports": "4848",
@@ -246,6 +281,11 @@
       "priority": "High"
     },
     {
+      "ports": "5986",
+      "service": "WinRM TLS",
+      "priority": "High"
+    },
+    {
       "ports": "6379",
       "service": "redis",
       "priority": "Critical"
@@ -259,6 +299,16 @@
       "ports": "7001-7002",
       "service": "weblogic",
       "priority": "Critical"
+    },
+    {
+      "ports": "7001",
+      "service": "WebLogic / application admin",
+      "priority": "High"
+    },
+    {
+      "ports": "7002",
+      "service": "WebLogic TLS",
+      "priority": "High"
     },
     {
       "ports": "8000",
@@ -276,9 +326,29 @@
       "priority": "Critical"
     },
     {
+      "ports": "8200",
+      "service": "HashiCorp Vault API",
+      "priority": "High"
+    },
+    {
       "ports": "8443",
       "service": "https-alt",
       "priority": "Critical"
+    },
+    {
+      "ports": "8500",
+      "service": "Consul HTTP API",
+      "priority": "High"
+    },
+    {
+      "ports": "8501",
+      "service": "Consul HTTPS API",
+      "priority": "High"
+    },
+    {
+      "ports": "8883",
+      "service": "MQTT over TLS",
+      "priority": "High"
     },
     {
       "ports": "9000",
@@ -293,6 +363,11 @@
     {
       "ports": "9092",
       "service": "kafka",
+      "priority": "High"
+    },
+    {
+      "ports": "9093",
+      "service": "Kafka TLS / controller",
       "priority": "High"
     },
     {
@@ -336,9 +411,29 @@
       "priority": "Critical"
     },
     {
+      "ports": "10255",
+      "service": "Kubernetes kubelet readonly",
+      "priority": "High"
+    },
+    {
+      "ports": "10257",
+      "service": "Kubernetes controller-manager",
+      "priority": "High"
+    },
+    {
+      "ports": "10259",
+      "service": "Kubernetes scheduler",
+      "priority": "High"
+    },
+    {
       "ports": "10443",
       "service": "https-alt",
       "priority": "Critical"
+    },
+    {
+      "ports": "11211",
+      "service": "memcached",
+      "priority": "High"
     },
     {
       "ports": "15672",
@@ -351,8 +446,8 @@
       "priority": "High"
     },
     {
-      "ports": "11211",
-      "service": "memcached",
+      "ports": "50000",
+      "service": "Jenkins agent",
       "priority": "High"
     }
   ],

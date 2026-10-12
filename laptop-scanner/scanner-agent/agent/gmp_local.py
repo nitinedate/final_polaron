@@ -48,7 +48,7 @@ _VULN_PROFILES = frozenset({"vuln", "nexus", "nessus"})
 # default because exhaustive UDP can dominate scan time on filtered networks.
 PRIORITY_UDP_PORTS = (
     "U:53,U:67-69,U:88,U:111,U:123,U:137-138,U:161-162,U:389,U:500,U:514,U:520,U:623,U:902,U:1434,"
-    "U:1701,U:1812-1813,U:1900,U:2049,U:3389,U:4500,U:4789,U:5004,U:5060,U:5353,U:11211"
+    "U:1701,U:1812-1813,U:1900,U:2049,U:3389,U:4500,U:4789,U:5004,U:5060,U:5353,U:11211,U:5683,U:47808"
 )
 
 
