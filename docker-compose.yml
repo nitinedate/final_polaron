@@ -188,7 +188,7 @@ x-worker-env: &worker-env
   LLM_REVIEW_MODEL: ${LLM_REVIEW_MODEL:-deepseek-r1:14b}
   LLM_REVIEW_MODEL_LARGE: ${LLM_REVIEW_MODEL_LARGE:-deepseek-r1:14b}
   LLM_FAST_MODEL: ${LLM_FAST_MODEL:-qwen3.5:9b}
-  # All models required by the stack — pulled by ollama-init on compose up
+  # All models required by the stack — pulled by the models-profile ollama-init job before the API starts
   OLLAMA_PULL_MODELS: ${OLLAMA_PULL_MODELS:-qwen2.5:14b,qwen2.5:7b,deepseek-r1:14b,llama3.1:8b,gemma4:12b,qwen3.5:9b,nomic-embed-text}
   RAG_EMBEDDING_FALLBACK: ${RAG_EMBEDDING_FALLBACK:-nomic-embed-text}
   OCR_ENABLED: ${OCR_ENABLED:-true}
@@ -334,6 +334,10 @@ services:
         sed 's/\r$$//' /ensure.sh > /tmp/ensure.sh
         exec /bin/sh /tmp/ensure.sh
     restart: "no"
+    # Keep this out of plain `up`. Compose sends SIGTERM (exit 143) to the API
+    # when a service_completed_successfully one-shot is reconciled mid-start.
+    profiles:
+      - models
     gpus: all
     deploy:
       resources:
@@ -439,8 +443,6 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-      ollama-init:
-        condition: service_completed_successfully
       neo4j:
         condition: service_started
       opensearch:
@@ -474,8 +476,8 @@ services:
         ]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 180s
+      retries: 24
+      start_period: 420s
 
   # Disk extract/parse — forensic product only (vuln scans live in services/vuln).
   worker-disk:
@@ -638,8 +640,6 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-      ollama-init:
-        condition: service_completed_successfully
       neo4j:
         condition: service_started
       opensearch:
@@ -733,8 +733,6 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-      ollama-init:
-        condition: service_completed_successfully
       api:
         condition: service_healthy
     deploy:
@@ -772,8 +770,6 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-      ollama-init:
-        condition: service_completed_successfully
       api:
         condition: service_healthy
     deploy:

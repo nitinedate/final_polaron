@@ -157,7 +157,25 @@ function Invoke-StackBuild {
 
 function Invoke-StackUp {
     param([string]$Name, [string[]]$ComposeArgs)
-    Invoke-Docker -Title "Start $Name" -DockerArgs ($ComposeArgs + @('up', '-d', '--no-build', '--pull', 'missing'))
+    $upArgs = $ComposeArgs + @('up', '-d', '--no-build', '--pull', 'missing')
+    Write-Host "Start $Name"
+    $code = Invoke-DockerNativeSafe -DockerArgs $upArgs
+    if ($code -eq 0) { return }
+    Write-Warn "Start $Name returned exit $code. Retrying once after Docker settles."
+    Start-Sleep -Seconds 8
+    Invoke-Docker -Title "Start $Name (retry)" -DockerArgs $upArgs
+}
+
+function Ensure-ForensicOllamaModels {
+    param([string[]]$ComposeArgs)
+    # Run the model one-shot to completion before the API. Leaving it as a
+    # service_completed_successfully dependency makes Compose stop the API
+    # (exit 143) while that one-shot is reconciled.
+    Write-Step 'Ensure Ollama models before the forensic API starts'
+    Invoke-Docker -Title 'Start Ollama' -DockerArgs ($ComposeArgs + @('up','-d','--no-build','--pull','missing','--wait','--wait-timeout','180','--no-deps','ollama'))
+    $code = Invoke-DockerNativeSafe -DockerArgs ($ComposeArgs + @('--profile','models','run','--rm','--no-deps','ollama-init'))
+    if ($code -ne 0) { throw "Ollama model ensure failed (exit $code)." }
+    Write-Ok 'Ollama models are present.'
 }
 
 function Ensure-MobileCoreWorkersStarted {
@@ -556,13 +574,16 @@ function Ensure-PublicHttpsEdge {
     Assert-PublicPortOwners
     Enable-PublicFirewall
 
-    # A running Aetheris gateway can serve renewal challenges itself. If the required
-    # lineage is missing, use the temporary HTTP-only bootstrap before starting TLS.
+    # A running Aetheris gateway can serve renewal challenges itself. This launcher
+    # stops that gateway before certificate work, so HTTP-01 then has nowhere to land.
+    # Use the temporary bootstrap whenever the lineage is missing or the gateway is down.
     $ipName = "aetheris-ip-$IP"
     $ipState = Get-CertificateState -ComposeArgs $composeArgs -Identity $IP -CertName $ipName
     $domainName = if ($DNS) { "aetheris-domain-$DNS" } else { '' }
     $domainState = if ($DNS) { Get-CertificateState -ComposeArgs $composeArgs -Identity $DNS -CertName $domainName } else { $null }
-    $needBootstrap = (-not $ipState.managed) -or ($DNS -and -not $domainState.managed)
+    $gatewayState = Get-ComposeServiceContainerState -ProjectName 'aetheris-gateway' -Service 'gateway'
+    $gatewayServing = [bool]($gatewayState -and $gatewayState.Status -eq 'running')
+    $needBootstrap = (-not $gatewayServing) -or (-not $ipState.managed) -or ($DNS -and -not $domainState.managed)
 
     if ($needBootstrap) {
         # If an older owned gateway is running, remove it so bootstrap can bind TCP 80.
@@ -672,6 +693,7 @@ try {
     Write-Step "Start product stacks"
     foreach ($name in @('forensic', 'mobile-android', 'mobile-ios')) {
         $args = @(Get-StackComposeArgs -Root $root -Name $name)
+        if ($name -eq 'forensic') { Ensure-ForensicOllamaModels -ComposeArgs $args }
         Invoke-StackUp -Name $name -ComposeArgs $args
         Ensure-MobileCoreWorkersStarted -Name $name -ComposeArgs $args
     }

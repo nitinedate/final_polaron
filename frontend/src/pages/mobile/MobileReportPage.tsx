@@ -74,6 +74,8 @@ function MobileReportSheets({
   );
 }
 
+export function MobileReportPage() {
+  const { jobId = "" } = useParams<{ jobId: string }>();
   const navigate = useNavigate();
   const toast = useToast();
   const platform = mobilePlatformService() ?? "android";
@@ -187,11 +189,15 @@ function MobileReportSheets({
               : "No mobile report sections yet."}
           </Card>
         ) : (
-          sections.map((s) => (
-            <Card key={s.id} className="p-4">
-          <MobileReportSheets jobId={jobId} sections={sections.map(withNarrative)} onUpdated={(updated) => {
-            setSections((current) => current.map((section) => (section.id === updated.id ? updated : section)));
-          }} />
+          <MobileReportSheets
+            jobId={jobId}
+            sections={sections.map(withNarrative)}
+            onUpdated={(updated) => {
+              setSections((current) => current.map((section) => (section.id === updated.id ? updated : section)));
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }

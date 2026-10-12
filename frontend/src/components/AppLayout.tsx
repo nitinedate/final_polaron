@@ -40,6 +40,7 @@ interface NavItem {
   firmOnly?: boolean;
   platformOnly?: boolean;
   exact?: boolean;
+  work?: "acquire" | "images" | "jobs" | "artifacts" | "rag" | "reports";
 }
 interface NavGroup {
   title: string;
@@ -92,32 +93,33 @@ const GROUPS: NavGroup[] = [
           title: "Mobile Forensics",
           items: [
             { to: "/mobile", label: "Mobile Overview", icon: Smartphone, requiredPerm: "job:read", firmOnly: true, exact: true },
-            { to: "/mobile/acquisition", label: "Device → Image", icon: Smartphone, requiredPerm: "job:run", firmOnly: true },
-            { to: "/mobile/images", label: "Images → RAG", icon: ImageIcon, requiredPerm: "job:run", firmOnly: true },
-            { to: "/mobile/jobs", label: "Mobile Jobs", icon: HardDrive, requiredPerm: "job:read", firmOnly: true },
-            { to: "/mobile/artifacts", label: "Mobile Artifacts", icon: FolderSearch, requiredPerm: "artifact:read", firmOnly: true },
             { to: "/mobile/acquisition", label: "Device → Image", icon: Smartphone, requiredPerm: "job:run", firmOnly: true, work: "acquire" },
             { to: "/mobile/images", label: "Images → RAG", icon: ImageIcon, requiredPerm: "job:run", firmOnly: true, work: "images" },
             { to: "/mobile/jobs", label: "Mobile Jobs", icon: HardDrive, requiredPerm: "job:read", firmOnly: true, work: "jobs" },
             { to: "/mobile/artifacts", label: "Mobile Artifacts", icon: FolderSearch, requiredPerm: "artifact:read", firmOnly: true, work: "artifacts" },
             { to: "/mobile/rag", label: "Mobile RAG", icon: Search, requiredPerm: "job:read", firmOnly: true, work: "rag" },
             { to: "/mobile/reports", label: "Mobile Reports", icon: FileText, requiredPerm: "job:read", firmOnly: true, work: "reports" },
+          ],
+        },
+      ] as NavGroup[])
+    : []),
   ...(isDedicatedMobileService()
     ? ([
         {
           title: mobilePlatformService() === "ios" ? "iOS Forensics" : "Android Forensics",
           items: [
-            { to: "/mobile", label: "Mobile Jobs", icon: Smartphone, requiredPerm: "job:read", firmOnly: true, exact: true },
-            { to: "/mobile/acquire", label: "Device → Image", icon: Smartphone, requiredPerm: "job:run", firmOnly: true },
-            { to: "/mobile/new", label: "Images → RAG", icon: ImageIcon, requiredPerm: "job:run", firmOnly: true },
-            { to: "/mobile/artifacts", label: "Mobile Artifacts", icon: FolderSearch, requiredPerm: "artifact:read", firmOnly: true },
             { to: "/mobile", label: "Mobile Jobs", icon: Smartphone, requiredPerm: "job:read", firmOnly: true, exact: true, work: "jobs" },
             { to: "/mobile/acquire", label: "Device → Image", icon: Smartphone, requiredPerm: "job:run", firmOnly: true, work: "acquire" },
             { to: "/mobile/new", label: "Images → RAG", icon: ImageIcon, requiredPerm: "job:run", firmOnly: true, work: "images" },
             { to: "/mobile/artifacts", label: "Mobile Artifacts", icon: FolderSearch, requiredPerm: "artifact:read", firmOnly: true, work: "artifacts" },
             { to: "/mobile/rag", label: "Mobile RAG", icon: Search, requiredPerm: "job:read", firmOnly: true, work: "rag" },
             { to: "/mobile/reports", label: "Mobile Reports", icon: FileText, requiredPerm: "job:read", firmOnly: true, work: "reports" },
-      ? ([
+          ],
+        },
+      ] as NavGroup[])
+    : []),
+  ...(isLegacyMobileExtractService()
+    ? ([
           { title: "Mobile Extraction (Legacy)", items: [
             { to: "/forensic/mobile", label: "Extractions", icon: Smartphone, requiredPerm: "job:read", firmOnly: true },
             { to: "/forensic/mobile/new", label: "Import package", icon: Smartphone, requiredPerm: "job:run", firmOnly: true },
@@ -323,10 +325,6 @@ function SettingsNav({
   );
 }
 
-function NavItems({ items, onNavigate }: { items: NavItem[]; onNavigate?: () => void }) {
-  return (
-    <div className="space-y-1">
-      {items.map((item) => (
 function NavItems({
   items,
   pathname,
@@ -395,7 +393,11 @@ function mobileWorkSection(pathname: string): NavItem["work"] | null {
 }
 
 function itemMatchesPath(pathname: string, item: NavItem): boolean {
-  if (item.work && item.work === mobileWorkSection(pathname)) return true;
+  if (item.work) return item.work === mobileWorkSection(pathname);
+  if (item.exact || item.to === "/") return pathname === item.to;
+  return pathname === item.to || pathname.startsWith(`${item.to}/`);
+}
+
 function groupMatchesPath(pathname: string, group: NavGroup): boolean {
   return group.items.some((item) => itemMatchesPath(pathname, item));
 }
@@ -421,11 +423,12 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
     : [...navGroups, ...accountGroups].find(
         (group) => group.title !== "Overview" && groupMatchesPath(location.pathname, group)
       )?.title ?? null;
-  const [chosenTitle, setChosenTitle] = useState<string | null | undefined>(undefined);
+  const [extraTitle, setExtraTitle] = useState<string | null>(null);
   const [pathSnap, setPathSnap] = useState(location.pathname);
   if (pathSnap !== location.pathname) {
     setPathSnap(location.pathname);
-  const [extraTitle, setExtraTitle] = useState<string | null>(null);
+    setExtraTitle(null);
+  }
   const toggleGroup = (title: string) => {
     if (title === routeTitle) return;
     setExtraTitle((current) => (current === title ? null : title));
@@ -443,18 +446,8 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         </div>
       </div>
       <nav className="relative z-[1] mt-3 flex-1 space-y-2 overflow-y-auto px-2 pb-4">
-                key="Settings"
-                open={openTitle === "Settings"}
-                onToggle={() => toggleGroup("Settings")}
-                onNavigate={onNavigate}
-              />
-                open={groupIsOpen("Settings")}
-          }
+        {navGroups.map((group) => {
           const pinned = group.title === "Overview";
-          const open = pinned || openTitle === group.title;
-          return (
-            <div key={group.title}>
-              {pinned ? (
           const open = pinned || groupIsOpen(group.title);
           return (
             <div key={group.title}>
@@ -474,6 +467,32 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
                 </button>
               )}
               {open ? <NavItems items={group.items} pathname={location.pathname} onNavigate={onNavigate} /> : null}
+            </div>
+          );
+        })}
+        <SettingsNav
+          open={groupIsOpen("Settings")}
+          onToggle={() => toggleGroup("Settings")}
+          onNavigate={onNavigate}
+        />
+        {accountGroups.map((group) => {
+          const open = groupIsOpen(group.title);
+          return (
+            <div key={group.title}>
+              <button
+                type="button"
+                onClick={() => toggleGroup(group.title)}
+                className="mb-0.5 flex w-full min-w-0 items-center rounded-lg px-2 py-1.5 text-left text-[10px] font-bold uppercase tracking-wider text-ink-400 hover:bg-brand-50/70 hover:text-ink-700"
+                aria-expanded={open}
+              >
+                <span className="truncate">{group.title}</span>
+                <ChevronDown className={clsx("ml-auto h-3.5 w-3.5 shrink-0 transition", open && "rotate-180")} />
+              </button>
+              {open ? <NavItems items={group.items} pathname={location.pathname} onNavigate={onNavigate} /> : null}
+            </div>
+          );
+        })}
+      </nav>
     </div>
   );
 }
@@ -484,40 +503,40 @@ export function AppLayout() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const title = resolveTitle(location.pathname);
 
-  return (
-    <div className="min-h-screen bg-transparent">
-      <aside className="fixed inset-y-0 left-0 z-[280] hidden w-[272px] border-r border-ink-300 bg-white/95 shadow-panel backdrop-blur-sm lg:block">
-  if (typeof document !== "undefined") {
-    document.documentElement.style.setProperty("--app-sidebar", SIDEBAR_WIDTH);
-  }
   useEffect(() => {
-    return () => document.documentElement.style.setProperty("--app-sidebar", "0px");
-  }, []);
+    setMobileOpen(false);
+  }, [location.pathname]);
 
   return (
     <div className="min-h-screen bg-transparent">
-      <aside className="fixed inset-y-0 left-0 z-[280] hidden w-[13rem] border-r border-ink-300 bg-white/95 shadow-panel backdrop-blur-sm lg:block">
+      <aside className="fixed inset-y-0 left-0 z-[280] hidden w-[272px] border-r border-ink-300 bg-white/95 shadow-panel backdrop-blur-sm lg:block">
+        <SidebarContent />
+      </aside>
+
+      {mobileOpen ? (
         <div className="fixed inset-0 z-[280] lg:hidden">
           <div className="absolute inset-0 bg-ink-950/40" onClick={() => setMobileOpen(false)} />
           <aside className="absolute inset-y-0 left-0 w-[272px] border-r border-ink-300 bg-white shadow-soft">
             <button
               className="absolute right-3 top-5 rounded-xl p-1 text-ink-400 hover:bg-brand-50"
               onClick={() => setMobileOpen(false)}
-          <aside className="absolute inset-y-0 left-0 w-[13rem] border-r border-ink-300 bg-white shadow-soft">
+              type="button"
+            >
               <X className="h-5 w-5" />
             </button>
             <SidebarContent onNavigate={() => setMobileOpen(false)} />
           </aside>
         </div>
-      )}
+      ) : null}
 
       <div className="lg:pl-[272px]">
         <header className="sticky top-0 z-30 border-b border-ink-300 bg-white/75 shadow-panel backdrop-blur-md">
           <div className="flex h-16 items-center justify-between px-4 sm:px-8">
             <div className="flex items-center gap-3">
-      <div className="lg:pl-[13rem]">
+              <button
                 className="rounded-xl p-2 text-ink-500 hover:bg-brand-50 lg:hidden"
                 onClick={() => setMobileOpen(true)}
+                type="button"
               >
                 <Menu className="h-5 w-5" />
               </button>
@@ -543,6 +562,7 @@ export function AppLayout() {
               <button
                 onClick={logout}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-ink-300 bg-white/80 px-3 py-2 text-sm font-semibold text-ink-600 shadow-panel hover:border-brand-400 hover:bg-brand-50/70"
+                type="button"
               >
                 <LogOut className="h-4 w-4" />
                 <span className="hidden sm:inline">Logout</span>
