@@ -306,13 +306,7 @@ export function ReportEditorPage() {
     }
   }
 
-  const orderedSections = orderReportSections(sections);
-  let pageCursor = 1;
-  const sectionsWithPages = orderedSections.map((section) => {
-    const pageStart = pageCursor;
-    pageCursor += countPreviewPages(section);
-    return { section, pageStart };
-  });
+  const { plan: sectionsWithPages, evidencePageStart } = reportPagePlan(sections);
 
   return (
     <div>
