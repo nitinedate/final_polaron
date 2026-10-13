@@ -8,13 +8,14 @@ def test_parse_range_and_roundtrip():
     assert pd.ports_to_gvm_range([443, 22, 443]) == 'T:22,T:443'
 
 
-def test_discovery_narrows_to_observed_open_ports(monkeypatch):
+def test_discovery_preserves_scope_and_reports_observed_ports_separately(monkeypatch):
     monkeypatch.setenv('PORT_DISCOVERY_ENABLED', 'true')
     monkeypatch.setenv('PORT_DISCOVERY_RANGE', 'T:22,80,443')
     with patch('agent.port_discovery.probe_open_tcp_ports', return_value={'10.0.0.1': [80, 443]}):
         plan = pd.discovery_plan(['10.0.0.1'])
     assert plan['fallback'] is False
-    assert plan['port_range'] == 'T:80,T:443'
+    assert plan['port_range'] == 'T:22,80,443'
+    assert plan['observed_port_range'] == 'T:80,T:443'
     assert plan['open_port_count'] == 2
 
 

@@ -81,11 +81,6 @@ export type HostDriveVolume = {
   letter: string;
   label?: string;
   drive_type?: "removable" | "fixed" | "network" | "cdrom" | "other";
-  /** Windows disk bus, when the helper could read it (usb, sata, nvme, …). */
-  bus_type?: string;
-  media_type?: string;
-  /** USB, FireWire, SD, or a volume Windows itself calls removable. */
-  external?: boolean;
   size_bytes?: number;
   free_bytes?: number;
   filesystem?: string;
@@ -652,14 +647,9 @@ export type HostDirectoryResult = {
   healed?: boolean;
 };
 
-async function listOfficeHostDriveLettersDirect(
-  timeoutMs: number,
-  opts?: { fresh?: boolean }
-): Promise<HostDriveLettersResult | null> {
+async function listOfficeHostDriveLettersDirect(timeoutMs: number): Promise<HostDriveLettersResult | null> {
   if (!isBrowserOnOfficeHost()) return null;
-  const health = await hostDriveHelperHealth(Math.min(timeoutMs, 1500), {
-    force: Boolean(opts?.fresh),
-  });
+  const health = await hostDriveHelperHealth(Math.min(timeoutMs, 1500));
   if (!health?.ok) return null;
   try {
     const res = await fetch(`${HELPER_BASE}/drives`, {
@@ -675,11 +665,8 @@ async function listOfficeHostDriveLettersDirect(
   }
 }
 
-export async function listOfficeServerDriveLetters(
-  timeoutMs = 8000,
-  opts?: { fresh?: boolean }
-): Promise<HostDriveLettersResult | null> {
-  const direct = await listOfficeHostDriveLettersDirect(timeoutMs, opts);
+export async function listOfficeServerDriveLetters(timeoutMs = 8000): Promise<HostDriveLettersResult | null> {
+  const direct = await listOfficeHostDriveLettersDirect(timeoutMs);
   if (direct?.ok && (direct.volumes?.length || direct.drives?.length)) {
     return { ...direct, helper_online: true, source: direct.source || "office_host_helper" };
   }
@@ -688,22 +675,16 @@ export async function listOfficeServerDriveLetters(
     const data = await api.get<HostDriveLettersResult>("/api/hostdrive/drives", undefined, {
       timeoutMs,
     });
-    if (data?.volumes?.length || data?.drives?.length) {
+    if (data?.ok && (data.volumes?.length || data.drives?.length)) {
       return data;
     }
-    if (direct?.volumes?.length || direct?.drives?.length) {
-      return { ...direct, helper_online: true, source: direct.source || "office_host_helper" };
-    }
-    // Keep an offline/empty payload so the picker can show helper status
-    // instead of looking like the request never happened.
-    return data ?? direct;
+    return data?.ok ? data : direct;
   } catch {
     return direct;
   }
 }
 
 export async function listOfficeServerDirectory(path: string, timeoutMs = 120_000): Promise<HostDirectoryResult | null> {
-  let apiResult: HostDirectoryResult | null = null;
   try {
     const { api } = await import("./api");
     const data = await api.post<HostDirectoryResult>(
@@ -712,27 +693,9 @@ export async function listOfficeServerDirectory(path: string, timeoutMs = 120_00
       { timeoutMs }
     );
     if (data?.ok) return data;
-    apiResult = data?.error ? data : null;
+    return data?.error ? data : null;
   } catch {
-    apiResult = null;
-  }
-  // Same PC as the forensic host: list the Windows path directly when Docker
-  // cannot see the new HDD/SSD/USB yet. Remote browsers stay on the API.
-  if (!isBrowserOnOfficeHost()) return apiResult;
-  const online = await hostDriveHelperHealth(1500, { force: true });
-  if (!online?.ok) return apiResult;
-  try {
-    const res = await fetch(`${HELPER_BASE}/list-dir`, {
-      method: "POST",
-      headers: { ...helperHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-      signal: AbortSignal.timeout(Math.min(timeoutMs, 20_000)),
-    });
-    const data = (await res.json()) as HostDirectoryResult;
-    if (res.ok && data?.ok) return data;
-    return data?.error ? data : apiResult;
-  } catch {
-    return apiResult;
+    return null;
   }
 }
 

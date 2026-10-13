@@ -68,7 +68,9 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
         "open_udp_ports": [],
         "port_scanner_errors": [],
         "other_errors": 0,
-        "verdict": "full",
+        "service_checks_verified": False,
+        "coverage_complete": False,
+        "verdict": "unverified",
         "reason": "",
     }
     if report is None:
@@ -140,7 +142,10 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
                             tcp.add(int(tok))
     except Exception:
         pass
+    # These OIDs are NVTs visible in report RESULTS/EXIT_CODE details, not an
+    # authoritative total of executed tests. Do not claim thousands of checks ran.
     out["nvts_launched"] = len(oids)
+    out["nvts_evidenced"] = len(oids)
     out["open_tcp_ports"] = sorted(tcp)[:512]
     out["open_udp_ports"] = sorted(udp)[:128]
 
@@ -159,9 +164,14 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
             "host filtered, scanner timed out, or feed not loaded"
         )
     else:
-        out["reason"] = f"{len(tcp)} TCP / {len(udp)} UDP port(s), {out['nvts_launched']} NVT(s) ran"
+        out["verdict"] = "observed_unverified"
+        out["reason"] = (
+            f"{len(tcp)} TCP / {len(udp)} UDP port(s) referenced by results; "
+            f"{len(oids)} distinct NVT(s) evidenced (not execution inventory). "
+            "No per-service negative-test or port-range execution proof"
+        )
     return out
 
 
 def is_degraded(coverage: dict[str, Any] | None) -> bool:
-    return str((coverage or {}).get("verdict") or "").startswith("degraded")
+    return str((coverage or {}).get("verdict") or "") != "full"

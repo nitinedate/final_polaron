@@ -931,11 +931,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                     <span className={summary.assessment.verified ? "font-semibold text-emerald-700" : "font-semibold text-red-700"}>
                       {summary.assessment.label}
                     </span>
-                    <span className="font-semibold text-ink-700">Service coverage verified</span>
-                    <span className={summary.assessment.service_coverage_complete ? "font-semibold text-emerald-700" : "font-semibold text-amber-700"}>
-                      {summary.assessment.service_coverage_complete ? "YES" : "NO - incomplete or not recorded"}
-                    </span>
-                    <span className="font-semibold text-ink-700">Engine clean eligible</span>
+                    <span className="font-semibold text-ink-700">Clean-result eligible (all required evidence)</span>
                     <span className={summary.assessment.clean_eligible ? "font-semibold text-emerald-700" : "font-semibold text-amber-700"}>
                       {summary.assessment.clean_eligible ? "YES" : "NO"}
                     </span>
@@ -944,7 +940,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                 {Object.entries(summary?.service_coverage || {}).length > 0 ? (
                   <div className="mt-4 space-y-3">
                     <h4 className="font-semibold text-ink-900">Service coverage</h4>
-                    <p className="text-sm text-ink-600">Native engine evidence for the 52 service families. A completed scan or an open port does not establish that every rule passed.</p>
+                    <p className="text-sm text-ink-600">Engine completion does not mean a clean assessment. Untested families, missing host evidence, and unsupported collectors remain limitations. Only explicitly authorized IP targets are scanned; verify the selected target list separately.</p>
                     {Object.entries(summary?.service_coverage || {}).map(([host, coverage]) => (
                       <details key={host} className="rounded-xl border border-ink-200 bg-white p-3">
                         <summary className="cursor-pointer text-sm font-semibold text-ink-800">
@@ -958,7 +954,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                               <tr key={service.service_id} className="border-t border-ink-100">
                                 <td className="p-2">{service.service_id} {service.name}</td>
                                 <td className="p-2">{service.status}</td>
-                                <td className="p-2">{service.reason}<br />{service.credentialed_checks}
+                                <td className="p-2">{service.reason}{service.port_hints?.length ? <span className="block text-sky-700">Port hint(s): {service.port_hints.join(", ")} — NOT proof of testing</span> : null}<br />{service.credentialed_checks}
                                   {service.source_result_ids.length ? <div className="break-all font-mono">{service.source_result_ids.join(", ")}</div> : null}
                                 </td>
                               </tr>

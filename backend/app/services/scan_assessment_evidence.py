@@ -302,6 +302,19 @@ def load_case_scan_assessment(db, case_id: str) -> dict[str, Any]:
             ),
         }
 
+    if is_edge_agent and not bool(orchestration.get("service_scope_verified")):
+        return {
+            **base,
+            "state": "service_coverage_unverified",
+            "verified": True,
+            "clean_eligible": False,
+            "message": (
+                f"Engine completed for {hosts_assessed} of {target_count} target(s), "
+                "but service/port-check execution coverage is not independently verified. "
+                "No clean conclusion is permitted."
+            ),
+        }
+
     if plugin_errors > 0:
         return {
             **base,

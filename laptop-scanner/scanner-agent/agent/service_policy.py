@@ -416,6 +416,13 @@ def analyze_services(
     services = []
     for svc in doc["services"]:
         observed = [r for r in endpoints.values() if matches_service(svc, r)]
+        # An open port is a valuable discovery hint, not proof of the protocol
+        # or that its vulnerability NVTs ran. Keep it separate from observation.
+        port_hints = [
+            r for r in endpoints.values()
+            if (r['transport'] == 'tcp' and r['port'] in svc['tcp_hints'])
+            or (r['transport'] == 'udp' and r['port'] in svc['udp_hints'])
+        ]
         referenced = []
         findings = []
         for row in rows:
@@ -447,7 +454,10 @@ def analyze_services(
         reason = (
             "Native report references; no independent per-check pass inferred"
             if status != "not-tested"
-            else "No verified protocol/product or matching native check evidence in this report"
+            else (
+                f"{len(port_hints)} catalog port hint(s) observed, but protocol and NVT execution unverified"
+                if port_hints else "No verified protocol/product or matching native check evidence in this report"
+            )
         )
         if svc["scope"] == "network" and not referenced and not observed:
             status = "unsupported"
@@ -462,6 +472,8 @@ def analyze_services(
                 "status": status,
                 "reason": reason,
                 "endpoint_count": len(observed),
+                "port_hint_count": len(port_hints),
+                "port_hints": sorted({f"{row['port']}/{row['transport']}" for row in port_hints}),
                 "source_result_ids": sorted(set(referenced)),
                 "finding_result_ids": sorted(set(findings)),
                 "credentialed_checks": "not-tested; authentication/privilege evidence is required",

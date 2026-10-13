@@ -306,7 +306,13 @@ export function ReportEditorPage() {
     }
   }
 
-  const { plan: sectionsWithPages, evidencePageStart } = reportPagePlan(sections);
+  const orderedSections = orderReportSections(sections);
+  let pageCursor = 1;
+  const sectionsWithPages = orderedSections.map((section) => {
+    const pageStart = pageCursor;
+    pageCursor += countPreviewPages(section);
+    return { section, pageStart };
+  });
 
   return (
     <div>
@@ -431,57 +437,57 @@ export function ReportEditorPage() {
         </Card>
       ) : (
         <ReportEvidenceTocContext.Provider value={{ page: evidencePageStart }}>
-          <ReportCaseExhibitProvider jobId={jobId!}>
-            <div className="space-y-3">
-              {sectionsWithPages.map(({ section, pageStart }) => (
-                <Card key={section.id} className="p-5">
-                  <div className="flex items-start justify-between gap-4">
-                    <div>
-                      <h3 className="font-bold capitalize text-ink-900">{section.section_key.replace(/_/g, " ")}</h3>
-                      <div className="mt-1 flex flex-wrap gap-2">
-                        <Badge tone={STATUS_TONE[section.verification_status] ?? "neutral"}>
-                          {section.verification_status}
-                        </Badge>
-                        {section.section_confidence != null && (
-                          <Badge tone="indigo">{Math.round(section.section_confidence * 100)}% confidence</Badge>
-                        )}
-                        {section.conflicts && section.conflicts.length > 0 && (
-                          <Badge tone="amber">{section.conflicts.length} validation conflict(s)</Badge>
-                        )}
-                      </div>
-                    </div>
+        <ReportCaseExhibitProvider jobId={jobId!}>
+        <div className="space-y-3">
+          {sectionsWithPages.map(({ section, pageStart }) => (
+            <Card key={section.id} className="p-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h3 className="font-bold capitalize text-ink-900">{section.section_key.replace(/_/g, " ")}</h3>
+                  <div className="mt-1 flex flex-wrap gap-2">
+                    <Badge tone={STATUS_TONE[section.verification_status] ?? "neutral"}>
+                      {section.verification_status}
+                    </Badge>
+                    {section.section_confidence != null && (
+                      <Badge tone="indigo">{Math.round(section.section_confidence * 100)}% confidence</Badge>
+                    )}
+                    {section.conflicts && section.conflicts.length > 0 && (
+                      <Badge tone="amber">{section.conflicts.length} validation conflict(s)</Badge>
+                    )}
                   </div>
-                  {section.narrative_content || section.structured_json ? (
-                    <div className="mt-4 flex flex-col items-center rounded-xl bg-slate-100 p-4">
-                      <ReportSectionPagesWithActions
-                        section={section}
-                        pageStart={pageStart}
-                        jobId={jobId!}
-                        allSections={sections}
-                        onUpdated={onSectionUpdated}
-                      />
-                    </div>
-                  ) : (
-                    <p className="mt-4 text-sm italic text-ink-400">No narrative content yet.</p>
-                  )}
-                  {section.citations && section.citations.length > 0 && (
-                    <p className="mt-3 text-xs text-ink-400">{section.citations.length} citation(s)</p>
-                  )}
-                </Card>
-              ))}
-              {jobId && (
-                <Card className="p-5">
-                  <h3 className="font-bold text-ink-900">Evidences</h3>
-                  <p className="mt-1 text-sm text-ink-500">
-                    Documents and images in which an offer letter was found, with the file path and date. Further files continue on the next page.
-                  </p>
-                  <div className="mt-4 flex flex-col items-center rounded-xl bg-slate-100 p-4">
-                    <ReportEvidencePages jobId={jobId} pageStart={evidencePageStart} />
-                  </div>
-                </Card>
+                </div>
+              </div>
+              {section.narrative_content || section.structured_json ? (
+                <div className="mt-4 flex flex-col items-center rounded-xl bg-slate-100 p-4">
+                  <ReportSectionPagesWithActions
+                    section={section}
+                    pageStart={pageStart}
+                    jobId={jobId!}
+                    allSections={sections}
+                    onUpdated={onSectionUpdated}
+                  />
+                </div>
+              ) : (
+                <p className="mt-4 text-sm italic text-ink-400">No narrative content yet.</p>
               )}
-            </div>
-          </ReportCaseExhibitProvider>
+              {section.citations && section.citations.length > 0 && (
+                <p className="mt-3 text-xs text-ink-400">{section.citations.length} citation(s)</p>
+              )}
+            </Card>
+          ))}
+          {jobId && (
+            <Card className="p-5">
+              <h3 className="font-bold text-ink-900">Evidences</h3>
+              <p className="mt-1 text-sm text-ink-500">
+                Documents and images in which an offer letter was found, with the file path and date. Further files continue on the next page.
+              </p>
+              <div className="mt-4 flex flex-col items-center rounded-xl bg-slate-100 p-4">
+                <ReportEvidencePages jobId={jobId} pageStart={evidencePageStart} />
+              </div>
+            </Card>
+          )}
+        </div>
+        </ReportCaseExhibitProvider>
         </ReportEvidenceTocContext.Provider>
       )}
     </div>

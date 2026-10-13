@@ -90,8 +90,8 @@ services:
         ]
       interval: 10s
       timeout: 5s
-      retries: 24
-      start_period: 420s
+      retries: 12
+      start_period: 180s
 
   worker-nessus:
     networks:

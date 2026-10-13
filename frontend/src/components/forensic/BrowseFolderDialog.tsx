@@ -5,7 +5,6 @@ import { Button, Modal } from "../ui";
 import {
   listOfficeServerDirectory,
   listOfficeServerDriveLetters,
-  startHostDriveAgentFromBrowser,
   type HostDirectoryEntry,
   type HostDriveVolume,
 } from "../../lib/hostDriveHelper";
@@ -63,68 +62,26 @@ function joinWindowsPath(base: string, name: string): string {
   return `${root}\\${name}`;
 }
 
-function volumeLetter(volume: HostDriveVolume): string {
-  return volume.letter.replace(/:$/, "").toUpperCase();
-}
-
-function isExternalVolume(volume: HostDriveVolume): boolean {
-  if (volume.external || volume.drive_type === "removable") return true;
-  const bus = (volume.bus_type || "").toLowerCase();
-  return bus === "usb" || bus === "1394" || bus === "sd";
-}
-
-function driveBadge(volume: HostDriveVolume): string | null {
-  const letter = volumeLetter(volume);
-  if (isExternalVolume(volume)) {
-    const media = (volume.media_type || "").toLowerCase();
-    if (volume.drive_type === "removable" && media !== "hdd" && media !== "ssd") return "USB";
-    if (media === "ssd") return "External SSD";
-    if (media === "hdd") return "External HDD";
-    return volume.drive_type === "removable" ? "USB" : "External HDD/SSD";
-  }
-  if (volume.drive_type === "network") return "Network";
-  if (volume.drive_type === "fixed" && letter !== "C") return "HDD/SSD";
-  return null;
-}
-
 function recommendLetters(volumes: HostDriveVolume[], fromAgent: string[]): string[] {
   const fromMount = fromAgent.map((x) => x.replace(/:$/, "").toUpperCase()).filter(Boolean);
-  const external = volumes
-    .filter((v) => isExternalVolume(v) || v.mounted === false)
-    .map((v) => volumeLetter(v))
+  if (fromMount.length) return fromMount;
+  return volumes
+    .filter((v) => v.drive_type === "removable" || v.mounted === false)
+    .map((v) => v.letter.replace(/:$/, "").toUpperCase())
     .filter((letter) => letter && letter !== "C");
-  return [...new Set([...external, ...fromMount])];
 }
 
 function sortVolumes(volumes: HostDriveVolume[], recommended: string[]): HostDriveVolume[] {
   const rec = new Set(recommended);
   return [...volumes].sort((a, b) => {
-    const al = volumeLetter(a);
-    const bl = volumeLetter(b);
-    const ar = rec.has(al) || isExternalVolume(a) ? 0 : 1;
-    const br = rec.has(bl) || isExternalVolume(b) ? 0 : 1;
+    const al = a.letter.replace(/:$/, "").toUpperCase();
+    const bl = b.letter.replace(/:$/, "").toUpperCase();
+    const ar = rec.has(al) || a.drive_type === "removable" ? 0 : 1;
+    const br = rec.has(bl) || b.drive_type === "removable" ? 0 : 1;
     if (ar !== br) return ar - br;
     return al.localeCompare(bl);
   });
 }
-
-function volumeSnapshot(volumes: HostDriveVolume[]): string {
-  return volumes
-    .map((v) =>
-      [
-        volumeLetter(v),
-        v.drive_type || "",
-        v.bus_type || "",
-        v.label || "",
-        v.mounted ? "1" : "0",
-        v.external ? "1" : "0",
-      ].join(":")
-    )
-    .sort()
-    .join("|");
-}
-
-const DRIVE_WATCH_MS = 8_000;
 
 export function BrowseFolderDialog({
   open,
@@ -149,63 +106,39 @@ export function BrowseFolderDialog({
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
   const [drivesLoading, setDrivesLoading] = useState(false);
-  const [helperStarting, setHelperStarting] = useState(false);
   const [agentLetters, setAgentLetters] = useState<string[]>([]);
   const [helperFromDrives, setHelperFromDrives] = useState<boolean | null>(null);
   const recommended = recommendLetters(windowsVolumes, agentLetters.length ? agentLetters : recommendedLetters);
   const recommendedKey = recommended.join(",");
   const helperKnownOnline = helperOnline === true || helperFromDrives === true;
-  const helperLabel = helperKnownOnline
-    ? "online"
-    : helperStarting
-      ? "starting…"
-      : helperOnline === false || helperFromDrives === false
-        ? "offline"
-        : "checking…";
   const loadSeq = useRef(0);
-  const volumesRef = useRef<HostDriveVolume[]>([]);
-  volumesRef.current = windowsVolumes;
-  const loadDrivesRef = useRef<(opts?: { quiet?: boolean }) => Promise<void>>(async () => {});
 
-  async function loadDrives(opts?: { quiet?: boolean }) {
+  async function loadDrives() {
     const seq = ++loadSeq.current;
-    const quiet = Boolean(opts?.quiet);
-    if (!quiet) {
-      setDrivesLoading(true);
-      setBrowseError(null);
-    }
+    setDrivesLoading(true);
+    setBrowseError(null);
     try {
-      const host = await listOfficeServerDriveLetters(quiet ? 8000 : 12000, { fresh: true });
+      const host = await listOfficeServerDriveLetters(12000);
       if (seq !== loadSeq.current) return;
       if (typeof host?.helper_online === "boolean") {
         setHelperFromDrives(host.helper_online);
       }
       const volumes = (host?.volumes || []).filter((v) => v.drive_type !== "cdrom");
-      const letters = host?.drives || [];
-      const next = volumes.length
-        ? volumes
-        : letters.map((letter) => ({ letter, drive_type: "fixed" as const }));
-      if (next.length) {
-        setWindowsVolumes((prev) => (volumeSnapshot(prev) === volumeSnapshot(next) ? prev : next));
-        setBrowseError((err) =>
-          err && /no hdd|not detected|helper is offline|office hostdrive/i.test(err) ? null : err
-        );
+      if (volumes.length) {
+        setWindowsVolumes(volumes);
         return;
       }
-      // A quiet poll must not wipe drives already on screen when the helper
-      // blips offline. An online empty result means they were unplugged.
-      if (quiet && volumesRef.current.length && host?.helper_online !== true) return;
+      const letters = host?.drives || [];
+      if (letters.length) {
+        setWindowsVolumes(letters.map((letter) => ({ letter, drive_type: "fixed" as const })));
+        return;
+      }
       setWindowsVolumes([]);
-      setBrowseError(
-        host?.helper_online === false
-          ? "HostDrive helper is offline. It is started automatically, the same way mobile USB detection does. Plug in the HDD, SSD, or pendrive once it is online."
-          : host?.message || host?.error || "No HDD, SSD, USB, pendrive or mapped drive was detected."
-      );
+      setBrowseError(host?.message || host?.error || "No HDD, SSD, USB, pendrive or mapped drive was detected.");
     } finally {
-      if (seq === loadSeq.current && !quiet) setDrivesLoading(false);
+      if (seq === loadSeq.current) setDrivesLoading(false);
     }
   }
-  loadDrivesRef.current = loadDrives;
 
   useEffect(() => {
     if (!open) {
@@ -217,40 +150,14 @@ export function BrowseFolderDialog({
       setBrowseEntries([]);
       setBrowseError(null);
       setDrivesLoading(false);
-      setHelperStarting(false);
       setAgentLetters([]);
       setHelperFromDrives(null);
       return;
     }
-    let cancelled = false;
     setAgentLetters(recommendedLettersKey ? recommendedLettersKey.split(",") : []);
-    void (async () => {
-      setHelperStarting(true);
-      // Same entry as mobile acquisition: start the Windows helper only when
-      // it is offline, and list volumes at the same time so disks Docker can
-      // already see are not delayed by helper startup.
-      const started = startHostDriveAgentFromBrowser(20_000);
-      try {
-        await loadDrivesRef.current();
-        const health = await started;
-        if (cancelled) return;
-        if (health?.ok) setHelperFromDrives(true);
-        await loadDrivesRef.current({ quiet: true });
-      } finally {
-        if (!cancelled) setHelperStarting(false);
-      }
-    })();
-    const id = window.setInterval(() => {
-      void loadDrivesRef.current({ quiet: true });
-    }, DRIVE_WATCH_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-      loadSeq.current += 1;
-    };
-    // Load once when the dialog opens, then watch for newly attached media.
-    // A new recommendedLetters array from the parent poll must not restart
-    // detection — that was the flicker.
+    void loadDrives();
+    // Load once when the dialog opens. A new recommendedLetters array from the
+    // parent poll must not restart detection — that was the flicker.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -365,7 +272,7 @@ export function BrowseFolderDialog({
                 Detection and browsing are read-only. Opening a drive does not upload evidence or restart Docker; the selected directory is mounted only when extraction starts.
               </p>
               <p className="mt-0.5 text-[11px] text-ink-500">
-                HostDrive helper: {helperLabel}. Watching for HDD, SSD, USB/pendrive and mapped drives — plug one in and it appears here automatically.
+                HostDrive helper: {helperKnownOnline ? "online" : helperOnline === false ? "offline" : "checking…"}
               </p>
             </div>
             <div className="flex flex-wrap gap-1.5">
@@ -377,7 +284,7 @@ export function BrowseFolderDialog({
               >
                 Refresh server drives
               </Button>
-              {!windowsVolumes.length && !helperKnownOnline && !helperStarting && onStartAgent ? (
+              {!windowsVolumes.length && !helperKnownOnline && onStartAgent ? (
                 <Button
                   variant="outline"
                   className="h-7 text-xs"
@@ -392,12 +299,8 @@ export function BrowseFolderDialog({
             </div>
           </div>
 
-          {(drivesLoading || (helperStarting && !helperKnownOnline)) && !windowsVolumes.length ? (
-            <p className="text-xs text-ink-500">
-              {helperStarting
-                ? "Starting HostDrive helper and detecting HDD, SSD, USB/pendrive and mapped drives…"
-                : "Detecting HDD / SSD / USB / mapped drives…"}
-            </p>
+          {drivesLoading && !windowsVolumes.length ? (
+            <p className="text-xs text-ink-500">Detecting HDD / SSD / USB / mapped drives…</p>
           ) : null}
 
           {browseError ? (
@@ -409,10 +312,9 @@ export function BrowseFolderDialog({
           {windowsVolumes.length ? (
             <div className="flex flex-wrap gap-1.5">
               {sortVolumes(windowsVolumes, recommended).map((vol) => {
-                const letter = volumeLetter(vol);
+                const letter = vol.letter.toUpperCase();
                 const active = Boolean(browsePath?.toUpperCase().startsWith(`${letter}:`));
                 const suggested = recommended.includes(letter);
-                const badge = driveBadge(vol);
                 return (
                   <button
                     key={letter}
@@ -428,8 +330,6 @@ export function BrowseFolderDialog({
                   >
                     <HardDrive className="h-3.5 w-3.5 text-brand-600" />
                     {letter}:{vol.label ? <span className="text-ink-500">{vol.label}</span> : null}
-                    {badge ? <span className="text-ink-500">{badge}</span> : null}
-                    {vol.size_bytes ? <span className="text-ink-400">{formatBytes(vol.size_bytes)}</span> : null}
                     {suggested ? <span className="text-brand-800">new</span> : null}
                   </button>
                 );

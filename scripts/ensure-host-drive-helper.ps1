@@ -11,7 +11,7 @@ $kit = Join-Path $root "scripts\ensure-examiner-kit.ps1"
 $networkConfig = Join-Path $root "scripts\configure-host-drive-helper-network.ps1"
 $helper = Join-Path $root "scripts\host-drive-helper.ps1"
 $agent = Join-Path $root "scripts\hostdrive-agent.ps1"
-$ExpectedHelperVersion = "5.51"
+$ExpectedHelperVersion = "5.50"
 
 function Test-IsAdministrator {
     try {

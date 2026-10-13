@@ -208,11 +208,7 @@ def seal_tail_harvest(details: dict[str, Any], host: str, *, reason: str) -> boo
 
 
 def _patch_job_best_effort(api: CentralApi, job_id: str, payload: dict[str, Any]) -> bool | None:
-    """Return True on success or False on uncertain central state.
-
-    A 404 is not proof of cancellation: routing, tenant schemas and scanner
-    assignment can change during an outage. Preserve local OpenVAS tasks.
-    """
+    """Return True on success, False when the update should be retried, None when the job is gone."""
     try:
         api.patch_job(job_id, payload)
         return True
@@ -220,11 +216,10 @@ def _patch_job_best_effort(api: CentralApi, job_id: str, payload: dict[str, Any]
         status = exc.response.status_code if exc.response is not None else 0
         if status == 404:
             log.error(
-                "Central returned 404 for job %s progress; preserving local OpenVAS "
-                "tasks while central job/tenant/ownership is investigated",
+                "Central API has no job %s for this scanner; progress cannot be saved",
                 job_id,
             )
-            return False
+            return None
         log.warning(
             "Central API progress update failed for job %s; scan will continue and retry on the next poll",
             job_id,
@@ -475,13 +470,9 @@ def _merge_chunk_details(
                 normalized_assessed.add(host.casefold())
     missing = [t for t in required_targets if t not in normalized_assessed]
 
-    # Hosts we intended to scan but OpenVAS never evidenced → eliminate as unreachable.
-    if mapped == "completed" and missing:
-        for host in missing:
-            skipped.append({"host": host, "reason": "unreachable"})
-            skipped_set.add(host)
-        required_targets = [t for t in required_targets if t not in skipped_set]
-        missing = []
+    # A missing report host is NOT proof of unreachability or assessment.
+    # Explicit skips remain in the original target scope and block a clean result.
+    missing = [t for t in all_targets if t not in normalized_assessed]
 
     coverage_ok = (
         mapped == "completed"
@@ -512,7 +503,7 @@ def _merge_chunk_details(
             "report_ids": report_ids,
             "task_status": merged_task_status,
             "progress": progress,
-            "hosts_attempted": len(required_targets),
+            "hosts_attempted": len(all_targets),
             "hosts_assessed": len(normalized_assessed) if normalized_assessed else 0,
             "assessed_hosts": sorted(assessed),
             "skipped_hosts": skipped,
@@ -524,7 +515,7 @@ def _merge_chunk_details(
             "service_coverage": service_coverage,
             "policy_snapshots": policy_snapshots,
             "degraded_hosts": sorted(
-                h for h, c in host_coverage.items() if str((c or {}).get("verdict") or "").startswith("degraded")
+                h for h, c in host_coverage.items() if str((c or {}).get("verdict") or "") != "full"
             ),
             "scan_start": min(scan_starts) if scan_starts else (now_iso if assessment_complete and skipped else None),
             "scan_end": max(scan_ends) if scan_ends else (now_iso if assessment_complete and skipped else None),
@@ -842,7 +833,9 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 from agent.port_discovery import discovery_plan
 
                 port_plan = discovery_plan(chunk)
-                discovered_range = str(port_plan.get("port_range") or "").strip() or None
+                # A fast probe only reports observations; it never changes GMP scope.
+                observed_port_range = str(port_plan.get("observed_port_range") or "").strip()
+                discovered_range = None
                 open_by_host = port_plan.get("open_ports") or {}
                 host_open = list(open_by_host.get(host) or [])
                 emit_ip_event(
@@ -851,7 +844,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     "port_discovery",
                     open_ports=host_open,
                     open_port_count=len(host_open),
-                    port_range=discovered_range,
+                    observed_port_range=observed_port_range,
+                    scan_range_source="Greenbone effective policy (not reduced by pre-probe)",
                     fallback=bool(port_plan.get("fallback")),
                     chunk_index=idx,
                 )
@@ -862,7 +856,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         job_id,
                         host,
                         len(host_open),
-                        discovered_range,
+                        observed_port_range,
                     )
                 else:
                     log.info(
@@ -1281,7 +1275,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 last_high_progress_notice = now
 
-        patch_result = _patch_job_best_effort(
+        if _patch_job_best_effort(
             api,
             job_id,
             {
@@ -1292,12 +1286,14 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 "chunk_tasks": _chunk_tasks_blob(),
                 "target_progress": target_progress,
             },
-        )
-        if not patch_result:
-            log.warning(
-                "Central progress for job %s is not confirmed; local OpenVAS "
-                "tasks are preserved and will be polled again", job_id,
+        ) is None:
+            log.error(
+                "Job %s is not on the central server for this scanner; stopping the local OpenVAS tasks",
+                job_id,
             )
+            for tid in list(in_flight.values()):
+                openvas.stop(tid)
+            return
 
         if all_terminal:
             # Re-merge only finished chunks for upload.
@@ -1658,19 +1654,7 @@ def main() -> None:
                     )
                     time.sleep(queue_poll)
                     continue
-                # Central outages must not terminate active OpenVAS workers or
-                # flood logs with identical transport tracebacks. Only a
-                # successful claim may launch another local scan.
-                if api.is_retryable(exc):
-                    log.warning(
-                        "Central scanner API temporarily unavailable (%s%s); "
-                        "retaining %d running job(s), will retry",
-                        exc.__class__.__name__,
-                        f" HTTP {status}" if status is not None else "",
-                        len(active),
-                    )
-                else:
-                    log.exception("Dispatcher loop error")
+                log.exception("Dispatcher loop error")
                 time.sleep(queue_poll)
 
 

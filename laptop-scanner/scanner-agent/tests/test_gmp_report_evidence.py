@@ -48,7 +48,7 @@ def test_done_report_wrong_host_is_not_complete():
     assert evidence["missing_ip_targets"] == ["192.168.0.163"]
 
 
-def test_merge_promotes_skipped_gap_to_complete():
+def test_merge_does_not_promote_skipped_gap_to_complete():
     from agent.main import _merge_chunk_details
 
     merged = _merge_chunk_details(
@@ -79,8 +79,8 @@ def test_merge_promotes_skipped_gap_to_complete():
         skipped_hosts=[{"host": "192.168.0.103", "reason": "unreachable"}],
     )
     assert merged["status"] == "completed"
-    assert merged["evidence"]["assessment_complete"] is True
-    assert merged["evidence"]["missing_ip_targets"] == []
+    assert merged["evidence"]["assessment_complete"] is False
+    assert merged["evidence"]["missing_ip_targets"] == ["192.168.0.103"]
 
 
 def test_merge_preserves_distinct_rows_with_the_same_summary_key():

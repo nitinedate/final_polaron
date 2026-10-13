@@ -131,38 +131,46 @@ function Get-GreenboneFeedState {
 }
 
 function Wait-GreenboneFeedInventory([int]$Minutes) {
-    # start-laptop used to pass 5 minutes. The first VT load is longer than that,
-    # and ending the script closed the window before Full and fast could be built.
-    $minimumMinutes = [Math]::Max(1, $Minutes)
-    $ceilingMinutes = [Math]::Max($minimumMinutes, 180)
-    $deadline = (Get-Date).AddMinutes($minimumMinutes)
-    $hardStop = (Get-Date).AddMinutes($ceilingMinutes)
+    # Respect the configured timeout. Never turn a short startup check into
+    # an implicit three-hour wait. No scanner restart or volume reset here.
+    $deadline = (Get-Date).AddMinutes([Math]::Max(1, $Minutes))
     $try = 0
-    while ((Get-Date) -lt $hardStop) {
+    $previous = ''
+    while ((Get-Date) -lt $deadline) {
         $try++
         $state = Get-GreenboneFeedState
         if ($state.Ready) {
-            Write-Host '[OK] OSPd OpenVAS NVT inventory is loaded.' -ForegroundColor Green
+            Write-Host '[OK] OSPd NVT inventory is available.' -ForegroundColor Green
             if ($state.Text) { Write-Host $state.Text }
             return $true
         }
-        $stillLoading = [string]$state.Text -match 'nvt_inventory_unavailable|nvt_inventory_loading|feed_syncing|still in progress|still loading|still synchronizing'
-        if ((Get-Date) -ge $deadline) {
-            if ($stillLoading) {
-                $deadline = (Get-Date).AddMinutes(5)
-                Write-Host ("[INFO] OSPd is still loading the VT feed (attempt {0}). This window stays open and will not shut down while loading (limit {1} minutes)." -f $try, $ceilingMinutes) -ForegroundColor Yellow
-            } else {
-                break
-            }
-        } elseif ($try -eq 1 -or ($try % 4) -eq 0) {
-            Write-Host ("[INFO] OSPd is still loading the VT feed (attempt {0}). No restart will be performed while loading." -f $try) -ForegroundColor Yellow
+        if ($state.ExitCode -eq 2 -and $state.Text -notmatch 'nvt_inventory_unavailable|nvt_inventory_loading|feed_syncing') {
+            Write-Host '[WARN] Feed probe failed rather than reporting loading. Diagnostics will be collected.' -ForegroundColor Yellow
+            Write-Host $state.Text
+            return $false
         }
-        if ($try -eq 1 -or ($try % 4) -eq 0) {
+        if ($state.Text -ne $previous -or $try -eq 1 -or ($try % 4) -eq 0) {
+            Write-Host ("[WAITING] NVT inventory unavailable (probe {0}, timeout {1} minute(s))." -f $try, $Minutes) -ForegroundColor Yellow
             if ($state.Text) { Write-Host $state.Text }
+            $previous = $state.Text
         }
-        Start-Sleep -Seconds 15
+        $remaining = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
+        if ($remaining -gt 0) { Start-Sleep -Seconds ([Math]::Min(15, $remaining)) }
     }
     return $false
+}
+
+function Show-GreenboneDiagnostics {
+    Write-Host '[DIAGNOSTICS] Recent Greenbone container state and logs (read only):' -ForegroundColor Yellow
+    foreach ($service in @('ospd-openvas', 'gvmd', 'redis-gvm', 'pg-gvm')) {
+        $cid = Get-ServiceContainerId $service
+        if ($cid) {
+            $inspect = Run-Docker -ArgumentList @('inspect', '-f', '{{.State.Status}} restart={{.RestartCount}} oom={{.State.OOMKilled}}', $cid) -AllowFailure
+            Write-Host ("{0}: {1}" -f $service, $inspect.Text)
+        }
+    }
+    $logs = Compose -ComposeArguments @('logs', '--tail', '60', 'ospd-openvas', 'gvmd') -AllowFailure
+    if ($logs.Text) { Write-Host $logs.Text }
 }
 
 function Rebuild-GvmdData {
@@ -278,9 +286,12 @@ $vtPresent = Test-FeedVolume -Service 'vulnerability-tests' -FindExpression "fin
 $dataPresent = Test-FeedVolume -Service 'data-objects' -FindExpression "find /mnt -type f -name '*.xml' -print -quit 2>/dev/null"
 Write-Host ("VT files present: {0}" -f $vtPresent)
 Write-Host ("GVMD data-object XML present: {0}" -f $dataPresent)
+if (-not $vtPresent -or -not $dataPresent) { Write-Host "[WARN] Feed files are missing or still copying. Check feed container logs; do not reset volumes." -ForegroundColor Yellow }
 
-if ($RefreshFeedContainers -or (-not $vtPresent) -or (-not $dataPresent)) {
-    Write-Host '[INFO] Refreshing feed data containers from the already-installed images.'
+if ($RefreshFeedContainers) {
+    # A manual, explicit opt-in only: presence checks are not proof of corruption.
+
+    Write-Host '[INFO] Explicitly requested feed-container refresh. Persistent volumes are preserved.'
     $feedServices = @('vulnerability-tests', 'notus-data', 'scap-data', 'cert-bund-data', 'dfn-cert-data', 'data-objects', 'report-formats')
     $refresh = Compose -ComposeArguments (@('up', '-d', '--force-recreate') + $feedServices) -AllowFailure
     if ($refresh.Text) { Write-Host $refresh.Text }
@@ -311,9 +322,7 @@ if (-not (Wait-GreenboneFeedInventory -Minutes $FeedLoadWaitMinutes)) {
     Write-Host 'The laptop agent remains online but will not claim scan jobs until the NVT inventory is ready.'
     Write-Host 'Do NOT run docker compose down -v and do NOT repeatedly restart ospd-openvas.'
     Write-Host ''
-    Write-Host 'Recent ospd-openvas logs:'
-    $ospdLogs = Compose -ComposeArguments @('logs', '--tail', '120', 'ospd-openvas') -AllowFailure
-    Write-Host $ospdLogs.Text
+    Show-GreenboneDiagnostics
     exit 10
 }
 

@@ -175,7 +175,8 @@ export interface ScanJobSeveritySummary {
     limitation: string;
     counts: Record<string, number>;
     services: { service_id: string; name: string; status: string; reason: string;
-      endpoint_count: number; source_result_ids: string[]; credentialed_checks: string }[];
+      endpoint_count: number; port_hint_count?: number; port_hints?: string[];
+      source_result_ids: string[]; credentialed_checks: string }[];
     ip_forwarding: { status: string; reason: string };
   }>;
   policy_snapshots?: Record<string, { port_range?: string; snapshot_status: string;
@@ -189,7 +190,6 @@ export interface ScanJobSeveritySummary {
     verified: boolean;
     label: string;
     clean_eligible: boolean;
-    service_coverage_complete?: boolean;
     plugin_error_count?: number;
   };
 }

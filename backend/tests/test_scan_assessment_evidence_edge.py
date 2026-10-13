@@ -75,7 +75,7 @@ def test_one_assessed_one_skipped_is_verified_not_clean(monkeypatch):
     assert out["target_count"] == 2
 
 
-def test_all_targets_assessed_is_verified_clean(monkeypatch):
+def test_all_targets_assessed_without_service_evidence_is_not_clean(monkeypatch):
     job = {
         "id": "j1", "status": "completed", "target_count": 2, "active_target_count": 2,
         "orchestration_json": {"edge_agent": True}, "external_scan_id": "task1", "error": None,
@@ -91,5 +91,5 @@ def test_all_targets_assessed_is_verified_clean(monkeypatch):
     }
     out = _run(monkeypatch, job=job, result=result)
     assert out["verified"] is True
-    assert out["clean_eligible"] is True
-    assert out["state"] == "verified"
+    assert out["clean_eligible"] is False
+    assert out["state"] == "service_coverage_unverified"

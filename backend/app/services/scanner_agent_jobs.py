@@ -1313,7 +1313,7 @@ def evaluate_edge_ingest_verdict(
         "required_count": required_count,
         "scan_timestamps_ok": scan_timestamps_ok,
         "plugin_health_ok": plugin_health_ok,
-        "clean_eligible": bool(verified_complete and plugin_health_ok and result_payload_ok and not skipped_details),
+        "clean_eligible": False,  # No automatic clean verdict from engine state alone.
         "result_payload_ok": result_payload_ok,
         "effective_report_id": effective_report_id,
         "scan_start": scan_start,
@@ -1496,7 +1496,7 @@ def ingest_agent_results(
         # A scan that skipped any requested host is verified as an execution,
         # but it is not eligible for a "clean/no vulnerabilities" conclusion
         # over the full requested scope.
-        "clean_eligible": bool(verified_complete and plugin_health_ok and result_payload_ok and not skipped_details),
+        "clean_eligible": False,  # No automatic clean verdict from engine state alone.
         "completed_with_warnings": bool(verified_complete and (plugin_errors > 0 or bool(skipped_details))),
         "result_payload_ok": result_payload_ok,
         "report_result_count": result_count,
@@ -1533,6 +1533,13 @@ def ingest_agent_results(
         host: analyze_services(vulnerabilities, host=host, coverage=(host_coverage or {}).get(host))
         for host in target_list
     }
+    # Engine completion is different from service-level assurance. Even a
+    # completed OpenVAS job with no scanner errors cannot claim a clean result
+    # while the mandatory service catalog lacks native check-pass evidence.
+    service_scope_verified = bool(orch["service_coverage"]) and all(
+        isinstance(value, dict) and value.get("coverage_complete") is True
+        for value in orch["service_coverage"].values()
+    )
     saved_policies = clip_policy_snapshots(orch.get("policy_snapshots"), target_list)
     saved_policies.update(clip_policy_snapshots(policy_snapshots, target_list))
     orch["policy_snapshots"] = saved_policies
@@ -1552,7 +1559,8 @@ def ingest_agent_results(
         "message": progress_message,
     }
     orch["assessment_complete"] = verified_complete
-    orch["clean_eligible"] = bool(verified_complete and plugin_health_ok and result_payload_ok and not skipped_details)
+    orch["clean_eligible"] = bool(verified_complete and plugin_health_ok and result_payload_ok and not skipped_details and service_scope_verified)
+    orch["service_scope_verified"] = service_scope_verified
     orch["completed_with_warnings"] = bool(verified_complete and (plugin_errors > 0 or bool(skipped_details)))
     orch["hosts_attempted"] = attempted
     orch["hosts_assessed"] = assessed
@@ -1582,15 +1590,19 @@ def ingest_agent_results(
                 str(h): {"verdict": "degraded_legacy_signature", "reason": reason, "open_tcp_ports": [], "nvts_launched": 0}
                 for h in assessed_list
             }
+    if not host_cov:
+        orch["clean_eligible"] = False
+        orch["service_scope_verified"] = False
+        orch["coverage_limitation"] = "No per-host scanner/port evidence was submitted"
     if isinstance(host_cov, dict) and host_cov:
         tp = dict(orch.get("target_progress") or {}) if isinstance(orch.get("target_progress"), dict) else {}
         degraded_now: list[str] = []
         for cov_host, cov in host_cov.items():
             if not isinstance(cov, dict):
                 continue
-            verdict = str(cov.get("verdict") or "full")
+            verdict = str(cov.get("verdict") or "unknown")
             entry = dict(tp.get(cov_host) or {})
-            if verdict.startswith("degraded"):
+            if verdict != "full" or cov.get("coverage_complete") is not True:
                 degraded_now.append(str(cov_host))
                 entry["status"] = "incomplete"
                 entry["activity"] = f"Incomplete — {str(cov.get('reason') or verdict)[:160]}"
@@ -1611,7 +1623,7 @@ def ingest_agent_results(
             orch["clean_eligible"] = False
             orch["partial"] = True
             orch["partial_reason"] = (
-                f"{len(degraded_now)} host(s) incomplete — port scan did not finish: {', '.join(degraded_now[:5])}"
+                f"{len(degraded_now)} host(s) have unverified service/port coverage: {', '.join(degraded_now[:5])}"
             )[:500]
             orch["edge_progress"] = {"pct": 100.0, "message": orch["partial_reason"]}
     orch["reachable_target_count"] = required_count
@@ -1632,6 +1644,7 @@ def ingest_agent_results(
         "partial": bool(orch.get("partial")),
         "partial_reason": orch.get("partial_reason"),
         "clean_eligible": bool(orch.get("clean_eligible")),
+        "service_scope_verified": bool(orch.get("service_scope_verified")),
         "completed_with_warnings": bool(orch.get("completed_with_warnings")),
         "host_coverage": host_cov,
         "service_coverage": orch["service_coverage"],
@@ -1708,6 +1721,7 @@ def ingest_agent_results(
         "partial": bool(orch.get("partial")),
         "assessment_complete": verified_complete,
         "clean_eligible": bool(orch.get("clean_eligible")),
+        "service_scope_verified": bool(orch.get("service_scope_verified")),
         "completed_with_warnings": bool(orch.get("completed_with_warnings")),
         "plugin_error_count": plugin_errors,
         "hosts_attempted": attempted,

@@ -48,7 +48,7 @@ _VULN_PROFILES = frozenset({"vuln", "nexus", "nessus"})
 # default because exhaustive UDP can dominate scan time on filtered networks.
 PRIORITY_UDP_PORTS = (
     "U:53,U:67-69,U:88,U:111,U:123,U:137-138,U:161-162,U:389,U:500,U:514,U:520,U:623,U:902,U:1434,"
-    "U:1701,U:1812-1813,U:1900,U:2049,U:3389,U:4500,U:4789,U:5004,U:5060,U:5353,U:11211,U:5683,U:47808"
+    "U:1701,U:1812-1813,U:1900,U:2049,U:3389,U:4500,U:4789,U:5004,U:5060,U:5353,U:11211"
 )
 
 
@@ -1415,7 +1415,9 @@ class LocalOpenVAS:
         self.timeout_retry = retry_raw
         self.open_sock_max_attempts = sock_raw
         self.scan_config_name = (os.environ.get("GVM_SCAN_CONFIG") or "Full and fast").strip()
-        full_assessment = self.port_profile == "full"
+        # Nessus/Nexus catalog scanning must not optimize away service checks.
+        # The fast/common profiles can retain their explicitly fast behavior.
+        full_assessment = self.port_profile == "full" or self.port_profile in _VULN_PROFILES
         self.optimize_test = (
             os.environ.get("GVM_OPTIMIZE_TEST") or ("no" if full_assessment else "yes")
         ).strip().lower()

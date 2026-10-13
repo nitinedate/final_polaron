@@ -189,7 +189,7 @@ if($readyCheck.ExitCode -eq 0){
         if(Test-Path $repairScript){
             $initialWait=10
             $recoveryWait=20
-            $feedLoadWait=60
+            $feedLoadWait=2
             if($e.ContainsKey('GREENBONE_INITIAL_WAIT_MIN')){
                 $tmp=0; if([int]::TryParse([string]$e['GREENBONE_INITIAL_WAIT_MIN'],[ref]$tmp)){$initialWait=[Math]::Max(1,$tmp)}
             }

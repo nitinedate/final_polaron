@@ -13,7 +13,7 @@ proxy_hide_header Server;
 proxy_hide_header Date;
 proxy_buffering off;
 proxy_cache off;
-proxy_connect_timeout 8s;
+proxy_connect_timeout 30s;
 proxy_send_timeout 7d;
 proxy_read_timeout 7d;
 send_timeout 7d;

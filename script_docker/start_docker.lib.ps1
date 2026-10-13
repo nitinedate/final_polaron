@@ -323,16 +323,9 @@ function Ensure-PublicCertificate {
     $check = Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @("inspect", "--name", $CertName, "--identity", $Identity)
     if ($check.managed) {
         # Certbot decides whether renewal is due (including ACME Renewal Information).
-        # A failed challenge must not block startup while the current certificate
-        # is still inside its validity window. The renewal sidecar retries later.
-        try {
-            Invoke-Docker -Title "Check renewal for $Identity" -DockerArgs ($ComposeArgs + @(
-                "run", "--rm", "--no-deps", "--pull", "missing", "certbot", "renew",
-                "--cert-name", $CertName, "--non-interactive", "--no-random-sleep-on-renew"))
-        } catch {
-            Write-Host "    $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "    Renewal did not finish. The current certificate will be used if it is still valid." -ForegroundColor Yellow
-        }
+        Invoke-Docker -Title "Check renewal for $Identity" -DockerArgs ($ComposeArgs + @(
+            "run", "--rm", "--no-deps", "--pull", "missing", "certbot", "renew",
+            "--cert-name", $CertName, "--non-interactive", "--no-random-sleep-on-renew"))
     } else {
         $issue = Get-CertbotIssueArgs -Identity $Identity -CertName $CertName -Email $Email -IsIP:$IsIP
         Invoke-Docker -Title "Issue trusted HTTPS certificate for $Identity" -DockerArgs (

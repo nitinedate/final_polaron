@@ -193,7 +193,9 @@ export function MobileReportPage() {
             jobId={jobId}
             sections={sections.map(withNarrative)}
             onUpdated={(updated) => {
-              setSections((current) => current.map((section) => (section.id === updated.id ? updated : section)));
+              setSections((current) =>
+                current.map((section) => (section.id === updated.id ? updated : section)),
+              );
             }}
           />
         )}

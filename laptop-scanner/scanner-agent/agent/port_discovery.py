@@ -134,7 +134,7 @@ def probe_open_tcp_ports(
 
 
 def discovery_plan(hosts: list[str]) -> dict[str, Any]:
-    """Build a Greenbone port-range plan without reducing fast-profile coverage."""
+    """Build an *observation-only* TCP probe plan. Never narrow Greenbone scope."""
     fallback = candidate_range()
     if not enabled():
         return {
@@ -142,6 +142,7 @@ def discovery_plan(hosts: list[str]) -> dict[str, Any]:
             "port_range": fallback,
             "open_ports": {},
             "open_port_count": 0,
+            "observed_port_range": "",
             "fallback": True,
         }
 
@@ -153,11 +154,13 @@ def discovery_plan(hosts: list[str]) -> dict[str, Any]:
             "port_range": fallback,
             "open_ports": observed,
             "open_port_count": 0,
+            "observed_port_range": "",
             "fallback": True,
         }
     return {
         "enabled": True,
-        "port_range": ports_to_gvm_range(union),
+        "port_range": fallback,
+        "observed_port_range": ports_to_gvm_range(union),
         "open_ports": observed,
         "open_port_count": len(union),
         "fallback": False,
