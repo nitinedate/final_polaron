@@ -283,7 +283,29 @@ class CentralApi:
             parsed = float(raw)
         except (TypeError, ValueError):
             parsed = 0.0
-        self.timeout = 0.0 if parsed <= 0 else parsed
+        # A value of 0 previously removed read/write deadlines, allowing one
+        # progress request to stall scan-control loops indefinitely.
+        self.timeout = parsed if parsed > 0 else 15.0
+        self.connect_timeout = self._bounded_env("CENTRAL_API_CONNECT_TIMEOUT_SEC", 4.0, 1.0, 20.0)
+        self.result_timeout = self._bounded_env("CENTRAL_RESULT_TIMEOUT_SEC", 120.0, 15.0, 600.0)
+        # httpx.Client is thread-safe. Keep-alive avoids a TLS handshake for
+        # each poll/heartbeat/PATCH when several IP tasks are active.
+        self._client = httpx.Client(
+            verify=self.verify,
+            timeout=self._httpx_timeout(),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=30.0),
+        )
+
+    @staticmethod
+    def _bounded_env(name: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(_aetheris_v124_os.getenv(name) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def close(self) -> None:
+        self._client.close()
 
     def set_token(self, token: str) -> None:
         value = (token or "").strip()
@@ -295,12 +317,14 @@ class CentralApi:
 
     def _httpx_timeout(self, timeout: float | None = None) -> httpx.Timeout:
         total = self.timeout if timeout is None else float(timeout)
-        # Connect stays bounded so a black-holed route fails fast; read/write
-        # wait until the server finishes (0 / None = no deadline).
-        if total is None or total <= 0:
-            return httpx.Timeout(None, connect=20.0)
-        connect = min(20.0, max(5.0, total / 4.0))
-        return httpx.Timeout(total, connect=connect, read=total, write=total, pool=connect)
+        if total <= 0:
+            total = 15.0
+        return httpx.Timeout(
+            connect=min(self.connect_timeout, total),
+            read=total,
+            write=total,
+            pool=min(self.connect_timeout, total),
+        )
 
     @staticmethod
     def is_retryable(exc: Exception) -> bool:
@@ -326,18 +350,18 @@ class CentralApi:
         http_timeout = self._httpx_timeout(timeout)
         for attempt in range(1, max(1, attempts) + 1):
             try:
-                with httpx.Client(verify=self.verify, timeout=http_timeout) as client:
-                    r = client.request(
-                        method,
-                        self._url(path),
-                        headers=self.headers,
-                        json=json,
-                        params=params,
-                    )
-                    r.raise_for_status()
-                    if not r.content:
-                        return {}
-                    return r.json()
+                r = self._client.request(
+                    method,
+                    self._url(path),
+                    headers=self.headers,
+                    json=json,
+                    params=params,
+                    timeout=http_timeout,
+                )
+                r.raise_for_status()
+                if not r.content:
+                    return {}
+                return r.json()
             except Exception as exc:
                 last_exc = exc
                 if attempt >= attempts or not self.is_retryable(exc):
@@ -352,7 +376,7 @@ class CentralApi:
             "POST",
             "/api/scanner-agent/logs",
             json={"entries": entries},
-            attempts=2,
+            attempts=1,
         )
 
     def heartbeat(
@@ -370,7 +394,7 @@ class CentralApi:
             "POST",
             "/api/scanner-agent/heartbeat",
             json=payload,
-            attempts=3,
+            attempts=1,
         )
 
     def next_job(self, *, active_job_ids: list[str] | None = None) -> dict[str, Any] | None:
@@ -382,7 +406,7 @@ class CentralApi:
             "GET",
             "/api/scanner-agent/jobs/next",
             params=params,
-            attempts=3,
+            attempts=1,
         )
         return data.get("job")
 
@@ -392,7 +416,7 @@ class CentralApi:
             f"/api/scanner-agent/jobs/{job_id}",
             json=payload,
             params={"agent_instance_id": self.agent_instance_id},
-            attempts=5,
+            attempts=1,  # The next poll retries a progress update without blocking GMP.
         )
 
     def upload_results(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -401,5 +425,6 @@ class CentralApi:
             f"/api/scanner-agent/jobs/{job_id}/results",
             json=payload,
             params={"agent_instance_id": self.agent_instance_id},
-            attempts=8,
+            timeout=self.result_timeout,
+            attempts=3,  # The caller retries indefinitely; never discard results.
         )

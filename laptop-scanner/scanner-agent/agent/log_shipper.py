@@ -31,6 +31,7 @@ class CentralLogHandler(logging.Handler):
         self._buf: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._last_flush = 0.0
+        self._async_flush_lock = threading.Lock()
         self.setFormatter(logging.Formatter("%(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -82,6 +83,30 @@ class CentralLogHandler(logging.Handler):
                 if len(self._buf) > self._max_buffer:
                     self._buf = self._buf[-self._max_buffer :]
             log.debug("log ship skipped (%s)", exc.__class__.__name__)
+
+    def maybe_flush_async(self, *, force: bool = False) -> None:
+        """Ship logs on a daemon thread, never delaying scanner job dispatch.
+
+        A single-flight guard prevents a WAN outage from creating unbounded
+        background threads. The existing bounded buffer retains failed batches.
+        """
+        with self._lock:
+            if not self._buf:
+                return
+        if not self._async_flush_lock.acquire(blocking=False):
+            return
+
+        def flush_once() -> None:
+            try:
+                self.maybe_flush(force=force)
+            finally:
+                self._async_flush_lock.release()
+
+        try:
+            threading.Thread(target=flush_once, name="scanner-log-flush", daemon=True).start()
+        except Exception:
+            self._async_flush_lock.release()
+            raise
 
 
 def install_log_shipper(api: Any) -> CentralLogHandler:
