@@ -155,8 +155,62 @@ function Invoke-StackBuild {
     Invoke-Docker -Title "Build/compile $Name" -DockerArgs $args
 }
 
+function Remove-ForeignComposeContainerNames {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string[]]$ComposeArgs
+    )
+    # A container created outside this Compose project can keep the canonical
+    # service name. Compose then fails with "name already in use" and the
+    # whole product stack stops. Remove only a name holder that is not this
+    # project and service. Volumes and evidence stay in place.
+    $project = "aetheris-$Name"
+    $cfg = Get-ComposeConfig -ComposeArgs $ComposeArgs
+    if (-not $cfg.services) { return }
+    foreach ($property in @($cfg.services.PSObject.Properties)) {
+        $service = [string]$property.Name
+        $spec = $property.Value
+        $expected = @()
+        if ($spec.container_name) {
+            $expected += [string]$spec.container_name
+        } else {
+            $replicas = 1
+            if ($spec.deploy -and $spec.deploy.replicas) { $replicas = [int]$spec.deploy.replicas }
+            if ($replicas -lt 1) { $replicas = 1 }
+            for ($index = 1; $index -le $replicas; $index++) {
+                $expected += "$project-$service-$index"
+            }
+        }
+        foreach ($containerName in $expected) {
+            $ids = @(& docker ps -aq --filter "name=$containerName")
+            if ($LASTEXITCODE -ne 0) { throw "Cannot query containers named $containerName" }
+            foreach ($id in $ids) {
+                $cid = ([string]$id).Trim()
+                if (-not $cid) { continue }
+                $raw = & docker inspect $cid
+                if ($LASTEXITCODE -ne 0) { continue }
+                $item = @((($raw -join "`n") | ConvertFrom-Json))[0]
+                if ([string]$item.Name -ne "/$containerName") { continue }
+                $labels = $item.Config.Labels
+                $ownedProject = ''
+                $ownedService = ''
+                if ($labels) {
+                    $ownedProject = [string]$labels.'com.docker.compose.project'
+                    $ownedService = [string]$labels.'com.docker.compose.service'
+                }
+                if ($ownedProject -eq $project -and $ownedService -eq $service) { continue }
+                $owner = if ($ownedProject -or $ownedService) { "$ownedProject/$ownedService" } else { 'no Compose project' }
+                Write-Warn "Removing $containerName ($cid). It is owned by $owner, so $project/$service cannot take its name."
+                $code = Invoke-DockerNativeSafe -DockerArgs @('rm', '-f', $cid) -Quiet
+                if ($code -ne 0) { throw "Could not remove $containerName, which blocks $project/$service." }
+            }
+        }
+    }
+}
+
 function Invoke-StackUp {
     param([string]$Name, [string[]]$ComposeArgs)
+    Remove-ForeignComposeContainerNames -Name $Name -ComposeArgs $ComposeArgs
     Invoke-Docker -Title "Start $Name" -DockerArgs ($ComposeArgs + @('up', '-d', '--no-build', '--pull', 'missing'))
 }
 
@@ -299,6 +353,7 @@ function Invoke-VulnOneShot {
 
 function Start-VulnerabilityStackPhased {
     param([string[]]$ComposeArgs)
+    Remove-ForeignComposeContainerNames -Name 'vuln' -ComposeArgs $ComposeArgs
     Write-Step 'Start vulnerability control plane (lightweight)'
     Invoke-Docker -Title 'Start vulnerability API' -DockerArgs ($ComposeArgs + @('up','-d','--no-build','--pull','missing','--no-deps','api'))
 
@@ -586,6 +641,8 @@ function Ensure-PublicHttpsEdge {
     Start-PublicHttpsGateway -ComposeArgs $composeArgs -PublicIP $IP -Domain $DNS
     return $composeArgs
 }
+
+if ($env:AETHERIS_START_DOCKER_FUNCTIONS_ONLY -eq '1') { return }
 
 $exitCode = 0
 $isPublic = ($Profile -ne 'local')

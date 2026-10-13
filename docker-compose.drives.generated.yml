@@ -29,18 +29,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: 'G:/'
-        target: '/host/g'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'H:/'
-        target: '/host/h'
-        read_only: true
-        bind:
-          create_host_path: false
   worker-disk:
     volumes:
       - type: bind
@@ -64,18 +52,6 @@ services:
       - type: bind
         source: 'F:/'
         target: '/host/f'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'G:/'
-        target: '/host/g'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'H:/'
-        target: '/host/h'
         read_only: true
         bind:
           create_host_path: false
@@ -105,18 +81,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: 'G:/'
-        target: '/host/g'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'H:/'
-        target: '/host/h'
-        read_only: true
-        bind:
-          create_host_path: false
   worker-mobile:
     volumes:
       - type: bind
@@ -140,18 +104,6 @@ services:
       - type: bind
         source: 'F:/'
         target: '/host/f'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'G:/'
-        target: '/host/g'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'H:/'
-        target: '/host/h'
         read_only: true
         bind:
           create_host_path: false
@@ -181,18 +133,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: 'G:/'
-        target: '/host/g'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'H:/'
-        target: '/host/h'
-        read_only: true
-        bind:
-          create_host_path: false
   worker-agent:
     volumes:
       - type: bind
@@ -216,18 +156,6 @@ services:
       - type: bind
         source: 'F:/'
         target: '/host/f'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'G:/'
-        target: '/host/g'
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: 'H:/'
-        target: '/host/h'
         read_only: true
         bind:
           create_host_path: false
