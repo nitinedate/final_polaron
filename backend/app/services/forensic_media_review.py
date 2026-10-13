@@ -8,16 +8,19 @@ sampling coverage is reported explicitly; unsampled frames are never called clea
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import io
 import json
 import logging
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import threading
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -409,6 +412,177 @@ def _store(db, job_id, row, kind, status, description, details, *, error=None):
         log.warning("Media review saved the observation but not the artifact mirror for %s", row.get("file_path"), exc_info=True)
 
 
+_frame_reader: contextvars.ContextVar = contextvars.ContextVar("media_cuda_reader", default=None)
+_CUDA_PROMPT = "Text Recognition:"
+
+
+def media_cuda_requested() -> bool:
+    """CUDA observations stay on unless this process is explicitly told to stay on CPU."""
+    raw = os.environ.get("FORENSIC_MEDIA_REVIEW_CUDA", "auto").strip().lower()
+    return raw not in {"0", "false", "no", "off", "cpu"}
+
+
+class _CudaObservationBatcher:
+    """One CUDA owner. The shard workers only hand it unclear frames."""
+
+    def __init__(self) -> None:
+        self._in: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="media-review-cuda", daemon=True)
+        self._slot = None
+        self.ready = False
+
+    def start(self) -> bool:
+        from app.services.gpu_thermal import prepare_gpu_for_heavy_work
+        from app.services.job_locks import gpu_heavy_slot
+        from app.services.ocr_gpu import _cuda_usable, _get_glm_ocr
+
+        if not _cuda_usable():
+            return False
+        self._slot = gpu_heavy_slot("media_review_cuda", fail_closed=False, wait_sec=5)
+        try:
+            held = self._slot.__enter__()
+        except Exception:
+            log.exception("CUDA image/video observations could not reserve the GPU")
+            self._slot = None
+            return False
+        if not held:
+            self.close()
+            return False
+        try:
+            prepare_gpu_for_heavy_work(reason="media_review_cuda", unload_ollama=True)
+            model, _processor, _device = _get_glm_ocr()
+            if model is None:
+                self.close()
+                return False
+            self.ready = True
+            self._thread.start()
+            return True
+        except Exception:
+            log.exception("CUDA image/video observations could not start")
+            self.close()
+            return False
+
+    def read(self, image_bytes: bytes) -> tuple[str, float]:
+        if not self.ready:
+            raise RuntimeError("CUDA observation stopped")
+        box: queue.Queue = queue.Queue(maxsize=1)
+        self._in.put((image_bytes, box))
+        while True:
+            try:
+                text, conf = box.get(timeout=1)
+                break
+            except queue.Empty:
+                if not self.ready:
+                    raise RuntimeError("CUDA observation stopped")
+        if isinstance(text, BaseException):
+            raise text
+        return text, conf
+
+    def close(self) -> None:
+        self._stop.set()
+        self.ready = False
+        try:
+            self._in.put_nowait(None)
+        except Exception:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=30)
+        while True:
+            try:
+                item = self._in.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                item[1].put((RuntimeError("CUDA observation stopped"), 0.0))
+        slot = self._slot
+        self._slot = None
+        if slot is not None:
+            slot.__exit__(None, None, None)
+
+    def _loop(self) -> None:
+        from app.services.ocr_gpu import _glm_micro_batch_size, _glm_ocr_images
+
+        micro = _glm_micro_batch_size()
+        while not self._stop.is_set():
+            try:
+                first = self._in.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if first is None:
+                return
+            batch = [first]
+            deadline = time.monotonic() + 0.05
+            while len(batch) < micro:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    nxt = self._in.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    self._in.put(None)
+                    break
+                batch.append(nxt)
+            try:
+                self._infer(batch, _glm_ocr_images)
+            except Exception:
+                log.exception("CUDA observation batch failed")
+                self.ready = False
+                for _payload, box in batch:
+                    box.put((RuntimeError("CUDA observation stopped"), 0.0))
+
+    def _infer(self, batch, ocr_images) -> None:
+        from PIL import Image, ImageOps
+
+        images = []
+        for payload, _box in batch:
+            try:
+                with Image.open(io.BytesIO(payload)) as handle:
+                    image = ImageOps.exif_transpose(handle).convert("RGB")
+                    image.thumbnail((1280, 1280))
+                    images.append(image.copy())
+            except Exception as exc:
+                images.append(exc)
+        good = [img for img in images if not isinstance(img, Exception)]
+        decoded: list[tuple[str, float]] = []
+        if good:
+            try:
+                decoded = list(ocr_images(good, prompt=_CUDA_PROMPT))
+            except Exception as exc:
+                log.warning("CUDA observation batch failed: %s", exc)
+                decoded = [(exc, 0.0) for _ in good]
+        cursor = 0
+        for img, (_payload, box) in zip(images, batch):
+            if isinstance(img, Exception):
+                box.put((img, 0.0))
+                continue
+            text, conf = decoded[cursor] if cursor < len(decoded) else ("", 0.0)
+            cursor += 1
+            box.put((text, conf))
+
+
+def _observe_frame(image_bytes: bytes) -> dict:
+    """Read one unclear frame on CUDA when the batcher is running, otherwise Tesseract."""
+    reader = _frame_reader.get()
+    if reader is not None:
+        try:
+            text, conf = reader(image_bytes)
+            description = (text or "").strip() or "No readable text."
+            return {
+                "description": description,
+                "signals": ocr_signals(text or ""),
+                "model": "glm-ocr",
+                "model_derived": True,
+                "ocr_confidence": round(float(conf or 0), 3),
+                "ocr_engine": "cuda",
+            }
+        except Exception:
+            log.exception("CUDA frame read failed; using Tesseract for this frame")
+    return _tesseract_frame(image_bytes)
+
+
 def _tesseract_frame(image_bytes: bytes) -> dict:
     """Read one picture with the same Tesseract engine used for document OCR."""
     from PIL import Image, ImageOps
@@ -430,7 +604,7 @@ def _tesseract_frame(image_bytes: bytes) -> dict:
 
 
 def _inspect_media_file(temp: str, kind: str, *, expected_sha: str | None, expected_size: int | None) -> dict:
-    """Clarity check plus Tesseract. No database access, so workers can share it."""
+    """Clarity check plus CUDA or Tesseract. No database access, so workers can share it."""
     digest = hashlib.sha256()
     with open(temp, "rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
@@ -463,7 +637,10 @@ def _inspect_media_file(temp: str, kind: str, *, expected_sha: str | None, expec
                 "details": details,
             }
         blob, properties = _image_derivative(temp)
-        observation = _tesseract_frame(blob)
+        observation = _observe_frame(blob)
+        if observation.get("ocr_engine") == "cuda":
+            details["model"] = observation["model"]
+            details["ocr_engine"] = "cuda"
         details["frames"].append(
             {
                 "timestamp_seconds": None,
@@ -495,7 +672,10 @@ def _inspect_media_file(temp: str, kind: str, *, expected_sha: str | None, expec
                     "description": "Clear video skipped. Not added to evidence observations.",
                     "details": details,
                 }
-        observation = _tesseract_frame(blob)
+        observation = _observe_frame(blob)
+        if observation.get("ocr_engine") == "cuda":
+            details["model"] = observation["model"]
+            details["ocr_engine"] = "cuda"
         frames.append((blob, time, coverage, observation))
     texts = []
     for blob, time, coverage, observation in frames:
@@ -559,115 +739,230 @@ def _commit_media_inspection(db, job_id, row, inspected: dict) -> None:
     )
 
 
+def media_review_workers() -> int:
+    """How many image/video shards to read and OCR at once."""
+    raw = os.environ.get("FORENSIC_MEDIA_REVIEW_WORKERS", "8")
+    try:
+        return max(1, min(int(raw), 16))
+    except ValueError:
+        return 8
+
+
 def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
-    """Tesseract over unclear pictures, eight at a time. Clear pictures are skipped."""
+    """Read up to eight archive shards at once and OCR unclear pictures on those workers.
+
+    A single shard scan left the other seven workers idle, so a disk of photos
+    stayed on one stream. Clear pictures are still skipped.
+    """
+    import queue
+    import threading
+
     from app.services.artifact_media_properties import _stream_to_temp
     from app.services.forensic_serial_stages import report_progress
     from app.services.job_control import pipeline_should_stop
     from app.services.progress_agent import note_operation
 
-    workers = 8
+    workers = media_review_workers()
+    batcher = None
+    if media_cuda_requested():
+        note_operation(
+            db,
+            job_id,
+            "media_review",
+            "Loading CUDA for image/video observations",
+            timeout_seconds=900,
+        )
+        batcher = _CudaObservationBatcher()
+        if not batcher.start():
+            batcher = None
+    pace = f"CUDA + {workers} workers" if batcher is not None else f"{workers} workers"
+    reader_token = _frame_reader.set(batcher.read) if batcher is not None else None
+    released = False
 
-    def _kind(row):
-        ext = Path(row["file_path"]).suffix.lower()
-        mime = str((row.get("metadata") or {}).get("mime") or (row.get("metadata") or {}).get("detected_mime") or "")
-        return "video" if ext in _VIDEO or mime.startswith("video/") else "image"
+    def _release_cuda() -> None:
+        nonlocal released, reader_token
+        if released:
+            return
+        released = True
+        if reader_token is not None:
+            _frame_reader.reset(reader_token)
+            reader_token = None
+        if batcher is not None:
+            batcher.close()
 
-    def _publish(row, inspected) -> None:
-        _commit_media_inspection(db, job_id, row, inspected)
-        note_operation(db, job_id, "media_review", "Tesseract image/video text", advanced=True, timeout_seconds=900)
+    try:
+        def _kind(row):
+            ext = Path(row["file_path"]).suffix.lower()
+            mime = str((row.get("metadata") or {}).get("mime") or (row.get("metadata") or {}).get("detected_mime") or "")
+            return "video" if ext in _VIDEO or mime.startswith("video/") else "image"
+
         counts = fetchone(
             db,
             "SELECT count(*) FILTER(WHERE status='done') AS done,count(*) FILTER(WHERE status='failed') AS failed,count(*) FILTER(WHERE status='skipped') AS skipped FROM forensic_media_observations WHERE job_id=:jid",
             {"jid": job_id},
         )
-        report_progress(
-            db,
-            job_id,
-            "media_review",
-            total=total,
-            completed=int(counts["done"]),
-            failed=int(counts["failed"]),
-            skipped=int(counts["skipped"]),
-            label="Tesseract on unclear images and videos",
-        )
+        done = int(counts["done"] or 0)
+        failed = int(counts["failed"] or 0)
+        skipped = int(counts["skipped"] or 0)
+        published = 0
 
-    def _inspect(temp, row):
-        try:
-            return _inspect_media_file(
-                temp,
-                _kind(row),
-                expected_sha=row.get("sha256") or (row.get("metadata") or {}).get("source_sha256"),
-                expected_size=row.get("size_bytes"),
-            )
-        except Exception as exc:
-            return {"error": str(exc), "kind": _kind(row), "details": {"frames": [], "model": "tesseract", "ocr_engine": "tesseract"}}
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        inflight = {}
-
-        def _drain(block: bool) -> None:
-            if not inflight:
-                return
-            if block:
-                finished, _ = wait(inflight, timeout=20, return_when=FIRST_COMPLETED)
-                if not finished:
-                    note_operation(db, job_id, "media_review", "Tesseract image/video text", advanced=True, timeout_seconds=900)
-                    return
+        def _publish(row, inspected) -> None:
+            nonlocal done, failed, skipped, published
+            _commit_media_inspection(db, job_id, row, inspected)
+            if inspected.get("error"):
+                failed += 1
+            elif inspected.get("clear"):
+                skipped += 1
             else:
-                finished = [fut for fut in list(inflight) if fut.done()]
-            for fut in finished:
-                row, temp = inflight.pop(fut)
-                try:
-                    _publish(row, fut.result())
-                except Exception:
-                    log.exception("Media observation save failed for %s", row.get("file_path"))
-                finally:
-                    if temp:
-                        Path(temp).unlink(missing_ok=True)
+                done += 1
+            published += 1
+            if published == 1 or published % 25 == 0:
+                note_operation(
+                    db,
+                    job_id,
+                    "media_review",
+                    f"Image/video observations {done + failed + skipped:,}/{total:,} on {pace}",
+                    advanced=True,
+                    timeout_seconds=900,
+                )
+                report_progress(
+                    db,
+                    job_id,
+                    "media_review",
+                    total=total,
+                    completed=done,
+                    failed=failed,
+                    skipped=skipped,
+                    label=f"Unclear images and videos, {pace}",
+                )
 
-        def _submit(row, temp) -> None:
-            if pipeline_should_stop(db, job_id):
-                if temp:
-                    Path(temp).unlink(missing_ok=True)
-                raise StageWaiting("Media observations paused by user")
-            while len(inflight) >= workers:
-                _drain(True)
-            inflight[pool.submit(_inspect, temp, row)] = (row, temp)
+        def _inspect(temp, row):
+            try:
+                return _inspect_media_file(
+                    temp,
+                    _kind(row),
+                    expected_sha=row.get("sha256") or (row.get("metadata") or {}).get("source_sha256"),
+                    expected_size=row.get("size_bytes"),
+                )
+            except Exception as exc:
+                return {"error": str(exc), "kind": _kind(row), "details": {"frames": [], "model": "tesseract", "ocr_engine": "tesseract"}}
 
-        for _part, wanted in by_part.items():
-            note_operation(
-                db,
-                job_id,
-                "media_review",
-                f"Reading the next image/video shard ({len(wanted)} files)",
-                timeout_seconds=1800,
-                advanced=True,
-            )
+        tasks: queue.Queue = queue.Queue()
+        results: queue.Queue = queue.Queue(maxsize=workers * 4)
+        stop = threading.Event()
+
+        def _scan_part(part, wanted) -> None:
             from app.services.tar_cache import iter_spilled_files_from_part
 
             seen = set()
-            for norm, spilled in iter_spilled_files_from_part(_part, set(wanted)):
+            for norm, spilled in iter_spilled_files_from_part(part, set(wanted)):
+                if stop.is_set():
+                    if spilled:
+                        Path(spilled).unlink(missing_ok=True)
+                    break
                 seen.add(norm)
                 row = wanted.get(norm)
                 if row is None or not spilled:
                     if spilled:
                         Path(spilled).unlink(missing_ok=True)
                     continue
-                _submit(row, spilled)
-            while inflight:
-                _drain(True)
-            for path, row in wanted.items():
-                if path not in seen:
-                    temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
-                    _submit(row, temp)
-            while inflight:
-                _drain(True)
+                try:
+                    results.put((row, _inspect(spilled, row)))
+                finally:
+                    Path(spilled).unlink(missing_ok=True)
+            if not stop.is_set():
+                for path, row in wanted.items():
+                    if path not in seen:
+                        results.put((row, None))
+
+        def _worker() -> None:
+            if batcher is not None:
+                _frame_reader.set(batcher.read)
+            while not stop.is_set():
+                item = tasks.get()
+                if item is None:
+                    return
+                try:
+                    _scan_part(*item)
+                except Exception as exc:
+                    log.exception("Image/video shard failed")
+                    results.put((None, {"error": str(exc)}))
+                results.put(("shard_done", None))
+
+        shard_jobs = list(by_part.items())
+        for item in shard_jobs:
+            tasks.put(item)
+        thread_count = min(workers, len(shard_jobs)) or 0
+        threads = [threading.Thread(target=_worker, name=f"media-review-{index}", daemon=True) for index in range(thread_count)]
+        for _ in threads:
+            tasks.put(None)
+        for thread in threads:
+            thread.start()
+        note_operation(
+            db,
+            job_id,
+            "media_review",
+            f"Image/video observations on {pace}",
+            advanced=True,
+            timeout_seconds=900,
+        )
+        finished = 0
+        while finished < len(shard_jobs):
+            if pipeline_should_stop(db, job_id):
+                stop.set()
+                raise StageWaiting("Media observations paused by user")
+            try:
+                row, inspected = results.get(timeout=20)
+            except queue.Empty:
+                note_operation(
+                    db,
+                    job_id,
+                    "media_review",
+                    f"Image/video observations {done + failed + skipped:,}/{total:,} on {pace}",
+                    advanced=True,
+                    timeout_seconds=900,
+                )
+                continue
+            if row == "shard_done":
+                finished += 1
+                continue
+            if inspected is None:
+                temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
+                try:
+                    _publish(row, _inspect(temp, row))
+                finally:
+                    if temp:
+                        Path(temp).unlink(missing_ok=True)
+                continue
+            if row is None:
+                log.warning("Image/video shard worker failed: %s", inspected.get("error"))
+                continue
+            try:
+                _publish(row, inspected)
+            except Exception:
+                log.exception("Media observation save failed for %s", row.get("file_path"))
         for row in loose:
+            if pipeline_should_stop(db, job_id):
+                raise StageWaiting("Media observations paused by user")
             temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
-            _submit(row, temp)
-        while inflight:
-            _drain(True)
+            try:
+                _publish(row, _inspect(temp, row))
+            finally:
+                if temp:
+                    Path(temp).unlink(missing_ok=True)
+        if published:
+            report_progress(
+                db,
+                job_id,
+                "media_review",
+                total=total,
+                completed=done,
+                failed=failed,
+                skipped=skipped,
+                label=f"Unclear images and videos, {pace}",
+            )
+    finally:
+        _release_cuda()
 
 
 def run_media_review(db, job_id, *, schema_name):
@@ -721,7 +1016,7 @@ def run_media_review(db, job_id, *, schema_name):
             db,
             job_id,
             (
-                "Image/video observations — Tesseract on unclear pictures, 8 workers. Clear pictures are skipped."
+                "Image/video observations — 8 shard workers, CUDA on unclear pictures when the GPU is free. Clear pictures are skipped."
                 if fast_ocr
                 else "Evidence observations are only for images and videos that are not clear. Clear pictures, audio, and video are skipped and not added."
             ),
