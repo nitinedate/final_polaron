@@ -115,6 +115,7 @@ def _cfg() -> dict[str, Any]:
         # dispatcher interval lets a newly queued job fill an available worker
         # slot without waiting for an unrelated scan's next GMP poll.
         "queue_poll": max(1, min(30, int(os.environ.get("QUEUE_POLL_INTERVAL_SEC") or 3))),
+        "progress_report_interval": max(15, min(180, int(os.environ.get("PROGRESS_REPORT_INTERVAL_SEC") or 45))),
         # Bounded concurrency prevents head-of-line blocking without spawning an
         # unbounded number of OpenVAS scans. Tune for laptop capacity; 1..8.
         "max_concurrent_jobs": max(1, min(8, int(os.environ.get("MAX_CONCURRENT_SCAN_JOBS") or 1))),
@@ -207,32 +208,41 @@ def seal_tail_harvest(details: dict[str, Any], host: str, *, reason: str) -> boo
     return True
 
 
+_last_progress_failure_log: dict[str, float] = {}
+_progress_failure_lock = threading.Lock()
+
+
 def _patch_job_best_effort(api: CentralApi, job_id: str, payload: dict[str, Any]) -> bool | None:
-    """Return True on success, False when the update should be retried, None when the job is gone."""
+    """Bounded, retryable status update. Never block Greenbone's poll loop on WAN outages.
+
+    None is reserved for a definitive 404; transient connectivity failures must
+    never stop live local OpenVAS tasks. Only one short HTTP attempt is made.
+    """
     try:
         api.patch_job(job_id, payload)
+        with _progress_failure_lock:
+            _last_progress_failure_log.pop(job_id, None)
         return True
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code if exc.response is not None else 0
         if status == 404:
-            log.error(
-                "Central API has no job %s for this scanner; progress cannot be saved",
-                job_id,
-            )
+            log.error("Central API has no job %s for this scanner; progress cannot be saved", job_id)
             return None
+        failure = f"HTTP {status}"
+    except Exception as exc:
+        failure = exc.__class__.__name__
+    now = time.monotonic()
+    with _progress_failure_lock:
+        last = _last_progress_failure_log.get(job_id, 0.0)
+        should_log = now - last >= 60.0 or last == 0.0
+        if should_log:
+            _last_progress_failure_log[job_id] = now
+    if should_log:
         log.warning(
-            "Central API progress update failed for job %s; scan will continue and retry on the next poll",
-            job_id,
-            exc_info=True,
+            "Central progress PATCH unavailable for %s (%s). Local scan is continuing; retry at next status interval.",
+            job_id, failure,
         )
-        return False
-    except Exception:
-        log.warning(
-            "Central API progress update failed for job %s; scan will continue and retry on the next poll",
-            job_id,
-            exc_info=True,
-        )
-        return False
+    return False
 
 
 def _upload_results_reliably(api: CentralApi, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -937,6 +947,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
 
     run_started = time.monotonic()
     last_progress = -1.0
+    last_status_patch_at = 0.0
     last_ip_status_sig: tuple[tuple[str, str, int], ...] | None = None
     last_change = run_started
     last_high_progress_notice = 0.0
@@ -1275,25 +1286,30 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 last_high_progress_notice = now
 
-        if _patch_job_best_effort(
-            api,
-            job_id,
-            {
-                "status": "running",
-                "progress_pct": progress,
-                "message": message,
-                "external_scan_id": external_blob,
-                "chunk_tasks": _chunk_tasks_blob(),
-                "target_progress": target_progress,
-            },
-        ) is None:
-            log.error(
-                "Job %s is not on the central server for this scanner; stopping the local OpenVAS tasks",
+        # The entire host progress snapshot can be large. Send at a bounded
+        # interval, but always publish terminal status immediately. Local GMP
+        # polling and IP-slot scheduling must not wait on repetitive PATCHes.
+        if all_terminal or now - last_status_patch_at >= cfg.get("progress_report_interval", 45):
+            last_status_patch_at = now
+            if _patch_job_best_effort(
+                api,
                 job_id,
-            )
-            for tid in list(in_flight.values()):
-                openvas.stop(tid)
-            return
+                {
+                    "status": "running",
+                    "progress_pct": progress,
+                    "message": message,
+                    "external_scan_id": external_blob,
+                    "chunk_tasks": _chunk_tasks_blob(),
+                    "target_progress": target_progress,
+                },
+            ) is None:
+                log.error(
+                    "Job %s is not on the central server for this scanner; stopping the local OpenVAS tasks",
+                    job_id,
+                )
+                for tid in list(in_flight.values()):
+                    openvas.stop(tid)
+                return
 
         if all_terminal:
             # Re-merge only finished chunks for upload.
@@ -1538,7 +1554,7 @@ def main() -> None:
                 capacity = probe_laptop_capacity()
                 max_workers = max(1, min(configured_jobs, int(capacity["max_concurrent_jobs"])))
                 try:
-                    log_shipper.maybe_flush()
+                    log_shipper.maybe_flush_async()
                 except Exception:
                     pass
 
