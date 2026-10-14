@@ -40,6 +40,12 @@ def test_every_shipped_template_validates_and_has_nessus_reference():
         elif template["vendor"] == "nexpose":
             # V1.8.0: Rapid7 Nexpose/InsightVM built-in template; never labelled as Nessus.
             assert template["nexpose_template"] and template["nessus_template"] is None
+        elif template["vendor"] == "aetheris":
+            # V1.9.0: Aetheris-defined templates (PDF service matrix / Fund Fox
+            # reference, TLS-SWEET32 focus) have no Nessus or Nexpose equivalent,
+            # so they carry neither label and must name themselves "Aetheris ·".
+            assert template["nessus_template"] is None and template["nexpose_template"] is None
+            assert template["name"].startswith("Aetheris \u00b7")
         else:
             assert template["nessus_template"]
         effective_policy({"template": template["key"]})

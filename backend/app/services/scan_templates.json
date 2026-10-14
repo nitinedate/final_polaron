@@ -1,5 +1,5 @@
 {
-  "catalog_version": "aetheris-templates-1.2",
+  "catalog_version": "aetheris-templates-1.3",
   "note": "Greenbone/OpenVAS equivalents of Rapid7 Nexpose/InsightVM and Tenable Nessus built-in scan templates. Settings are a contract checked by service_policy.validate_request; only allow-listed keys reach the scanner. 'seed_as_builtin' templates are created automatically as ready-to-use policies in every tenant.",
   "templates": [
     {
@@ -440,7 +440,7 @@
     },
     {
       "key": "nx_full_audit",
-      "name": "Nexpose \u00b7 Full audit",
+      "name": "Nexpose · Full audit",
       "vendor": "nexpose",
       "nexpose_template": "Full audit",
       "nessus_template": null,
@@ -462,7 +462,7 @@
     },
     {
       "key": "nx_exhaustive",
-      "name": "Nexpose \u00b7 Exhaustive",
+      "name": "Nexpose · Exhaustive",
       "vendor": "nexpose",
       "nexpose_template": "Exhaustive",
       "nessus_template": null,
@@ -486,7 +486,7 @@
     },
     {
       "key": "nx_safe_network_audit",
-      "name": "Nexpose \u00b7 Safe network audit",
+      "name": "Nexpose · Safe network audit",
       "vendor": "nexpose",
       "nexpose_template": "Safe network audit",
       "nessus_template": null,
@@ -510,7 +510,7 @@
     },
     {
       "key": "nx_discovery",
-      "name": "Nexpose \u00b7 Discovery scan",
+      "name": "Nexpose · Discovery scan",
       "vendor": "nexpose",
       "nexpose_template": "Discovery scan",
       "nessus_template": null,
@@ -531,7 +531,7 @@
     },
     {
       "key": "nx_discovery_aggressive",
-      "name": "Nexpose \u00b7 Discovery scan (aggressive)",
+      "name": "Nexpose · Discovery scan (aggressive)",
       "vendor": "nexpose",
       "nexpose_template": "Discovery scan (aggressive)",
       "nessus_template": null,
@@ -553,7 +553,7 @@
     },
     {
       "key": "nx_internet_dmz_audit",
-      "name": "Nexpose \u00b7 Internet DMZ audit",
+      "name": "Nexpose · Internet DMZ audit",
       "vendor": "nexpose",
       "nexpose_template": "Internet DMZ audit",
       "nessus_template": null,
@@ -635,7 +635,7 @@
     },
     {
       "key": "nx_web_audit",
-      "name": "Nexpose \u00b7 Web audit",
+      "name": "Nexpose · Web audit",
       "vendor": "nexpose",
       "nexpose_template": "Web audit",
       "nessus_template": null,
@@ -688,7 +688,7 @@
     },
     {
       "key": "nx_penetration_test",
-      "name": "Nexpose \u00b7 Penetration test",
+      "name": "Nexpose · Penetration test",
       "vendor": "nexpose",
       "nexpose_template": "Penetration test",
       "nessus_template": null,
@@ -712,7 +712,7 @@
     },
     {
       "key": "nx_microsoft_hotfix",
-      "name": "Nexpose \u00b7 Microsoft hotfix",
+      "name": "Nexpose · Microsoft hotfix",
       "vendor": "nexpose",
       "nexpose_template": "Microsoft hotfix",
       "nessus_template": null,
@@ -750,7 +750,7 @@
     },
     {
       "key": "nx_linux_rpms",
-      "name": "Nexpose \u00b7 Linux RPMs",
+      "name": "Nexpose · Linux RPMs",
       "vendor": "nexpose",
       "nexpose_template": "Linux RPMs",
       "nessus_template": null,
@@ -780,7 +780,7 @@
     },
     {
       "key": "nx_pci_asv_external",
-      "name": "Nexpose \u00b7 PCI ASV external audit",
+      "name": "Nexpose · PCI ASV external audit",
       "vendor": "nexpose",
       "nexpose_template": "PCI ASV external audit",
       "nessus_template": null,
@@ -804,7 +804,7 @@
     },
     {
       "key": "nx_pci_internal",
-      "name": "Nexpose \u00b7 PCI internal audit",
+      "name": "Nexpose · PCI internal audit",
       "vendor": "nexpose",
       "nexpose_template": "PCI internal audit",
       "nessus_template": null,
@@ -854,7 +854,7 @@
     },
     {
       "key": "nx_hipaa",
-      "name": "Nexpose \u00b7 HIPAA compliance",
+      "name": "Nexpose · HIPAA compliance",
       "vendor": "nexpose",
       "nexpose_template": "HIPAA compliance",
       "nessus_template": null,
@@ -878,7 +878,7 @@
     },
     {
       "key": "nx_sox",
-      "name": "Nexpose \u00b7 Sarbanes-Oxley (SOX) compliance",
+      "name": "Nexpose · Sarbanes-Oxley (SOX) compliance",
       "vendor": "nexpose",
       "nexpose_template": "Sarbanes-Oxley (SOX) compliance",
       "nessus_template": null,
@@ -902,7 +902,7 @@
     },
     {
       "key": "nx_scada_audit",
-      "name": "Nexpose \u00b7 SCADA audit",
+      "name": "Nexpose · SCADA audit",
       "vendor": "nexpose",
       "nexpose_template": "SCADA audit",
       "nessus_template": null,
@@ -950,7 +950,7 @@
     },
     {
       "key": "nx_cis",
-      "name": "Nexpose \u00b7 CIS",
+      "name": "Nexpose · CIS",
       "vendor": "nexpose",
       "nexpose_template": "CIS",
       "nessus_template": null,
@@ -984,7 +984,7 @@
     },
     {
       "key": "nx_disa",
-      "name": "Nexpose \u00b7 DISA",
+      "name": "Nexpose · DISA",
       "vendor": "nexpose",
       "nexpose_template": "DISA",
       "nessus_template": null,
@@ -1018,7 +1018,7 @@
     },
     {
       "key": "nx_denial_of_service",
-      "name": "Nexpose \u00b7 Denial of service (UNSAFE)",
+      "name": "Nexpose · Denial of service (UNSAFE)",
       "vendor": "nexpose",
       "nexpose_template": "Denial of service",
       "nessus_template": null,
@@ -1037,6 +1037,163 @@
       "nessus_reference": null,
       "deviations": "Never created automatically; a policy manager must create it explicitly.",
       "seed_as_builtin": false
+    },
+    {
+      "key": "aetheris_tls_sweet32",
+      "name": "Aetheris · TLS/SSL & SWEET32 focus",
+      "nessus_template": null,
+      "nexpose_template": null,
+      "vendor": "aetheris",
+      "category": "vulnerability",
+      "description": "Focused TLS/SSL configuration audit across every TLS- and STARTTLS-bearing service port (not just 443): HTTPS, SMTP/POP3/IMAP STARTTLS, LDAP/LDAPS, database TLS (MSSQL/MySQL/PostgreSQL/MongoDB), message-broker TLS, WinRM HTTPS and FTPS. Runs the Greenbone 'SSL and TLS' NVT family to detect SWEET32 (64-bit block / 3DES cipher acceptance), SSLv2/SSLv3, weak/anonymous/NULL/RC4 ciphers, and certificate problems. SSH family is included so OpenSSH/Dropbear algorithm and version weaknesses from the reference report are also covered.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "nexus",
+        "custom_tcp_ports": [
+          25,
+          80,
+          81,
+          110,
+          143,
+          389,
+          443,
+          465,
+          563,
+          587,
+          631,
+          636,
+          853,
+          902,
+          990,
+          993,
+          995,
+          1433,
+          3268,
+          3269,
+          3306,
+          5432,
+          5671,
+          5672,
+          5986,
+          6379,
+          8000,
+          8008,
+          8080,
+          8081,
+          8443,
+          8888,
+          9092,
+          9200,
+          9300,
+          15671,
+          15672,
+          27017
+        ],
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "nvt_families": [
+          "SSL and TLS",
+          "SSH"
+        ],
+        "scan_purpose": "vulnerability",
+        "cve_watchlist": [
+          "CVE-2016-2183",
+          "CVE-2016-0800",
+          "CVE-2014-3566"
+        ]
+      },
+      "reference": "Aetheris TLS/SSL focus built from the Aetheris scanner implementation guide (section 9: TLS/SSL and SWEET32) and the Fund Fox gap report (SSL Version 2/3 detection, SSL medium-strength ciphers / SWEET32). Not a Nessus or Nexpose built-in template.",
+      "nessus_reference": null,
+      "deviations": "OpenVAS negotiates each protocol natively via its 'SSL and TLS' family rather than sending a raw ClientHello to every port; unsupported negotiations remain a coverage gap, not a pass. SWEET32 is reported as acceptance of a 64-bit block cipher (3DES) in the negotiated suite. Credentials are not required.",
+      "seed_as_builtin": true
+    },
+    {
+      "key": "aetheris_pdf_reference_audit",
+      "name": "Aetheris · PDF reference audit (Fund Fox)",
+      "nessus_template": null,
+      "nexpose_template": null,
+      "vendor": "aetheris",
+      "category": "vulnerability",
+      "description": "Comprehensive unauthenticated audit scoped to the Aetheris scanner implementation guide's 52-service matrix and all eight Fund Fox finding types: SSLv2/SSLv3 detection, SWEET32 / medium-strength ciphers, OpenSSH (X11 forwarding bypass and pre-10.3 advisories), Dropbear (<2016.72 and <2013.59), Windows SMB share access, and IP forwarding. Scans the full service port policy plus every TLS-bearing port, pinning the SSL/TLS, SSH, Web and Windows NVT families. Add an SMB/SSH credential for missing-patch and configuration checks.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "nexus",
+        "custom_tcp_ports": [
+          25,
+          80,
+          81,
+          110,
+          143,
+          389,
+          443,
+          465,
+          563,
+          587,
+          631,
+          636,
+          853,
+          902,
+          990,
+          993,
+          995,
+          1433,
+          3268,
+          3269,
+          3306,
+          5432,
+          5671,
+          5672,
+          5986,
+          6379,
+          8000,
+          8008,
+          8080,
+          8081,
+          8443,
+          8888,
+          9092,
+          9200,
+          9300,
+          15671,
+          15672,
+          27017
+        ],
+        "udp_profile": "priority",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "nvt_families": [
+          "SSL and TLS",
+          "SSH",
+          "Web Servers",
+          "Web application abuses",
+          "Windows",
+          "General",
+          "Service detection"
+        ],
+        "scan_purpose": "vulnerability",
+        "cve_watchlist": [
+          "CVE-2016-2183",
+          "CVE-2016-6329",
+          "CVE-2016-0800",
+          "CVE-2014-3566",
+          "CVE-2016-1907",
+          "CVE-2016-3115",
+          "CVE-2016-6210",
+          "CVE-2016-7406",
+          "CVE-2016-7407",
+          "CVE-2016-7408",
+          "CVE-2016-7409",
+          "CVE-2013-4421",
+          "CVE-2013-4434"
+        ]
+      },
+      "reference": "Aetheris reference audit built from the Aetheris scanner implementation guide (v2.0, 52-service matrix) and the Fund Fox gap assessment (eight finding types). Not a Nessus or Nexpose built-in template; maps the reference findings to Greenbone NVT families rather than reproducing Tenable plugins or severity.",
+      "nessus_reference": null,
+      "deviations": "Unauthenticated by default: it reports what is reachable over the network. Missing-patch (High/Critical) and SMB share-permission findings need an SMB or SSH credential, exactly as noted in the guide. IP forwarding is a host configuration check that needs authenticated evidence; it is reported not-tested without credentials. Exact CVSS/severity parity with the report is not asserted.",
+      "seed_as_builtin": true
     }
   ],
   "not_supported": [
@@ -1053,7 +1210,7 @@
     {
       "vendor": "nexpose",
       "template": "Full audit - Deprecated (with Web spider)",
-      "reason": "Deprecated by Rapid7 when the web spider was removed; use Nexpose \u00b7 Full audit."
+      "reason": "Deprecated by Rapid7 when the web spider was removed; use Nexpose · Full audit."
     }
   ]
 }

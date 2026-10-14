@@ -287,12 +287,19 @@ function SeverityDonut({
   onSelect,
   totalFindings,
   informationalCount = 0,
+  cleanEligible = false,
+  cleanBlockers = [],
 }: {
   buckets: ScanJobSeverityBucket[];
   selected: string | null;
   onSelect: (severity: string) => void;
   totalFindings: number;
   informationalCount?: number;
+  /** Server verdict: a true "clean / no vulnerabilities" conclusion is only
+   *  claimable with authenticated evidence (see assessment.clean_eligible). */
+  cleanEligible?: boolean;
+  /** Why a clean conclusion is not claimable (e.g. unauthenticated scan). */
+  cleanBlockers?: string[];
 }) {
   const size = 200;
   const cx = size / 2;
@@ -312,32 +319,64 @@ function SeverityDonut({
       return { ...b, start, end };
     });
 
-  // Zero scored findings. Informational results mean the open ports were checked.
+  // Zero scored findings. A green "clean" conclusion is only honest when the
+  // server says the result is clean-eligible (authenticated evidence, no skips,
+  // no plugin errors, service scope verified). Otherwise the scan merely found
+  // nothing scored over the network, which is NOT proof the host is clean —
+  // show a neutral "checked" state and say what is missing.
   if (slices.length === 0) {
     const portsChecked = informationalCount > 0;
+    // Only "clean" (green) when it was actually earned. An unauthenticated scan
+    // that saw live services but no scored CVEs must never read as "clean".
+    const trulyClean = cleanEligible;
+    const centreLabel = trulyClean ? "clean" : portsChecked ? "checked" : "not clean";
+    const ring = trulyClean
+      ? "rgb(var(--chart-success))"
+      : portsChecked
+        ? "rgb(var(--chart-info))"
+        : "rgb(var(--chart-3))";
+    const centreText = trulyClean
+      ? "fill-emerald-600"
+      : portsChecked
+        ? "fill-sky-700"
+        : "fill-amber-700";
+    const blocker = cleanBlockers[0];
+    let message: string;
+    if (trulyClean) {
+      message = "No vulnerabilities found — scan completed clean (authenticated evidence).";
+    } else if (portsChecked) {
+      message =
+        `No scored vulnerabilities, but this is not a clean result: ${informationalCount} ` +
+        `informational result(s) were recorded on the ports that answered. ` +
+        (blocker ? `${blocker}. ` : "") +
+        `Add an SMB (Windows) or SSH (Linux) credential to the policy for missing-patch ` +
+        `(High/Critical) checks. Show informational to see the ports that were checked.`;
+    } else {
+      message =
+        "No scored vulnerabilities were found over the network. This is not proof the " +
+        "host is clean — " +
+        (blocker ? `${blocker.toLowerCase()}. ` : "service checks are unverified. ") +
+        "Add an SMB/SSH credential, or allow the scanner through the host firewall, to assess it.";
+    }
     return (
       <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-center">
-        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-label={portsChecked ? "Ports checked, no scored vulnerabilities" : "No findings"}>
+        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-label={trulyClean ? "No vulnerabilities, clean assessment" : portsChecked ? "Ports checked, no scored vulnerabilities, not a clean result" : "No scored findings, not a clean result"}>
           <circle
             cx={cx}
             cy={cy}
             r={(outerR + innerR) / 2}
             fill="none"
-            stroke={portsChecked ? "rgb(var(--chart-info))" : "rgb(var(--chart-success))"}
+            stroke={ring}
             strokeWidth={outerR - innerR}
           />
           <text x={cx} y={cy - 2} textAnchor="middle" className="fill-ink-800 text-lg font-bold">
             0
           </text>
-          <text x={cx} y={cy + 16} textAnchor="middle" className={`text-[10px] font-semibold uppercase ${portsChecked ? "fill-sky-700" : "fill-emerald-600"}`}>
-            {portsChecked ? "checked" : "clean"}
+          <text x={cx} y={cy + 16} textAnchor="middle" className={`text-[10px] font-semibold uppercase ${centreText}`}>
+            {centreLabel}
           </text>
         </svg>
-        <p className="text-sm text-ink-500">
-          {portsChecked
-            ? `No scored vulnerabilities. ${informationalCount} informational result(s) were recorded on the ports that answered. Show informational to see those ports.`
-            : "No vulnerabilities found — scan completed clean."}
-        </p>
+        <p className="text-sm text-ink-500">{message}</p>
       </div>
     );
   }
@@ -1057,6 +1096,8 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                   onSelect={setSelectedSeverity}
                   totalFindings={donutTotal}
                   informationalCount={showInfo ? 0 : infoCount}
+                  cleanEligible={summary?.assessment?.clean_eligible === true}
+                  cleanBlockers={summary?.assessment?.clean_blockers || []}
                 />
               </div>
               <div>
