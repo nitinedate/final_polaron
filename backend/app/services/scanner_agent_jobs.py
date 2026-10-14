@@ -1602,12 +1602,17 @@ def ingest_agent_results(
     if _normalize_agent_instance(agent_instance_id):
         orch["edge_owner_instance"] = _normalize_agent_instance(agent_instance_id)
         orch["edge_owner_seen_at"] = datetime.now(timezone.utc).isoformat()
-    if final_status == "completed" and plugin_errors > 0:
-        progress_message = f"assessment completed with {plugin_errors} scanner warning(s)"
+    if final_status == "completed" and not service_scope_verified:
+        progress_message = (
+            "Engine complete - service coverage unverified"
+            + (f" ({plugin_errors} scanner warning(s))" if plugin_errors > 0 else "")
+        )
+    elif final_status == "completed" and plugin_errors > 0:
+        progress_message = f"Assessment verified with {plugin_errors} scanner warning(s)"
     elif final_status == "completed":
-        progress_message = "assessment verified"
+        progress_message = "Assessment verified"
     else:
-        progress_message = "assessment incomplete"
+        progress_message = "Assessment incomplete"
     orch["edge_progress"] = {
         "pct": 100.0,
         "message": progress_message,

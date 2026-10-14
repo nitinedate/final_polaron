@@ -22,23 +22,29 @@ def test_empty_tail_is_not_sealed() -> None:
     assert details.get("status") != "completed"
 
 
-def test_report_host_is_sealed_for_upload() -> None:
+def test_partial_report_must_not_be_sealed_or_cancelled() -> None:
     from agent.main import seal_tail_harvest
 
     details = {
-        "vulnerabilities": [{"host": "192.168.0.163", "plugin_id": "1.3.6.1.4.1.25623.1.0.1"}],
+        "status": "running", "progress": 95,
+        "vulnerabilities": [{"host": "192.168.0.163", "plugin_id": "test-nvt"}],
         "evidence": {
             "report_id": "b5ebead4-ebd5-4b91-b972-a3698b34549e",
-            "hosts_assessed": 0,
-            "assessed_hosts": [],
-            "task_status": "stop requested",
+            "hosts_assessed": 1,
+            "assessed_hosts": ["192.168.0.163"],
+            "task_status": "running",
+            "assessment_complete": False,
         },
     }
-    assert seal_tail_harvest(details, "192.168.0.163", reason="stalled 30s at 94%") is True
-    evidence = details["evidence"]
-    assert evidence["hosts_assessed"] == 1
-    assert "192.168.0.163" in evidence["assessed_hosts"]
-    assert evidence["task_status"] == "done"
-    assert evidence["report_result_count"] == 1
-    assert evidence["assessment_complete"] is True
-    assert details["status"] == "completed"
+    assert seal_tail_harvest(details, "192.168.0.163", reason="frozen at 95%") is False
+    assert details["status"] == "running"
+    assert details["evidence"]["task_status"] == "running"
+    assert details["evidence"]["assessment_complete"] is False
+
+
+def test_default_tail_timeout_is_disabled(monkeypatch) -> None:
+    from agent.main import _env_stall_sec
+    monkeypatch.delenv("HIGH_PROGRESS_STALL_SEC", raising=False)
+    assert _env_stall_sec() == 0
+    monkeypatch.setenv("HIGH_PROGRESS_STALL_SEC", "not-a-number")
+    assert _env_stall_sec() == 0

@@ -119,8 +119,9 @@ def _cfg() -> dict[str, Any]:
         # Bounded concurrency prevents head-of-line blocking without spawning an
         # unbounded number of OpenVAS scans. Tune for laptop capacity; 1..8.
         "max_concurrent_jobs": max(1, min(8, int(os.environ.get("MAX_CONCURRENT_SCAN_JOBS") or 1))),
-        # A hung NVT (TCP 445 connect loop) freezes one IP at 90-98%.
-        # Harvest that tail from the report already written. 0 disables it.
+        # A Greenbone task at 90-99% is often still evaluating NVTs or writing
+        # its report. Never treat a partial report as terminal just because
+        # progress did not change. This value is diagnostic only (0 disables).
         "high_progress_warn_sec": max(60, int(os.environ.get("HIGH_PROGRESS_WARN_SEC") or 300)),
         "high_progress_stall_sec": _env_stall_sec(),
         "high_progress_stall_pct": max(80, min(99, int(os.environ.get("HIGH_PROGRESS_STALL_PCT") or 90))),
@@ -134,11 +135,11 @@ def _cfg() -> dict[str, Any]:
 def _env_stall_sec() -> int:
     raw = os.environ.get("HIGH_PROGRESS_STALL_SEC")
     if raw is None or str(raw).strip() == "":
-        return 45
+        return 0
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
-        return 45
+        return 0
 
 
 def ip_tail_should_harvest(progress: float, unchanged_sec: float, *, stall_sec: int, stall_pct: int) -> bool:
@@ -153,59 +154,16 @@ def ip_tail_should_harvest(progress: float, unchanged_sec: float, *, stall_sec: 
 
 
 def seal_tail_harvest(details: dict[str, Any], host: str, *, reason: str) -> bool:
-    """Accept a frozen tail only when this IP is already in the report.
+    """Reject automatic completion from a running/partial Greenbone report.
 
-    Returning False leaves the scan running. A climbing scan is never sealed.
+    This legacy helper is deliberately fail-closed. A report may already contain
+    hostname, OS, ports and findings while NVTs are running. The authoritative
+    terminal state comes ONLY from ``LocalOpenVAS.poll``'s GMP task status.
+    Returning False ensures that callers cannot rewrite "running" into "done"
+    or fire a background stop request after uploading partial results.
     """
-    import ipaddress
-    from datetime import datetime, timezone
-
-    vulns = list(details.get("vulnerabilities") or [])
-    ev = dict(details.get("evidence") or {})
-    report_id = str(ev.get("report_id") or "").strip()
-    if not report_id:
-        return False
-
-    def _norm(value: str) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        try:
-            return str(ipaddress.ip_address(text))
-        except ValueError:
-            return text.casefold()
-
-    wanted = _norm(host)
-    hosts: set[str] = set()
-    for item in list(ev.get("assessed_hosts") or []) + [row.get("host") for row in vulns]:
-        normalized = _norm(str(item or ""))
-        if normalized:
-            hosts.add(normalized)
-    if not wanted or wanted not in hosts:
-        return False
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assessed = sorted(hosts)
-    ev["report_id"] = report_id
-    ev["task_status"] = "done"
-    ev["assessed_hosts"] = assessed
-    ev["hosts_attempted"] = max(int(ev.get("hosts_attempted") or 0), len(assessed), 1)
-    ev["hosts_assessed"] = len(assessed)
-    ev["missing_ip_targets"] = []
-    ev["target_identity_ok"] = True
-    ev["report_result_count"] = len(vulns)
-    ev["report_read_error"] = None
-    ev["scan_start"] = ev.get("scan_start") or now
-    ev["scan_end"] = ev.get("scan_end") or now
-    ev["assessment_complete"] = True
-    ev["assessment_verdict"] = "tail_stall_harvest"
-    details["evidence"] = ev
-    details["vulnerabilities"] = vulns
-    details["status"] = "completed"
-    details["gmp_status"] = "done"
-    details["partial"] = True
-    details["partial_reason"] = reason
-    return True
+    del details, host, reason
+    return False
 
 
 _last_progress_failure_log: dict[str, float] = {}
@@ -1196,6 +1154,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                 log.warning("Failed to stop service lane %s at the Nexus budget", one, exc_info=True)
                         if not isinstance(harvested, dict):
                             harvested = dict(details)
+                        # Engine cancellation under an explicitly configured
+                        # deadline is not a successful, full-coverage completion.
                         harvested["status"] = "completed"
                         harvested["progress"] = 100
                         evidence = dict(harvested.get("evidence") or {})
@@ -1281,20 +1241,16 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                     cov_verdict,
                                 )
                                 ip_progress_since[idx] = (pct_i, now_m)
-                            elif harvested is not None and seal_tail_harvest(harvested, host, reason=reason):
-                                # The report is already saved. Release the hung check
-                                # afterwards so a TCP 445 retry cannot run for days.
-                                for one in lane_ids:
-                                    threading.Thread(target=lambda task_id=one: openvas.stop(task_id), daemon=True).start()
-                                details = harvested
-                                st = "completed"
-                                emit_ip_event(
-                                    job_id, host, "tail_harvest", task_id=tid, status="completed",
-                                    progress=pct_i,
-                                    vulnerabilities=len(details.get("vulnerabilities") or []),
-                                    error=reason,
-                                    duration_sec=round(now_m - ip_started_mono.get(idx, now_m), 3),
+                            elif harvested is not None:
+                                log.warning(
+                                    "IP %s remains %s%%: partial report observed, but task is "
+                                    "not GMP-terminal. %d provisional finding(s) retained by "
+                                    "Greenbone; no stop_task or false completion",
+                                    host, pct_i, len(harvested.get("vulnerabilities") or []),
                                 )
+                                # Do not hammer GMP every poll. A definite Done,
+                                # Stopped or Failed response is required to finish.
+                                ip_progress_since[idx] = (pct_i, now_m)
                             else:
                                 log.warning(
                                     "IP %s is still at %s%% and the report has no host evidence yet; leaving the scan running",
@@ -1543,9 +1499,14 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 _upload_results_reliably(api, job_id, payload)
                 log.info(
-                    "Job %s chunked scan done complete=%s vulns=%d hosts_assessed=%d skipped=%d",
+                    "Job %s engine finished assessment_complete=%s service_checks_verified=%s "
+                    "vulns=%d hosts_assessed=%d skipped=%d",
                     job_id,
                     complete,
+                    bool((evidence.get("service_coverage") or {})) and all(
+                        isinstance(item, dict) and item.get("coverage_complete") is True
+                        for item in (evidence.get("service_coverage") or {}).values()
+                    ),
                     len(merged.get("vulnerabilities") or []),
                     int(evidence.get("hosts_assessed") or 0),
                     len(skipped_hosts),
