@@ -6,7 +6,27 @@ from __future__ import annotations
 from typing import Any
 
 
-def reconcile_host_observations(details: dict[str, Any], host: str, preprobe_ports: list[int] | None) -> dict[str, Any]:
+def _merge_port_states(coverage: dict[str, Any], native: list[int], states: dict[str, Any]) -> dict[str, int]:
+    """Per-port TCP state from the agent's connect probe, upgraded to open by Greenbone."""
+    merged: dict[int, str] = {}
+    for state in ("filtered", "closed", "open"):
+        for raw in states.get(state) or []:
+            if str(raw).isdigit():
+                merged[int(raw)] = state
+    for port in native:
+        merged[port] = "open"  # Greenbone's SYN scan saw a listener
+    coverage["port_states"] = {"tcp": {str(p): st for p, st in sorted(merged.items())}}
+    counts = {st: sum(1 for v in merged.values() if v == st) for st in ("open", "closed", "filtered")}
+    coverage["port_state_counts"] = counts
+    return counts
+
+
+def reconcile_host_observations(
+    details: dict[str, Any],
+    host: str,
+    preprobe_ports: list[int] | None,
+    preprobe_states: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     evidence = details.get("evidence") or {}
     coverages = evidence.get("host_coverage") or {}
     coverage = coverages.get(host)
@@ -18,6 +38,33 @@ def reconcile_host_observations(details: dict[str, Any], host: str, preprobe_por
     coverage["preprobe_is_not_vulnerability_evidence"] = True
     native = sorted({int(x) for x in coverage.get("open_tcp_ports") or [] if str(x).isdigit() and 1 <= int(x) <= 65535})
     coverage["greenbone_tcp_ports"] = native
+    counts = _merge_port_states(coverage, native, preprobe_states) if isinstance(preprobe_states, dict) else None
+    if (counts is not None and not preprobe and not native
+            and coverage.get("verdict") == "degraded_no_ports"
+            and not coverage.get("port_scanner_errors") and not coverage.get("time_limited")
+            and (counts["closed"] + counts["filtered"]) > 0):
+        # V1.7.0: Greenbone finished without a port-scanner error and the agent's
+        # probe of every policy port agrees nothing is open. That is a result,
+        # not "not tested": say exactly what was seen.
+        closed, filtered = counts["closed"], counts["filtered"]
+        total = closed + filtered
+        coverage["verdict"] = "no_exposed_services"
+        coverage["network_scan_complete"] = True
+        coverage["host_responded"] = closed > 0
+        if closed:
+            coverage["reason"] = (
+                f"No policy service is exposed: {closed} of {total} policy TCP ports refused the connection "
+                f"(host is up, nothing listening) and {filtered} did not answer"
+            )
+        else:
+            coverage["reason"] = (
+                f"No policy service answered: all {total} policy TCP ports were dropped "
+                "(a firewall is blocking them, or the host is offline)"
+            )
+            warnings = list(coverage.get("warnings") or [])
+            warnings.append("No TCP port answered at all; this cannot tell a firewall from an offline host")
+            coverage["warnings"] = warnings[-20:]
+        return details
     if preprobe and not native and coverage.get("time_limited"):
         # V1.6.7: the per-IP time limit stopped the scan before Greenbone reported
         # ports; that is the cause, so keep its verdict and record the probe.

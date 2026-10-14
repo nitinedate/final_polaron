@@ -4,18 +4,25 @@ import { Badge, Button, Card, Field, Input, Modal, PageHeader, Select, Spinner }
 import { vulnApi } from "../../lib/vulnApi";
 import { useToast } from "../../lib/toast";
 import { useAuth } from "../../lib/auth";
-import type { ScanPolicy, ScanPolicyTemplate, Scanner } from "../../lib/types/vuln";
+import type { ScanPolicy, ScanPolicyTemplate, Scanner, ServicePortPolicy } from "../../lib/types/vuln";
 
 const CATEGORY_LABEL: Record<string, string> = {
   discovery: "Discovery",
   vulnerability: "Vulnerability scans",
   compliance: "Compliance",
-  threat: "Threat checks",
+  threat: "Threat checks (Aetheris, not Nessus templates)",
 };
 
+const SEVERITY_FLOOR: { value: string; label: string }[] = [
+  { value: "0.1", label: "Low and above (0.1+)" },
+  { value: "4", label: "Medium and above (4.0+)" },
+  { value: "7", label: "High and above (7.0+)" },
+  { value: "9", label: "Critical only (9.0+)" },
+];
+
 const PORT_PROFILE_LABEL: Record<string, string> = {
-  nexus: "Nexus service ports (52 service families)",
-  catalog: "Nexus service ports (52 service families)",
+  nexus: "Service port policy (services that can have Low+ findings)",
+  catalog: "Service port policy (services that can have Low+ findings)",
   nessus: "IANA TCP list + service ports (wider, slower)",
   full: "All 65,535 TCP ports",
   focused: "Only the listed ports",
@@ -50,20 +57,23 @@ export function ScanPoliciesPage() {
   const [policies, setPolicies] = useState<ScanPolicy[]>([]);
   const [scanners, setScanners] = useState<Scanner[]>([]);
   const [templates, setTemplates] = useState<ScanPolicyTemplate[]>([]);
+  const [portPolicy, setPortPolicy] = useState<ServicePortPolicy | null>(null);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [p, s, t] = await Promise.all([
+      const [p, s, t, pp] = await Promise.all([
         vulnApi.listScanPolicies(),
         vulnApi.listScanners(),
         vulnApi.listScanPolicyTemplates().catch(() => [] as ScanPolicyTemplate[]),
+        vulnApi.getServicePortPolicy().catch(() => null),
       ]);
       setPolicies(p);
       setScanners(s);
       setTemplates(t);
+      setPortPolicy(pp);
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "Failed to load policies");
     } finally {
@@ -130,7 +140,9 @@ export function ScanPoliciesPage() {
                         {template ? (
                           <div>
                             <span className="text-ink-800">{template.name}</span>
-                            <span className="block text-xs text-ink-500">Nessus: {template.nessus_template}</span>
+                            <span className="block text-xs text-ink-500">
+                              {template.nessus_template ? `Nessus: ${template.nessus_template}` : "Aetheris threat check"}
+                            </span>
                           </div>
                         ) : (
                           <Badge tone="neutral">{p.policy_type}</Badge>
@@ -170,6 +182,7 @@ export function ScanPoliciesPage() {
         <PolicyModal
           scanners={scanners}
           templates={templates}
+          portPolicy={portPolicy}
           onClose={() => setCreateOpen(false)}
           onSaved={() => {
             setCreateOpen(false);
@@ -184,11 +197,13 @@ export function ScanPoliciesPage() {
 function PolicyModal({
   scanners,
   templates,
+  portPolicy,
   onClose,
   onSaved,
 }: {
   scanners: Scanner[];
   templates: ScanPolicyTemplate[];
+  portPolicy: ServicePortPolicy | null;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -204,6 +219,9 @@ function PolicyModal({
   const [udpProfile, setUdpProfile] = useState("");
   const [performance, setPerformance] = useState("");
   const [checkScope, setCheckScope] = useState("");
+  const [minSeverity, setMinSeverity] = useState("");
+  const [disabledServices, setDisabledServices] = useState<string[]>([]);
+  const [nameContains, setNameContains] = useState("");
   const [extraPorts, setExtraPorts] = useState("");
   const [smbRef, setSmbRef] = useState("");
   const [sshRef, setSshRef] = useState("");
@@ -225,6 +243,29 @@ function PolicyModal({
   }
 
   const required = template?.requires_credentials || [];
+  const isDynamic = Boolean(template?.settings.nvt_filter);
+  const effectiveProfile = portProfile || String(template?.settings.port_profile || "");
+  const usesPortPolicy = ["nexus", "catalog"].includes(effectiveProfile) && Boolean(portPolicy);
+  const policyGroups = useMemo(() => {
+    const out = new Map<string, NonNullable<typeof portPolicy>["services"]>();
+    for (const svc of portPolicy?.services || []) out.set(svc.category, [...(out.get(svc.category) || []), svc]);
+    return Array.from(out.entries());
+  }, [portPolicy]);
+  const enabledPorts = useMemo(() => {
+    const off = new Set(disabledServices);
+    const tcp = new Set<number>();
+    const udp = new Set<number>();
+    for (const svc of portPolicy?.services || []) {
+      if (off.has(svc.key)) continue;
+      svc.tcp.forEach((p) => tcp.add(p));
+      svc.udp.forEach((p) => udp.add(p));
+    }
+    return { tcp: tcp.size, udp: udp.size };
+  }, [portPolicy, disabledServices]);
+  function toggleService(key: string) {
+    setDisabledServices((cur) => (cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]));
+  }
+  const purpose = template?.settings.scan_purpose || "vulnerability";
   const credentialsMissing = required.length > 0 && !smbRef.trim() && !sshRef.trim();
   const focused = template?.settings.port_profile === "focused";
 
@@ -235,6 +276,15 @@ function PolicyModal({
     if (udpProfile) settings.udp_profile = udpProfile;
     if (performance) settings.performance = performance;
     if (checkScope) settings.check_scope = checkScope;
+    if (usesPortPolicy && disabledServices.length) settings.disabled_services = disabledServices;
+    if (isDynamic && (minSeverity || nameContains.trim())) {
+      const base = template.settings.nvt_filter || {};
+      settings.nvt_filter = {
+        ...base,
+        ...(minSeverity ? { min_severity: Number(minSeverity) } : {}),
+        ...(nameContains.trim() ? { name_contains: nameContains.trim() } : {}),
+      };
+    }
     const extra = parsePorts(extraPorts);
     if (extra.length) {
       const base = (template.settings.custom_tcp_ports || []).map(String);
@@ -304,7 +354,7 @@ function PolicyModal({
             <p className="text-ink-700">{template.description}</p>
             <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-ink-600">
               <dt className="font-semibold text-ink-700">Nessus equivalent</dt>
-              <dd>{template.nessus_template}</dd>
+              <dd>{template.nessus_template || "None in Nessus 10.11 (Aetheris threat check)"}</dd>
               <dt className="font-semibold text-ink-700">TCP ports</dt>
               <dd>{effectivePorts}</dd>
               <dt className="font-semibold text-ink-700">UDP</dt>
@@ -323,6 +373,15 @@ function PolicyModal({
                 <>
                   <dt className="font-semibold text-ink-700">Check families</dt>
                   <dd>{s.nvt_families.join(", ")}</dd>
+                </>
+              ) : null}
+              {s.nvt_filter ? (
+                <>
+                  <dt className="font-semibold text-ink-700">Check filter</dt>
+                  <dd>
+                    {s.nvt_filter.min_severity ? `Severity ${s.nvt_filter.min_severity}+` : "Any severity"}
+                    {s.nvt_filter.name_contains ? `, name contains "${s.nvt_filter.name_contains}"` : ""}
+                  </dd>
                 </>
               ) : null}
               {s.cve_watchlist?.length ? (
@@ -367,7 +426,7 @@ function PolicyModal({
             <Field label="TCP port scope">
               <Select value={portProfile} onChange={(e) => setPortProfile(e.target.value)}>
                 <option value="">Template default</option>
-                <option value="nexus">Nexus service ports</option>
+                <option value="nexus">Service port policy</option>
                 <option value="nessus">IANA TCP list (wider, slower)</option>
                 <option value="full">All 65,535 TCP ports (slowest)</option>
               </Select>
@@ -398,6 +457,23 @@ function PolicyModal({
           </Select>
         </Field>
 
+        {isDynamic ? (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Minimum check severity" hint="Only checks at or above this CVSS score run.">
+              <Select value={minSeverity} onChange={(e) => setMinSeverity(e.target.value)}>
+                <option value="">Template default ({s.nvt_filter?.min_severity ?? "any"})</option>
+                {SEVERITY_FLOOR.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Check name contains" hint="Optional, for example SMB, OpenSSH or Apache.">
+              <Input value={nameContains} onChange={(e) => setNameContains(e.target.value)} placeholder="SMB" />
+            </Field>
+          </div>
+        ) : null}
+
+        {purpose === "vulnerability" && !isDynamic ? (
         <Field
           label="Checks"
           hint={
@@ -412,6 +488,50 @@ function PolicyModal({
             <option value="all">All checks (includes informational)</option>
           </Select>
         </Field>
+        ) : null}
+
+        {usesPortPolicy && portPolicy ? (
+          <details className="rounded-xl border border-ink-200 bg-white px-4 py-3 text-sm" open={false}>
+            <summary className="cursor-pointer font-semibold text-ink-800">
+              Services to check: {portPolicy.services.length - disabledServices.length} of {portPolicy.services.length} ·{" "}
+              {enabledPorts.tcp} TCP and {enabledPorts.udp} UDP ports
+            </summary>
+            <p className="mt-2 text-xs text-ink-600">
+              Only services that can produce Low, Medium, High or Critical findings are listed. Only the ports of
+              ticked services are scanned. Policy {portPolicy.policy_version}.
+            </p>
+            <div className="mt-3 max-h-80 space-y-3 overflow-y-auto pr-1">
+              {policyGroups.map(([category, items]) => (
+                <div key={category}>
+                  <p className="text-xs font-semibold text-ink-700">{category}</p>
+                  {items.map((svc) => (
+                    <label key={svc.key} className="mt-1 flex cursor-pointer items-start gap-2 text-xs text-ink-700">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={!disabledServices.includes(svc.key)}
+                        onChange={() => toggleService(svc.key)}
+                      />
+                      <span>
+                        <span className="font-medium text-ink-800">{svc.name}</span>{" "}
+                        <span className="text-ink-500">
+                          {[...svc.tcp.map((p) => `${p}/tcp`), ...svc.udp.map((p) => `${p}/udp`)].join(", ")}
+                        </span>
+                        <span className="block text-ink-500">{svc.low_plus_examples}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ))}
+            </div>
+            {portPolicy.not_checked.length ? (
+              <p className="mt-3 text-xs text-ink-500">
+                Not checked:{" "}
+                {portPolicy.not_checked.map((x) => `${x.port} (${x.reason})`).join("; ")}
+              </p>
+            ) : null}
+          </details>
+        ) : null}
 
         <Field
           label={focused ? "Extra TCP ports" : "Additional TCP ports"}

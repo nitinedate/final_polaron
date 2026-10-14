@@ -1,0 +1,891 @@
+{
+  "policy_version": "aetheris-service-ports-1.0",
+  "description": "Services and ports Aetheris checks on every IP. Each entry is a network service that can produce Low, Medium, High or Critical findings. A scan checks exactly the enabled ports; nothing else.",
+  "services": [
+    {
+      "key": "ftp",
+      "name": "FTP / FTPS",
+      "category": "File transfer",
+      "catalog_family": "SVC-07",
+      "tcp": [
+        21,
+        990
+      ],
+      "udp": [],
+      "low_plus_examples": "anonymous or cleartext login, outdated server with known CVEs, weak TLS on FTPS",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ssh",
+      "name": "SSH / SFTP",
+      "category": "Remote access",
+      "catalog_family": "SVC-06",
+      "tcp": [
+        22
+      ],
+      "udp": [],
+      "low_plus_examples": "weak key exchange/ciphers/MACs, outdated OpenSSH or Dropbear with known CVEs, default accounts",
+      "enabled_by_default": true
+    },
+    {
+      "key": "telnet",
+      "name": "Telnet",
+      "category": "Remote access",
+      "catalog_family": "SVC-16",
+      "tcp": [
+        23
+      ],
+      "udp": [],
+      "low_plus_examples": "cleartext logins, default credentials, outdated daemons",
+      "enabled_by_default": true
+    },
+    {
+      "key": "smtp",
+      "name": "SMTP / SMTPS / submission",
+      "category": "Mail",
+      "catalog_family": "SVC-11",
+      "tcp": [
+        25,
+        465,
+        587
+      ],
+      "udp": [],
+      "low_plus_examples": "open relay, cleartext auth, weak TLS, outdated mail servers with known CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "dns",
+      "name": "DNS",
+      "category": "Network infrastructure",
+      "catalog_family": "SVC-14",
+      "tcp": [
+        53
+      ],
+      "udp": [
+        53
+      ],
+      "low_plus_examples": "open recursion, zone transfer, cache poisoning and version CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "http",
+      "name": "HTTP web servers",
+      "category": "Web",
+      "catalog_family": "SVC-09",
+      "tcp": [
+        80,
+        81,
+        8000,
+        8080
+      ],
+      "udp": [],
+      "low_plus_examples": "outdated servers and frameworks, missing security controls, exposed admin pages, injection flaws",
+      "enabled_by_default": true
+    },
+    {
+      "key": "kerberos",
+      "name": "Kerberos",
+      "category": "Directory",
+      "catalog_family": "SVC-20",
+      "tcp": [
+        88
+      ],
+      "udp": [
+        88
+      ],
+      "low_plus_examples": "weak encryption types, pre-authentication issues, KDC CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "pop3",
+      "name": "POP3 / POP3S",
+      "category": "Mail",
+      "catalog_family": "SVC-12",
+      "tcp": [
+        110,
+        995
+      ],
+      "udp": [],
+      "low_plus_examples": "cleartext auth, weak TLS, outdated servers",
+      "enabled_by_default": true
+    },
+    {
+      "key": "rpcbind",
+      "name": "rpcbind / portmapper",
+      "category": "RPC",
+      "catalog_family": "SVC-52",
+      "tcp": [
+        111
+      ],
+      "udp": [
+        111
+      ],
+      "low_plus_examples": "RPC service exposure, amplification, rpcbind CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "msrpc",
+      "name": "Microsoft RPC / WMI endpoint mapper",
+      "category": "Windows",
+      "catalog_family": "SVC-02",
+      "tcp": [
+        135
+      ],
+      "udp": [],
+      "low_plus_examples": "exposed DCE/RPC endpoints, RPC CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "netbios",
+      "name": "NetBIOS name service",
+      "category": "Windows",
+      "catalog_family": "SVC-01",
+      "tcp": [],
+      "udp": [
+        137
+      ],
+      "low_plus_examples": "name service information leakage and spoofing",
+      "enabled_by_default": true
+    },
+    {
+      "key": "smb",
+      "name": "SMB / CIFS",
+      "category": "Windows",
+      "catalog_family": "SVC-01",
+      "tcp": [
+        139,
+        445
+      ],
+      "udp": [],
+      "low_plus_examples": "SMBv1 enabled, signing not required, MS17-010 and other SMB CVEs, null sessions",
+      "enabled_by_default": true
+    },
+    {
+      "key": "imap",
+      "name": "IMAP / IMAPS",
+      "category": "Mail",
+      "catalog_family": "SVC-13",
+      "tcp": [
+        143,
+        993
+      ],
+      "udp": [],
+      "low_plus_examples": "cleartext auth, weak TLS, outdated servers",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ldap",
+      "name": "LDAP / LDAPS / Global Catalog",
+      "category": "Directory",
+      "catalog_family": "SVC-18",
+      "tcp": [
+        389,
+        636,
+        3268,
+        3269
+      ],
+      "udp": [
+        389
+      ],
+      "low_plus_examples": "anonymous bind, cleartext binds, weak TLS, CLDAP amplification",
+      "enabled_by_default": true
+    },
+    {
+      "key": "https",
+      "name": "HTTPS / TLS web servers",
+      "category": "Web",
+      "catalog_family": "SVC-10",
+      "tcp": [
+        443,
+        4443,
+        8443,
+        9443,
+        10443
+      ],
+      "udp": [],
+      "low_plus_examples": "weak protocols and ciphers, certificate problems, outdated servers and frameworks",
+      "enabled_by_default": true
+    },
+    {
+      "key": "r_services",
+      "name": "rexec / rlogin / rsh",
+      "category": "Remote access",
+      "catalog_family": null,
+      "tcp": [
+        512,
+        513,
+        514
+      ],
+      "udp": [],
+      "low_plus_examples": "trust-based logins without passwords, cleartext credentials",
+      "enabled_by_default": true
+    },
+    {
+      "key": "afp",
+      "name": "Apple Filing Protocol",
+      "category": "File transfer",
+      "catalog_family": null,
+      "tcp": [
+        548
+      ],
+      "udp": [],
+      "low_plus_examples": "guest access, outdated AFP servers",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ipp",
+      "name": "IPP printing",
+      "category": "Printers",
+      "catalog_family": "SVC-49",
+      "tcp": [
+        631
+      ],
+      "udp": [],
+      "low_plus_examples": "CUPS and printer firmware CVEs, unauthenticated administration",
+      "enabled_by_default": true
+    },
+    {
+      "key": "rsync",
+      "name": "rsync",
+      "category": "File transfer",
+      "catalog_family": null,
+      "tcp": [
+        873
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated modules exposing files",
+      "enabled_by_default": true
+    },
+    {
+      "key": "vmware",
+      "name": "VMware ESXi / vCenter",
+      "category": "Virtualisation",
+      "catalog_family": "SVC-30",
+      "tcp": [
+        902
+      ],
+      "udp": [
+        902
+      ],
+      "low_plus_examples": "ESXi and vCenter CVEs, exposed management",
+      "enabled_by_default": true
+    },
+    {
+      "key": "java_rmi",
+      "name": "Java RMI",
+      "category": "Application servers",
+      "catalog_family": null,
+      "tcp": [
+        1099
+      ],
+      "udp": [],
+      "low_plus_examples": "remote class loading and deserialization flaws",
+      "enabled_by_default": true
+    },
+    {
+      "key": "mssql",
+      "name": "Microsoft SQL Server",
+      "category": "Databases",
+      "catalog_family": "SVC-22",
+      "tcp": [
+        1433
+      ],
+      "udp": [
+        1434
+      ],
+      "low_plus_examples": "outdated versions, weak authentication, browser service exposure",
+      "enabled_by_default": true
+    },
+    {
+      "key": "oracle",
+      "name": "Oracle Database / TNS",
+      "category": "Databases",
+      "catalog_family": "SVC-25",
+      "tcp": [
+        1521
+      ],
+      "udp": [],
+      "low_plus_examples": "TNS listener CVEs, default accounts",
+      "enabled_by_default": true
+    },
+    {
+      "key": "l2tp_ipsec",
+      "name": "IPsec / IKE / L2TP",
+      "category": "VPN",
+      "catalog_family": "SVC-46",
+      "tcp": [],
+      "udp": [
+        500,
+        1701,
+        4500
+      ],
+      "low_plus_examples": "aggressive mode PSK exposure, weak transforms, IKE CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "pptp",
+      "name": "PPTP VPN",
+      "category": "VPN",
+      "catalog_family": null,
+      "tcp": [
+        1723
+      ],
+      "udp": [],
+      "low_plus_examples": "MS-CHAPv2 weaknesses, deprecated protocol",
+      "enabled_by_default": true
+    },
+    {
+      "key": "radius",
+      "name": "RADIUS",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        1812,
+        1813
+      ],
+      "low_plus_examples": "weak shared secrets, RADIUS protocol CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "mqtt",
+      "name": "MQTT",
+      "category": "Messaging",
+      "catalog_family": null,
+      "tcp": [
+        1883
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated brokers exposing messages",
+      "enabled_by_default": true
+    },
+    {
+      "key": "nfs",
+      "name": "NFS",
+      "category": "File transfer",
+      "catalog_family": "SVC-51",
+      "tcp": [
+        2049
+      ],
+      "udp": [
+        2049
+      ],
+      "low_plus_examples": "world-readable exports, NFS CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "zookeeper",
+      "name": "Apache ZooKeeper",
+      "category": "Messaging",
+      "catalog_family": null,
+      "tcp": [
+        2181
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated access to cluster data",
+      "enabled_by_default": true
+    },
+    {
+      "key": "docker",
+      "name": "Docker API",
+      "category": "Containers",
+      "catalog_family": "SVC-31",
+      "tcp": [
+        2375,
+        2376
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated Docker API leading to host takeover",
+      "enabled_by_default": true
+    },
+    {
+      "key": "web_app_3000",
+      "name": "Web application (3000)",
+      "category": "Web",
+      "catalog_family": null,
+      "tcp": [
+        3000
+      ],
+      "udp": [],
+      "low_plus_examples": "exposed development servers and dashboards",
+      "enabled_by_default": true
+    },
+    {
+      "key": "mysql",
+      "name": "MySQL / MariaDB",
+      "category": "Databases",
+      "catalog_family": "SVC-23",
+      "tcp": [
+        3306
+      ],
+      "udp": [],
+      "low_plus_examples": "outdated versions, weak or empty passwords",
+      "enabled_by_default": true
+    },
+    {
+      "key": "rdp",
+      "name": "Remote Desktop",
+      "category": "Windows",
+      "catalog_family": "SVC-05",
+      "tcp": [
+        3389
+      ],
+      "udp": [
+        3389
+      ],
+      "low_plus_examples": "NLA disabled, weak TLS, BlueKeep-class CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "cisco_smart_install",
+      "name": "Cisco Smart Install",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [
+        4786
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated configuration download/replace",
+      "enabled_by_default": true
+    },
+    {
+      "key": "glassfish",
+      "name": "GlassFish admin",
+      "category": "Application servers",
+      "catalog_family": null,
+      "tcp": [
+        4848
+      ],
+      "udp": [],
+      "low_plus_examples": "default credentials, admin console CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "docker_registry",
+      "name": "Docker registry (5000)",
+      "category": "Containers",
+      "catalog_family": null,
+      "tcp": [
+        5000
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated image pull and push",
+      "enabled_by_default": true
+    },
+    {
+      "key": "postgresql",
+      "name": "PostgreSQL",
+      "category": "Databases",
+      "catalog_family": "SVC-24",
+      "tcp": [
+        5432
+      ],
+      "udp": [],
+      "low_plus_examples": "outdated versions, weak authentication",
+      "enabled_by_default": true
+    },
+    {
+      "key": "adb",
+      "name": "Android Debug Bridge",
+      "category": "Remote access",
+      "catalog_family": null,
+      "tcp": [
+        5555
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated shell on devices",
+      "enabled_by_default": true
+    },
+    {
+      "key": "kibana",
+      "name": "Kibana",
+      "category": "Web",
+      "catalog_family": null,
+      "tcp": [
+        5601
+      ],
+      "udp": [],
+      "low_plus_examples": "exposed dashboards, Kibana CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "amqp",
+      "name": "RabbitMQ / AMQP",
+      "category": "Messaging",
+      "catalog_family": "SVC-36",
+      "tcp": [
+        5672,
+        15672
+      ],
+      "udp": [],
+      "low_plus_examples": "default credentials, management API exposure",
+      "enabled_by_default": true
+    },
+    {
+      "key": "vnc",
+      "name": "VNC",
+      "category": "Remote access",
+      "catalog_family": "SVC-29",
+      "tcp": [
+        5900,
+        5901,
+        5902,
+        5903,
+        5904,
+        5905,
+        5906,
+        5907,
+        5908,
+        5909
+      ],
+      "udp": [],
+      "low_plus_examples": "no or weak authentication, outdated servers",
+      "enabled_by_default": true
+    },
+    {
+      "key": "couchdb",
+      "name": "CouchDB",
+      "category": "Databases",
+      "catalog_family": null,
+      "tcp": [
+        5984
+      ],
+      "udp": [],
+      "low_plus_examples": "admin party / unauthenticated access, CouchDB CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "winrm",
+      "name": "WinRM",
+      "category": "Windows",
+      "catalog_family": "SVC-04",
+      "tcp": [
+        5985,
+        5986
+      ],
+      "udp": [],
+      "low_plus_examples": "HTTP (unencrypted) WinRM, weak authentication",
+      "enabled_by_default": true
+    },
+    {
+      "key": "redis",
+      "name": "Redis",
+      "category": "Databases",
+      "catalog_family": "SVC-27",
+      "tcp": [
+        6379
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated access leading to code execution",
+      "enabled_by_default": true
+    },
+    {
+      "key": "kubernetes",
+      "name": "Kubernetes API",
+      "category": "Containers",
+      "catalog_family": "SVC-32",
+      "tcp": [
+        6443
+      ],
+      "udp": [],
+      "low_plus_examples": "anonymous access, API server CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "weblogic",
+      "name": "Oracle WebLogic",
+      "category": "Application servers",
+      "catalog_family": "SVC-44",
+      "tcp": [
+        7001,
+        7002
+      ],
+      "udp": [],
+      "low_plus_examples": "deserialization and console CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ajp",
+      "name": "Apache JServ (AJP)",
+      "category": "Application servers",
+      "catalog_family": null,
+      "tcp": [
+        8009
+      ],
+      "udp": [],
+      "low_plus_examples": "Ghostcat file read/inclusion",
+      "enabled_by_default": true
+    },
+    {
+      "key": "web_admin_9000",
+      "name": "Web admin (9000)",
+      "category": "Web",
+      "catalog_family": null,
+      "tcp": [
+        9000
+      ],
+      "udp": [],
+      "low_plus_examples": "exposed admin consoles",
+      "enabled_by_default": true
+    },
+    {
+      "key": "prometheus",
+      "name": "Prometheus / metrics (9090)",
+      "category": "Web",
+      "catalog_family": null,
+      "tcp": [
+        9090
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated metrics and admin APIs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "kafka",
+      "name": "Apache Kafka",
+      "category": "Messaging",
+      "catalog_family": "SVC-37",
+      "tcp": [
+        9092
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated brokers",
+      "enabled_by_default": true
+    },
+    {
+      "key": "jetdirect",
+      "name": "JetDirect raw printing",
+      "category": "Printers",
+      "catalog_family": "SVC-50",
+      "tcp": [
+        9100
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated printer access (checks avoid sending print data)",
+      "enabled_by_default": true
+    },
+    {
+      "key": "elasticsearch",
+      "name": "Elasticsearch",
+      "category": "Databases",
+      "catalog_family": "SVC-28",
+      "tcp": [
+        9200,
+        9300
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated access to indices, Elasticsearch CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "git",
+      "name": "Git / GitLab",
+      "category": "Web",
+      "catalog_family": "SVC-35",
+      "tcp": [
+        9418
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated repository access, GitLab CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "jboss",
+      "name": "JBoss / WildFly",
+      "category": "Application servers",
+      "catalog_family": "SVC-40",
+      "tcp": [
+        9990
+      ],
+      "udp": [],
+      "low_plus_examples": "management console exposure, deserialization CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "webmin",
+      "name": "Webmin",
+      "category": "Web",
+      "catalog_family": null,
+      "tcp": [
+        10000
+      ],
+      "udp": [],
+      "low_plus_examples": "Webmin CVEs including remote code execution",
+      "enabled_by_default": true
+    },
+    {
+      "key": "kubelet",
+      "name": "kubelet",
+      "category": "Containers",
+      "catalog_family": "SVC-33",
+      "tcp": [
+        10250
+      ],
+      "udp": [],
+      "low_plus_examples": "anonymous kubelet API leading to container exec",
+      "enabled_by_default": true
+    },
+    {
+      "key": "memcached",
+      "name": "Memcached",
+      "category": "Databases",
+      "catalog_family": "SVC-38",
+      "tcp": [
+        11211
+      ],
+      "udp": [
+        11211
+      ],
+      "low_plus_examples": "unauthenticated access, UDP amplification",
+      "enabled_by_default": true
+    },
+    {
+      "key": "mongodb",
+      "name": "MongoDB",
+      "category": "Databases",
+      "catalog_family": "SVC-26",
+      "tcp": [
+        27017
+      ],
+      "udp": [],
+      "low_plus_examples": "unauthenticated databases, outdated versions",
+      "enabled_by_default": true
+    },
+    {
+      "key": "tftp",
+      "name": "TFTP",
+      "category": "File transfer",
+      "catalog_family": "SVC-17",
+      "tcp": [],
+      "udp": [
+        69
+      ],
+      "low_plus_examples": "unauthenticated file read/write",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ntp",
+      "name": "NTP",
+      "category": "Network infrastructure",
+      "catalog_family": "SVC-47",
+      "tcp": [],
+      "udp": [
+        123
+      ],
+      "low_plus_examples": "monlist/mode 6 amplification, NTP CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "snmp",
+      "name": "SNMP",
+      "category": "Network infrastructure",
+      "catalog_family": "SVC-15",
+      "tcp": [],
+      "udp": [
+        161,
+        162
+      ],
+      "low_plus_examples": "default community strings, information disclosure",
+      "enabled_by_default": true
+    },
+    {
+      "key": "syslog",
+      "name": "Syslog",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        514
+      ],
+      "low_plus_examples": "unauthenticated log injection, syslog daemon CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "rip",
+      "name": "RIP routing",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        520
+      ],
+      "low_plus_examples": "route injection with RIPv1",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ipmi",
+      "name": "IPMI / BMC",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        623
+      ],
+      "low_plus_examples": "IPMI 2.0 hash disclosure, cipher zero",
+      "enabled_by_default": true
+    },
+    {
+      "key": "ssdp_upnp",
+      "name": "SSDP / UPnP",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        1900
+      ],
+      "low_plus_examples": "UPnP CVEs and amplification",
+      "enabled_by_default": true
+    },
+    {
+      "key": "sip",
+      "name": "SIP / VoIP",
+      "category": "VoIP",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        5060
+      ],
+      "low_plus_examples": "unauthenticated registration, SIP stack CVEs",
+      "enabled_by_default": true
+    },
+    {
+      "key": "mdns",
+      "name": "mDNS",
+      "category": "Network infrastructure",
+      "catalog_family": null,
+      "tcp": [],
+      "udp": [
+        5353
+      ],
+      "low_plus_examples": "information disclosure and amplification",
+      "enabled_by_default": true
+    }
+  ],
+  "not_checked": [
+    {
+      "port": "20/tcp",
+      "service": "ftp-data",
+      "reason": "FTP data channel, not a listening service; FTP findings are reported on 21/tcp"
+    },
+    {
+      "port": "67-68/udp",
+      "service": "dhcp",
+      "reason": "network-scoped protocol; it cannot be checked against one IP address"
+    },
+    {
+      "port": "138/udp",
+      "service": "netbios-dgm",
+      "reason": "datagram service with no separate checks; NetBIOS issues are reported on 137/udp and SMB ports"
+    },
+    {
+      "port": "4789/udp",
+      "service": "vxlan",
+      "reason": "overlay transport with no OpenVAS vulnerability checks"
+    },
+    {
+      "port": "5004/udp",
+      "service": "rtp",
+      "reason": "media stream ports with no OpenVAS vulnerability checks"
+    }
+  ]
+}

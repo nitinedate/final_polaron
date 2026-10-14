@@ -146,15 +146,28 @@ function downloadTextFile(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
-const SERVICE_STATUS_ORDER = ["finding", "observation", "not-tested", "not-observed", "not-in-scope", "unsupported"];
+const SERVICE_STATUS_ORDER = ["finding", "observation", "not-tested", "closed", "filtered", "not-observed", "not-in-scope", "unsupported"];
 const SERVICE_STATUS_LABEL: Record<string, string> = {
   finding: "Finding",
   observation: "Observed",
   "not-tested": "Not tested",
+  closed: "Closed",
+  filtered: "No answer",
   "not-observed": "Not observed",
-  "not-in-scope": "Not in scope",
+  "not-in-scope": "Not in policy",
   unsupported: "Unsupported",
 };
+const POLICY_STATE_LABEL: Record<string, string> = {
+  finding: "Low+ finding",
+  open: "Open, no Low+ finding",
+  closed: "Closed",
+  filtered: "No answer",
+  "not-observed": "Not observed",
+  unknown: "Unknown",
+  "not-in-policy": "Not in policy",
+};
+const POLICY_STATE_ORDER = ["finding", "open", "unknown", "not-observed", "closed", "filtered", "not-in-policy"];
+const LOW_PLUS = ["critical", "high", "medium", "low"];
 
 function jobCoverageIncomplete(job: ScanJob): boolean {
   return job.status === "completed" && /[1-9]\d* host\(s\) incomplete|coverage incomplete/i.test(job.progress_label || "");
@@ -760,6 +773,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<ScanJobSeveritySummary | null>(null);
   const [selectedSeverity, setSelectedSeverity] = useState<string | null>(null);
+  const [showInfo, setShowInfo] = useState(false);
   const [ipsOpen, setIpsOpen] = useState(true);
 
   useEffect(() => {
@@ -841,6 +855,10 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
       ? "Completed with warnings"
       : (summary?.status || job.status);
   const cleanBlockers = summary?.assessment?.clean_blockers || [];
+  // V1.7.0: the chart shows Low and above by default; informational rows are evidence, not findings.
+  const infoCount = (summary?.severities || []).filter((b) => !LOW_PLUS.includes(b.severity)).reduce((n, b) => n + b.count, 0);
+  const donutBuckets = (summary?.severities || []).filter((b) => showInfo || LOW_PLUS.includes(b.severity));
+  const donutTotal = donutBuckets.reduce((n, b) => n + b.count, 0);
 
   return (
     <Modal open onClose={onClose} title={`Scan details · ${job.id.slice(0, 8)}…`} size="lg">
@@ -966,12 +984,22 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
           ) : (
             <>
               <div>
-                <h4 className="mb-3 text-sm font-semibold text-ink-800">Polaron — Findings by severity</h4>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <h4 className="text-sm font-semibold text-ink-800">
+                    Polaron — Findings by severity{showInfo ? "" : " (Low and above)"}
+                  </h4>
+                  {infoCount > 0 ? (
+                    <button type="button" className="text-xs font-semibold text-brand-700 hover:underline"
+                      onClick={() => setShowInfo((v) => !v)}>
+                      {showInfo ? "Hide informational" : `Show ${infoCount} informational`}
+                    </button>
+                  ) : null}
+                </div>
                 <SeverityDonut
-                  buckets={summary?.severities || []}
+                  buckets={donutBuckets}
                   selected={selectedSeverity}
                   onSelect={setSelectedSeverity}
-                  totalFindings={summary?.total ?? 0}
+                  totalFindings={donutTotal}
                 />
               </div>
               <div>
@@ -1039,13 +1067,15 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                       <details key={host} className="rounded-xl border border-ink-200 bg-white p-3">
                         <summary className="cursor-pointer text-sm font-semibold text-ink-800">
                           {host} · {coverage.counts.finding || 0} with findings · {coverage.counts.observation || 0} observed · {coverage.counts["not-tested"] || 0} not tested
+                          {coverage.counts.closed ? ` · ${coverage.counts.closed} closed` : ""}
+                          {coverage.counts.filtered ? ` · ${coverage.counts.filtered} no answer` : ""}
                           {coverage.counts["not-observed"] ? ` · ${coverage.counts["not-observed"]} not observed` : ""}
-                          {coverage.counts["not-in-scope"] ? ` · ${coverage.counts["not-in-scope"]} not in scope` : ""}
+                          {coverage.counts["not-in-scope"] ? ` · ${coverage.counts["not-in-scope"]} not in policy` : ""}
                           {` · ${coverage.counts.unsupported || 0} unsupported`}
                         </summary>
                         <p className="my-2 text-xs text-amber-800">{coverage.limitation}</p>
                         <p className="mb-2 text-xs text-ink-500">
-                          Not tested: the port was open but no check result was found. Not observed: the port was scanned and closed, and no open port was identified as this service. Not in scope: the port was not in the scanned range.
+                          Not tested: the port was open but no check result was found. Closed: the port refused the connection, nothing listens there. No answer: the port did not respond (firewall or host offline). Not observed: scanned, but no response or listener seen (used for UDP). Not in policy: the port was not in this scan's service port policy.
                         </p>
                         <div className="max-h-80 overflow-auto">
                           <table className="w-full text-left text-xs">
@@ -1068,6 +1098,38 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                             ))}</tbody>
                           </table>
                         </div>
+                        {coverage.policy_services?.length ? (
+                          <div className="mt-3 rounded-lg border border-ink-100 p-2">
+                            <p className="text-xs font-semibold text-ink-800">
+                              Policy services · {String(coverage.policy_summary?.finding ?? 0)} with Low+ findings ·{" "}
+                              {String(coverage.policy_summary?.open ?? 0)} open · {String(coverage.policy_summary?.closed ?? 0)} closed ·{" "}
+                              {String(coverage.policy_summary?.filtered ?? 0)} no answer
+                            </p>
+                            <div className="max-h-72 overflow-auto">
+                              <table className="mt-1 w-full text-left text-xs">
+                                <thead><tr><th className="p-1.5">Service</th><th className="p-1.5">State</th><th className="p-1.5">Ports</th><th className="p-1.5">Low+ findings</th></tr></thead>
+                                <tbody>
+                                  {[...coverage.policy_services]
+                                    .filter((svc) => svc.state !== "not-in-policy")
+                                    .sort((a, b) => POLICY_STATE_ORDER.indexOf(a.state) - POLICY_STATE_ORDER.indexOf(b.state))
+                                    .map((svc) => (
+                                      <tr key={svc.key} className="border-t border-ink-100">
+                                        <td className="p-1.5">{svc.name}</td>
+                                        <td className="p-1.5">{POLICY_STATE_LABEL[svc.state] || svc.state}</td>
+                                        <td className="p-1.5">{svc.ports.map((p) => `${p.port} ${p.state}`).join(", ")}</td>
+                                        <td className="p-1.5">
+                                          {(["Critical", "High", "Medium", "Low"] as const)
+                                            .filter((k) => svc.severity_counts?.[k])
+                                            .map((k) => `${svc.severity_counts[k]} ${k}`)
+                                            .join(", ") || "—"}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        ) : null}
                         {[coverage.host_level, coverage.other_ports].map((bucket) =>
                           bucket && bucket.source_result_ids?.length ? (
                             <div key={bucket.service_id} className="mt-3 rounded-lg border border-ink-100 p-2">
@@ -1106,6 +1168,9 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                               ? ` · ${policy.check_scope_status.nvt_count.toLocaleString()} of ${policy.check_scope_status.base_nvt_count.toLocaleString()} checks selected`
                               : ""}
                             {policy.check_scope_status?.config?.startsWith("not applied") ? " · not applied, all checks ran" : ""}
+                            {policy.check_scope_status?.filter
+                              ? ` · filter: ${policy.check_scope_status.filter.min_severity ? `severity ${policy.check_scope_status.filter.min_severity}+` : "any severity"}${policy.check_scope_status.filter.name_contains ? `, name contains "${policy.check_scope_status.filter.name_contains}"` : ""}`
+                              : ""}
                           </p>
                         ) : null}
                         {policy.performance ? (

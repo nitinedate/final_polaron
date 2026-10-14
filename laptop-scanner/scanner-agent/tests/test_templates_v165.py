@@ -32,7 +32,12 @@ def test_every_shipped_template_validates_and_has_nessus_reference():
     for template in doc["templates"]:
         req = validate_request({"template": template["key"]})
         assert req["template"] == template["key"]
-        assert template["nessus_template"] and template["nessus_reference"]
+        assert template["nessus_reference"]
+        if template["category"] == "threat":
+            # V1.6.9: not in the Nessus 10.11 scanner list, so never labelled as a Nessus template.
+            assert template["nessus_template"] is None and template["name"].startswith("Threat check:")
+        else:
+            assert template["nessus_template"]
         effective_policy({"template": template["key"]})
 
 

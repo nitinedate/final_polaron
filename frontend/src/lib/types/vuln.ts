@@ -68,7 +68,8 @@ export interface ScanPolicyCreate {
 export interface ScanPolicyTemplate {
   key: string;
   name: string;
-  nessus_template: string;
+  /** null for Aetheris threat checks that have no current Nessus template */
+  nessus_template: string | null;
   category: "discovery" | "vulnerability" | "compliance" | "threat" | string;
   description: string;
   compliance_framework?: string | null;
@@ -85,11 +86,44 @@ export interface ScanPolicyTemplate {
     require_credentials?: string[];
     nvt_families?: string[];
     cve_watchlist?: string[];
+    scan_purpose?: "vulnerability" | "ping_discovery" | "credential_validation" | "compliance";
+    nvt_filter?: { min_severity?: number; name_contains?: string; families?: string[] };
     [key: string]: unknown;
   };
   tcp_port_count_floor: number | null;
   udp_port_count: number | null;
   requires_credentials: string[];
+}
+
+/** V1.7.0 service port policy (GET /api/scan-service-port-policy). */
+export interface ServicePortPolicyService {
+  key: string;
+  name: string;
+  category: string;
+  catalog_family: string | null;
+  tcp: number[];
+  udp: number[];
+  low_plus_examples: string;
+  enabled_by_default: boolean;
+}
+
+export interface ServicePortPolicy {
+  policy_version: string;
+  description: string;
+  services: ServicePortPolicyService[];
+  not_checked: { port: string; service: string; reason: string }[];
+  tcp_port_count: number;
+  udp_port_count: number;
+}
+
+export interface PolicyServiceStatus {
+  key: string;
+  name: string;
+  category: string;
+  state: "finding" | "open" | "closed" | "filtered" | "not-observed" | "unknown" | "not-in-policy" | string;
+  ports: { port: string; state: string }[];
+  severity_counts: Record<string, number>;
+  finding_result_ids: string[];
 }
 
 export interface ServiceResultBucket {
@@ -207,6 +241,7 @@ export interface ScanJobTargetProgress {
     nvts_launched?: number;
     results_evidenced?: number;
     warnings?: number;
+    port_state_counts?: { open?: number; closed?: number; filtered?: number };
   };
 }
 
@@ -231,6 +266,8 @@ export interface ScanJobSeveritySummary {
       severity_counts?: Record<string, number>; attribution?: string[]; credentialed_checks: string }[];
     host_level?: ServiceResultBucket;
     other_ports?: ServiceResultBucket;
+    policy_services?: PolicyServiceStatus[];
+    policy_summary?: Record<string, number | string>;
     network_scan_complete?: boolean;
     ip_forwarding: { status: string; reason: string };
   }>;
@@ -245,8 +282,10 @@ export interface ScanJobSeveritySummary {
       scanner_preferences?: Record<string, string> };
     nvt_timeout_caps?: { count: number; applied: number; cap_sec: number | null; oids: string[] };
     check_scope?: "vulnerability" | "all" | string;
-    check_scope_status?: { config?: string; nvt_count?: number | null; base_nvt_count?: number | null;
-      filtered_families?: number; severity_checks_selected?: number; excluded_families?: string[] } }>;
+    check_scope_status?: { config?: string; scope?: string; nvt_count?: number | null; base_nvt_count?: number | null;
+      filtered_families?: number; severity_checks_selected?: number; excluded_families?: string[];
+      filter?: { min_severity?: number; name_contains?: string; families?: string[] } };
+    scan_purpose?: string }>;
   cve_watchlist?: {
     cves: string[];
     hit_count: number;

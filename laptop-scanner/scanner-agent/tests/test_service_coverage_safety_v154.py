@@ -12,7 +12,7 @@ from agent.service_policy import analyze_services
 def test_preprobe_never_narrows_authorized_scope(monkeypatch):
     monkeypatch.setenv("PORT_DISCOVERY_ENABLED", "true")
     monkeypatch.setenv("PORT_DISCOVERY_RANGE", "T:22,T:80,T:443,T:445")
-    with patch("agent.port_discovery.probe_open_tcp_ports", return_value={"192.0.2.10": [445]}):
+    with patch("agent.port_discovery.probe_tcp_port_states", return_value={"192.0.2.10": {'open': [445], 'closed': [], 'filtered': []}}):
         plan = discovery_plan(["192.0.2.10"])
     assert plan["port_range"] == "T:22,T:80,T:443,T:445"
     assert plan["observed_port_range"] == "T:445"

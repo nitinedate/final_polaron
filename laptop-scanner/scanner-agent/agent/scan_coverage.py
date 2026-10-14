@@ -117,6 +117,7 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
     oids: set[str] = set()
     tcp: set[int] = set()
     udp: set[int] = set()
+    auth: dict[str, str] = {}
     result_rows = 0
     try:
         for r in report.xpath(".//results/result"):
@@ -138,6 +139,14 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
             for d in h.findall("detail"):
                 name = _text(d, "name")
                 value = _text(d, "value")
+                if name.startswith("Auth-") and name.count("-") >= 2:
+                    # Greenbone login outcome, e.g. Auth-SMB-Success / Auth-SSH-Failure
+                    # (same parsing as the Greenbone web UI: any success wins).
+                    _, proto, outcome = name.split("-", 2)
+                    key = proto.lower()
+                    if auth.get(key) != "success":
+                        auth[key] = "success" if outcome.lower().startswith("success") else "failure"
+                    continue
                 if name == "EXIT_CODE":
                     src = d.find("source")
                     src_name = _text(src, "name") if src is not None else ""
@@ -159,6 +168,7 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
     out["open_tcp_ports"] = sorted(tcp)[:512]
     out["open_udp_ports"] = sorted(udp)[:128]
     out["results_evidenced"] = result_rows
+    out["auth_status"] = auth
     out["plugin_error_count"] = len(out["port_scanner_errors"]) + out["other_errors"]
 
     # ---- verdict -----------------------------------------------------------

@@ -806,7 +806,27 @@ def classify_host_coverage(
         # This is still not a clean claim: service_scope_verified and
         # clean_eligible stay false for unauthenticated/unverified scans.
         network_ok = verdict == "observed_unverified" and cov.get("network_scan_complete") is True
-        if verdict == "full" and cov.get("coverage_complete") is True:
+        purpose = str(cov.get("scan_purpose") or "vulnerability")
+        auth = cov.get("auth_status") if isinstance(cov.get("auth_status"), dict) else {}
+        auth_text = ", ".join(
+            f"{proto.upper()} login {'succeeded' if state == 'success' else 'failed'}"
+            for proto, state in sorted(auth.items())
+        )
+        if verdict == "no_exposed_services" and cov.get("network_scan_complete") is True:
+            # V1.7.0: port scan finished; every policy port was closed or dropped.
+            network_complete.append(str(cov_host))
+            entry["status"] = "completed"
+            counts = cov.get("port_state_counts") if isinstance(cov.get("port_state_counts"), dict) else {}
+            entry["activity"] = (
+                f"No exposed services - {int(counts.get('closed') or 0)} policy ports closed, "
+                f"{int(counts.get('filtered') or 0)} not answering"
+                + ("" if cov.get("host_responded") else " (firewall blocking or host offline)")
+            )
+        elif verdict == "discovery_alive":
+            # V1.6.9 Ping-Only Discovery: aliveness is the whole result.
+            entry["status"] = "completed"
+            entry["activity"] = "Alive - answered the ping (ping-only discovery; ports and vulnerabilities not checked)"
+        elif verdict == "full" and cov.get("coverage_complete") is True:
             entry["status"] = "completed"
             entry["activity"] = "Completed"
         elif network_ok:
@@ -817,6 +837,10 @@ def classify_host_coverage(
                     f"Completed at time limit - stopped after {int(cov.get('time_limit_sec') or 0) // 60} min "
                     f"at {int(cov.get('stopped_at_progress') or 0)}%; "
                 )
+            elif purpose == "credential_validation":
+                prefix = "Credential check - " + (auth_text or "no login result reported by Greenbone") + "; "
+            elif purpose == "compliance":
+                prefix = "Compliance audit finished - " + (f"{auth_text}; " if auth_text else "")
             else:
                 prefix = "Completed with warnings - " if warnings else "Completed - "
             entry["activity"] = (
@@ -842,6 +866,9 @@ def classify_host_coverage(
             "results_evidenced": int(cov.get("results_evidenced") or 0),
             "warnings": len(warnings),
             "time_limited": bool(cov.get("time_limited")),
+            "scan_purpose": purpose,
+            "auth_status": auth,
+            "port_state_counts": cov.get("port_state_counts") if isinstance(cov.get("port_state_counts"), dict) else {},
             "stopped_at_progress": cov.get("stopped_at_progress"),
         }
         tp[str(cov_host)] = entry

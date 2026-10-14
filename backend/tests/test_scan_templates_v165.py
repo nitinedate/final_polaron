@@ -111,3 +111,4 @@ def test_central_policy_module_matches_the_agent_copy():
     assert filecmp.cmp(agent / "service_policy.py", central / "scanner_service_policy.py", shallow=False)
     assert filecmp.cmp(agent / "scan_templates.json", central / "scan_templates.json", shallow=False)
     assert filecmp.cmp(agent / "service_catalog.json", central / "service_catalog.json", shallow=False)
+    assert filecmp.cmp(agent / "service_port_policy.json", central / "service_port_policy.json", shallow=False)

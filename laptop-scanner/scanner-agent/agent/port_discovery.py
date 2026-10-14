@@ -87,11 +87,63 @@ def _workers(total_probes: int) -> int:
 
 def candidate_range() -> str:
     profile = (os.environ.get("PORT_PROFILE") or "").strip().lower()
-    if profile in {"vuln", "nexus", "nessus"}:
+    if profile in {"nexus", "catalog"}:
+        # V1.7.0: probe exactly the TCP ports of the service port policy; the
+        # probe is the closed/filtered evidence per service, so the separate
+        # PORT_DISCOVERY_RANGE list must not narrow it for these profiles.
+        from agent.service_policy import policy_ports
+
+        tcp, _udp = policy_ports()
+        if tcp:
+            return ",".join(f"T:{p}" for p in tcp)
+    if profile in {"vuln", "nessus"}:
         from agent.vuln_ports import tcp_gmp_range
 
         return tcp_gmp_range()
     return (os.environ.get("PORT_DISCOVERY_RANGE") or DEFAULT_FAST_RANGE).strip() or DEFAULT_FAST_RANGE
+
+
+def probe_tcp_port_states(
+    hosts: list[str],
+    *,
+    port_range: str | None = None,
+    timeout: float | None = None,
+) -> dict[str, dict[str, list[int]]]:
+    """TCP connect probe that keeps the three outcomes apart (V1.7.0).
+
+    open      the connection was accepted
+    closed    refused (TCP reset): the host is up and nothing listens there
+    filtered  no answer before the timeout, or the host/network was unreachable:
+              a firewall dropped it, or the host is offline
+    """
+    clean_hosts = [str(h).strip() for h in hosts if str(h).strip()]
+    ports = parse_tcp_ports(port_range or candidate_range())
+    result: dict[str, dict[str, list[int]]] = {
+        host: {"open": [], "closed": [], "filtered": []} for host in clean_hosts
+    }
+    if not clean_hosts or not ports:
+        return result
+    to = _timeout_sec() if timeout is None else max(0.05, float(timeout))
+
+    def _one(host: str, port: int) -> tuple[str, int, str]:
+        try:
+            with socket.create_connection((host, int(port)), timeout=to):
+                return host, int(port), "open"
+        except ConnectionRefusedError:
+            return host, int(port), "closed"
+        except OSError:
+            return host, int(port), "filtered"
+
+    total = len(clean_hosts) * len(ports)
+    with ThreadPoolExecutor(max_workers=_workers(total), thread_name_prefix="aetheris-port") as pool:
+        futs = [pool.submit(_one, host, port) for host in clean_hosts for port in ports]
+        for fut in as_completed(futs):
+            host, port, state = fut.result()
+            result[host][state].append(port)
+    for states in result.values():
+        for key in states:
+            states[key] = sorted(set(states[key]))
+    return result
 
 
 def probe_open_tcp_ports(
@@ -100,37 +152,9 @@ def probe_open_tcp_ports(
     port_range: str | None = None,
     timeout: float | None = None,
 ) -> dict[str, list[int]]:
-    """Return observed open candidate TCP ports for each host.
-
-    A refused/filtered/timeout result is not treated as proof that the host is
-    dead.  Callers must use the fast fallback range when this returns no ports.
-    """
-    clean_hosts = [str(h).strip() for h in hosts if str(h).strip()]
-    ports = parse_tcp_ports(port_range or candidate_range())
-    result: dict[str, list[int]] = {host: [] for host in clean_hosts}
-    if not clean_hosts or not ports:
-        return result
-
-    to = _timeout_sec() if timeout is None else max(0.05, float(timeout))
-
-    def _one(host: str, port: int) -> tuple[str, int, bool]:
-        try:
-            with socket.create_connection((host, int(port)), timeout=to):
-                return host, int(port), True
-        except OSError:
-            return host, int(port), False
-
-    total = len(clean_hosts) * len(ports)
-    with ThreadPoolExecutor(max_workers=_workers(total), thread_name_prefix="aetheris-port") as pool:
-        futs = [pool.submit(_one, host, port) for host in clean_hosts for port in ports]
-        for fut in as_completed(futs):
-            host, port, is_open = fut.result()
-            if is_open:
-                result[host].append(port)
-
-    for host in result:
-        result[host] = sorted(set(result[host]))
-    return result
+    """Compatibility wrapper: open ports only (see probe_tcp_port_states)."""
+    states = probe_tcp_port_states(hosts, port_range=port_range, timeout=timeout)
+    return {host: list(st.get("open") or []) for host, st in states.items()}
 
 
 def discovery_plan(hosts: list[str]) -> dict[str, Any]:
@@ -146,13 +170,15 @@ def discovery_plan(hosts: list[str]) -> dict[str, Any]:
             "fallback": True,
         }
 
-    observed = probe_open_tcp_ports(hosts, port_range=fallback)
+    states = probe_tcp_port_states(hosts, port_range=fallback)
+    observed = {host: list(st.get("open") or []) for host, st in states.items()}
     union = sorted({p for vals in observed.values() for p in vals})
     if not union:
         return {
             "enabled": True,
             "port_range": fallback,
             "open_ports": observed,
+            "port_states": states,
             "open_port_count": 0,
             "observed_port_range": "",
             "fallback": True,
@@ -162,6 +188,7 @@ def discovery_plan(hosts: list[str]) -> dict[str, Any]:
         "port_range": fallback,
         "observed_port_range": ports_to_gvm_range(union),
         "open_ports": observed,
+        "port_states": states,
         "open_port_count": len(union),
         "fallback": False,
     }

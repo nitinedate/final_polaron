@@ -691,7 +691,8 @@ def render_gap_docx(ctx: dict[str, Any]) -> bytes:
                 counts = evidence.get("counts") or {}
                 doc.add_paragraph(
                     f"{host}: {counts.get('finding', 0)} families with findings; {counts.get('observation', 0)} observed; "
-                    f"{counts.get('not-tested', 0)} not tested; {counts.get('not-observed', 0)} not observed in the scanned "
+                    f"{counts.get('not-tested', 0)} not tested; {counts.get('closed', 0)} closed; "
+                    f"{counts.get('filtered', 0)} not answering; {counts.get('not-observed', 0)} not observed in the scanned "
                     f"port range; {counts.get('not-in-scope', 0)} outside the scanned port range; "
                     f"{counts.get('unsupported', 0)} unsupported."
                 )

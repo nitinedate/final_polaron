@@ -88,4 +88,4 @@ def test_diagnostic_reports_actual_local_listener():
 
 def test_build_stamp_identifies_new_fix():
     from agent import AGENT_BUILD
-    assert AGENT_BUILD == '1.6.8-v48.0'
+    assert AGENT_BUILD == '1.7.0-v49.0'

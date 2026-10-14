@@ -14,6 +14,7 @@ import type {
   ScanPolicy,
   ScanPolicyCreate,
   ScanPolicyTemplate,
+  ServicePortPolicy,
   ScanPolicyUpdate,
   NetworkToken,
   NetworkTokenCreate,
@@ -97,6 +98,8 @@ export const vulnApi = {
     api.post<Scanner>(`/api/scanners/${scannerId}/ensure-agent-recovery-token`),
 
   listScanPolicyTemplates: () => api.get<ScanPolicyTemplate[]>("/api/scan-policy-templates"),
+
+  getServicePortPolicy: () => api.get<ServicePortPolicy>("/api/scan-service-port-policy"),
 
   listScanPolicies: (caseId?: string) =>
     api.get<ScanPolicy[]>("/api/scan-policies", caseId ? { case_id: caseId } : undefined),

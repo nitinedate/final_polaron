@@ -1126,6 +1126,26 @@ def list_policy_templates(
     return out
 
 
+@router.get("/api/scan-service-port-policy")
+def get_service_port_policy(
+    current: CurrentUser = Depends(require_firm_permission("scan:read")),
+):
+    """The services and ports a nexus-scope scan checks (V1.7.0)."""
+    _require_vuln_module()
+    from app.services.scanner_service_policy import policy_ports, service_port_policy
+
+    doc = service_port_policy()
+    tcp, udp = policy_ports()
+    return {
+        "policy_version": doc["policy_version"],
+        "description": doc["description"],
+        "services": doc["services"],
+        "not_checked": doc.get("not_checked") or [],
+        "tcp_port_count": len(tcp),
+        "udp_port_count": len(udp),
+    }
+
+
 @router.get("/api/scan-policies")
 def list_policies(
     case_id: str | None = None,
@@ -1618,6 +1638,11 @@ def get_scan_job_severity_summary(
     network_done = bool(is_edge and network_complete_hosts and not degraded_hosts)
     if verified and skipped_count > 0:
         assessment_label = "ENGINE COMPLETE - IP SCOPE EXCEPTION"
+    elif verified and network_done and network_complete_hosts and all(
+        str(((orch_obj.get("host_coverage") or {}).get(h) or {}).get("verdict") or "") == "no_exposed_services"
+        for h in network_complete_hosts
+    ):
+        assessment_label = "NETWORK SCAN COMPLETE - NO EXPOSED SERVICES"
     elif verified and network_done and plugin_error_count > 0:
         assessment_label = f"NETWORK SCAN COMPLETE - {plugin_error_count} SCANNER WARNING(S)"
     elif verified and network_done:

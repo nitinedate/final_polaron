@@ -13,6 +13,8 @@ from typing import Any
 from uuid import UUID
 
 CATALOG_PATH = Path(__file__).with_name("service_catalog.json")
+SERVICE_PORT_POLICY_PATH = Path(__file__).with_name("service_port_policy.json")
+POLICY_PORT_MODES = {"nexus", "catalog"}
 TEMPLATES_PATH = Path(__file__).with_name("scan_templates.json")
 # nexus    DEFAULT. The Nexus service-port catalog (52 families, ~88 TCP +
 #          30 priority UDP ports). V1.6.7 restores this meaning.
@@ -85,7 +87,14 @@ SNAPSHOT_FIELDS = {
     "nvt_timeout_caps",
     "check_scope",
     "check_scope_status",
+    "scan_purpose",
+    "nvt_filter",
+    "require_families",
+    "disabled_services",
+    "service_port_policy_version",
 }
+SCAN_PURPOSES = {"vulnerability", "ping_discovery", "credential_validation", "compliance"}
+_NAME_FILTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/()+-]{0,59}$")
 PERFORMANCE_PROFILES = {"standard", "fast"}
 CHECK_SCOPES = {"vulnerability", "all"}
 PREFERENCE_FIELDS = {
@@ -176,6 +185,36 @@ def service_catalog() -> dict[str, Any]:
     return doc
 
 
+@lru_cache(maxsize=1)
+def service_port_policy() -> dict[str, Any]:
+    """The services/ports Aetheris checks (V1.7.0). Single source for the nexus scope."""
+    doc = json.loads(SERVICE_PORT_POLICY_PATH.read_text(encoding="utf-8"))
+    keys = [s["key"] for s in doc["services"]]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Duplicate service key in service_port_policy.json")
+    families = {s["key"] for s in service_catalog()["services"]}
+    for svc in doc["services"]:
+        for port in list(svc["tcp"]) + list(svc["udp"]):
+            if not isinstance(port, int) or not 1 <= port <= 65535:
+                raise ValueError(f"Invalid port {port!r} for {svc['key']}")
+        if svc.get("catalog_family") and svc["catalog_family"] not in families:
+            raise ValueError(f"Unknown catalog family {svc['catalog_family']} for {svc['key']}")
+    return doc
+
+
+def policy_ports(disabled: list[str] | None = None) -> tuple[list[int], list[int]]:
+    """TCP and UDP ports of every enabled policy service."""
+    off = set(disabled or [])
+    tcp: set[int] = set()
+    udp: set[int] = set()
+    for svc in service_port_policy()["services"]:
+        if svc["key"] in off or not svc.get("enabled_by_default", True):
+            continue
+        tcp.update(svc["tcp"])
+        udp.update(svc["udp"])
+    return sorted(tcp), sorted(udp)
+
+
 def port_numbers(value: Any) -> list[int]:
     if value is None or value == "":
         return []
@@ -256,6 +295,21 @@ def _validate_fields(raw: dict[str, Any]) -> dict[str, Any]:
         if value not in PERFORMANCE_PROFILES:
             raise ValueError("performance must be fast or standard")
         out["performance"] = value
+    if raw.get("disabled_services") not in (None, []):
+        keys = raw["disabled_services"]
+        known = {s["key"] for s in service_port_policy()["services"]}
+        if not isinstance(keys, list) or not set(map(str, keys)) <= known:
+            raise ValueError("disabled_services must list keys from the service port policy")
+        out["disabled_services"] = sorted(set(map(str, keys)))
+    if raw.get("scan_purpose") not in (None, ""):
+        value = str(raw["scan_purpose"]).strip().lower()
+        if value not in SCAN_PURPOSES:
+            raise ValueError(f"scan_purpose must be one of {sorted(SCAN_PURPOSES)}")
+        out["scan_purpose"] = value
+    if raw.get("require_families") is not None:
+        out["require_families"] = bool(raw["require_families"])
+    if raw.get("nvt_filter") not in (None, "", {}):
+        out["nvt_filter"] = _validate_nvt_filter(raw["nvt_filter"])
     if raw.get("check_scope") not in (None, ""):
         value = str(raw["check_scope"]).strip().lower()
         if value not in CHECK_SCOPES:
@@ -322,6 +376,44 @@ def _validate_fields(raw: dict[str, Any]) -> dict[str, Any]:
     if out.get("port_profile") == "focused" and not (out.get("custom_tcp_ports") or out.get("custom_udp_ports")):
         raise ValueError("The focused port profile requires custom_tcp_ports or custom_udp_ports")
     # No passwords, account tokens, URLs or arbitrary scanner preferences cross this contract.
+    return out
+
+
+def _validate_nvt_filter(value: Any) -> dict[str, Any]:
+    """Structured Advanced Dynamic filter. Never a raw gvmd filter string.
+
+    min_severity  0.1-10.0: run checks whose severity is at least this
+    name_contains short plain text the check name must contain
+    families      optional list of Greenbone family names to restrict to
+    """
+    if not isinstance(value, dict):
+        raise ValueError("nvt_filter must be an object")
+    unknown = set(value) - {"min_severity", "name_contains", "families"}
+    if unknown:
+        raise ValueError(f"Unsupported nvt_filter keys: {sorted(unknown)}")
+    out: dict[str, Any] = {}
+    if value.get("min_severity") not in (None, ""):
+        try:
+            sev = round(float(value["min_severity"]), 1)
+        except (TypeError, ValueError):
+            raise ValueError("nvt_filter.min_severity must be a number") from None
+        if not 0.1 <= sev <= 10.0:
+            raise ValueError("nvt_filter.min_severity must be between 0.1 and 10.0")
+        out["min_severity"] = sev
+    if value.get("name_contains") not in (None, ""):
+        text = str(value["name_contains"]).strip()
+        if not _NAME_FILTER_RE.match(text):
+            raise ValueError("nvt_filter.name_contains may use letters, digits, spaces and . _ : / ( ) + - only")
+        out["name_contains"] = text
+    if value.get("families") not in (None, [], ""):
+        fams = value["families"]
+        if not isinstance(fams, list) or len(fams) > 64 or not all(
+            isinstance(f, str) and _FAMILY_RE.match(f) for f in fams
+        ):
+            raise ValueError("nvt_filter.families must be up to 64 Greenbone family names")
+        out["families"] = sorted(set(fams))
+    if not out:
+        raise ValueError("nvt_filter needs min_severity, name_contains or families")
     return out
 
 
@@ -399,8 +491,23 @@ def effective_policy(
         str(os.environ.get("UDP_PORT_RANGE") or "").replace("U:", "").replace("u:", "")
     )
     extra_udp = sorted(set(extra_udp + port_numbers(legacy_udp)))
+    policy_mode = mode in POLICY_PORT_MODES
+    if policy_mode:
+        # V1.7.0: the service port policy is the whole scope. Only explicit extras
+        # (SCAN_*_CUSTOM_PORTS, SERVICE_EXTRA_*_PORTS, policy custom ports) are added;
+        # the legacy UDP_PORT_RANGE default list is ignored here.
+        pol_tcp, pol_udp = policy_ports(req.get("disabled_services"))
+        env_tcp = port_numbers(os.environ.get("SERVICE_EXTRA_TCP_PORTS"))
+        env_udp = port_numbers(os.environ.get("SERVICE_EXTRA_UDP_PORTS"))
+        explicit_udp = (
+            req["custom_udp_ports"] if "custom_udp_ports" in req
+            else port_numbers(os.environ.get("SCAN_UDP_CUSTOM_PORTS"))
+        )
+        extra_udp = sorted(set(explicit_udp) | set(env_udp))
     if mode == "full":
         tcp = list(range(1, 65536))
+    elif policy_mode:
+        tcp = sorted(set(pol_tcp) | set(extra_tcp) | set(env_tcp))
     elif mode == "focused":
         # Threat templates: only the explicitly listed ports, nothing implied.
         tcp = sorted(set(req.get("custom_tcp_ports") or []))
@@ -416,6 +523,8 @@ def effective_policy(
         udp_ports = []
     elif mode == "focused":
         udp_ports = sorted(set(req.get("custom_udp_ports") or []))
+    elif policy_mode:
+        udp_ports = sorted(set(pol_udp) | set(extra_udp))
     else:
         udp_ports = sorted(
             set(
@@ -447,11 +556,13 @@ def effective_policy(
     }
     for key in (
         "template", "template_name", "scan_config", "alive_test", "safe_checks", "optimize_test", "performance",
-        "check_scope",
+        "check_scope", "scan_purpose", "nvt_filter", "require_families", "disabled_services",
         "require_credentials", "require_credentials_mode", "nvt_families", "cve_watchlist",
     ):
         if key in req:
             policy[key] = req[key]
+    if policy_mode:
+        policy["service_port_policy_version"] = service_port_policy()["policy_version"]
     if mode in NESSUS_MODES:
         policy["port_list_name"] = NESSUS_IANA_PORT_LIST
         policy["port_list_status"] = "static floor (TCP 1-1024 + catalog) until widened by the scanner"
@@ -558,7 +669,9 @@ for _svc, _tcp, _udp in (
 # Services whose checks need Windows/host credentials in Greenbone and Nessus.
 _CREDENTIAL_ONLY = {"SVC-03": "WMI checks run only with Windows (SMB) credentials"}
 _SEVERITIES = ("Critical", "High", "Medium", "Low", "Info", "Unscored")
-STATUSES = ("finding", "observation", "not-tested", "not-observed", "not-in-scope", "unsupported")
+STATUSES = ("finding", "observation", "not-tested", "closed", "filtered", "not-observed", "not-in-scope",
+            "unsupported")
+LOW_PLUS = ("Critical", "High", "Medium", "Low")
 
 
 @lru_cache(maxsize=1)
@@ -764,6 +877,8 @@ def analyze_services(
 
     network_done = cov.get("network_scan_complete") is True
     scanned = _scanned_ports(scanned_port_range)
+    tcp_states = {int(k): str(v) for k, v in ((cov.get("port_states") or {}).get("tcp") or {}).items()
+                  if str(k).isdigit()}
     services = []
     for svc in doc["services"]:
         key = svc["key"]
@@ -794,6 +909,20 @@ def analyze_services(
         elif svc["scope"] == "network":
             status = "unsupported"
             reason = "No DHCP network-scoped collector is implemented by the per-IP agent"
+        elif svc["tcp_hints"] and all(p in tcp_states for p in svc["tcp_hints"]) and not any(
+            tcp_states[p] == "open" for p in svc["tcp_hints"]
+        ):
+            # V1.7.0: the agent probed every TCP port of this family and none was open.
+            closed = [p for p in svc["tcp_hints"] if tcp_states[p] == "closed"]
+            filtered = [p for p in svc["tcp_hints"] if tcp_states[p] == "filtered"]
+            status = "closed" if closed else "filtered"
+            reason = (
+                (f"TCP {', '.join(map(str, closed))} refused the connection (nothing listening)" if closed else "")
+                + ("; " if closed and filtered else "")
+                + (f"TCP {', '.join(map(str, filtered))} did not answer (firewall or host offline)" if filtered else "")
+                + ("; UDP ports were not probed" if svc["udp_hints"] else "")
+                + ". Not exposed, not a security pass"
+            )
         elif port_hints:
             status = "not-tested"
             shared = sorted({f"{r['port']}/{r['transport']}" for r in port_hints})
@@ -836,6 +965,7 @@ def analyze_services(
             "credentialed_checks": "not-tested; authentication/privilege evidence is required",
         })
     totals = {state: sum(s["status"] == state for s in services) for state in STATUSES}
+    policy_view = _policy_service_view(rows, cov, scanned, tcp_states, network_done)
     return {
         "policy_version": doc["policy_version"],
         "host": host,
@@ -844,6 +974,8 @@ def analyze_services(
         "host_level": _bucket("Host / OS / network stack (general)", host_level, key="HOST-GENERAL"),
         "other_ports": _bucket("Other open ports (outside the 52-family catalog)", other_ports, key="OTHER-PORTS"),
         "unattributed_results": 0,
+        "policy_services": policy_view["services"],
+        "policy_summary": policy_view["summary"],
         "endpoints": sorted(endpoints.values(), key=lambda x: (x["transport"], x["port"])),
         "ip_forwarding": evaluate_ip_forwarding(None),
         "network_scan_complete": network_done,
@@ -854,6 +986,65 @@ def analyze_services(
             "'not-observed' means absent from the scanned range, not secure"
         ),
     }
+
+
+def _policy_service_view(
+    rows: list[dict[str, Any]],
+    cov: dict[str, Any],
+    scanned: tuple[set[int], set[int]] | None,
+    tcp_states: dict[int, str],
+    network_done: bool,
+) -> dict[str, Any]:
+    """One row per service in the service port policy, with port states and Low+ findings."""
+    open_tcp = {int(p) for p in (cov.get("open_tcp_ports") or []) if str(p).isdigit()}
+    open_udp = {int(p) for p in (cov.get("open_udp_ports") or []) if str(p).isdigit()}
+    findings: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        endpoint = _row_endpoint(row)
+        if endpoint and _row_severity(row) in LOW_PLUS:
+            findings.setdefault(endpoint, []).append(row)
+    services: list[dict[str, Any]] = []
+    for svc in service_port_policy()["services"]:
+        tcp = [p for p in svc["tcp"] if scanned is None or p in scanned[0]]
+        udp = [p for p in svc["udp"] if scanned is None or p in scanned[1]]
+        if not tcp and not udp:
+            services.append({"key": svc["key"], "name": svc["name"], "category": svc["category"],
+                             "state": "not-in-policy", "ports": [], "severity_counts": {}, "finding_result_ids": []})
+            continue
+        ports: list[dict[str, Any]] = []
+        for p in tcp:
+            state = "open" if p in open_tcp else tcp_states.get(p) or ("closed/filtered" if network_done else "unknown")
+            ports.append({"port": f"{p}/tcp", "state": state})
+        for p in udp:
+            state = "open" if p in open_udp else ("no response" if network_done else "unknown")
+            ports.append({"port": f"{p}/udp", "state": state})
+        hits = [r for p in tcp for r in findings.get((p, "tcp"), [])] + \
+               [r for p in udp for r in findings.get((p, "udp"), [])]
+        counts = {sev: 0 for sev in LOW_PLUS}
+        for r in hits:
+            counts[_row_severity(r)] += 1
+        states = {pt["state"] for pt in ports}
+        if hits:
+            state = "finding"
+        elif "open" in states:
+            state = "open"
+        elif "closed" in states:
+            state = "closed"
+        elif states <= {"filtered"}:
+            state = "filtered"
+        elif network_done:
+            state = "not-observed"
+        else:
+            state = "unknown"
+        services.append({
+            "key": svc["key"], "name": svc["name"], "category": svc["category"], "state": state,
+            "ports": ports, "severity_counts": counts,
+            "finding_result_ids": sorted({_row_rid(r) for r in hits if _row_rid(r)}),
+        })
+    summary = {st: sum(1 for x in services if x["state"] == st)
+               for st in ("finding", "open", "closed", "filtered", "not-observed", "unknown", "not-in-policy")}
+    summary["policy_version"] = service_port_policy()["policy_version"]
+    return {"services": services, "summary": summary}
 
 
 def mark_cve_watchlist(vulnerabilities: list[dict[str, Any]], watchlist: Any) -> dict[str, Any] | None:

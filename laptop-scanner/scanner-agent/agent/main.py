@@ -509,6 +509,24 @@ def _merge_chunk_details(
     }
 
 
+def _refresh_service_coverage(details: dict[str, Any], host: str) -> None:
+    """Recompute per-service states after pre-probe evidence was merged (V1.7.0)."""
+    from agent.service_policy import analyze_services
+
+    ev = details.get("evidence")
+    if not isinstance(ev, dict):
+        return
+    cov = (ev.get("host_coverage") or {}).get(host)
+    snapshot = next(iter((ev.get("policy_snapshots") or {}).values()), {}) or {}
+    try:
+        services = dict(ev.get("service_coverage") or {})
+        services[host] = analyze_services(list(details.get("vulnerabilities") or []), host=host,
+                                          coverage=cov, scanned_port_range=snapshot.get("port_range"))
+        ev["service_coverage"] = services
+    except Exception:
+        log.debug("Service coverage refresh failed for %s", host, exc_info=True)
+
+
 def _ip_worker_limit(capacity: dict[str, Any], chunk_count: int) -> int:
     """How many IPs may scan at once.
 
@@ -836,6 +854,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     # SCAN_DEGRADED_RETRY is set.
     degraded_retries: dict[int, int] = {}
     preprobe_by_host: dict[str, list[int]] = {}
+    preprobe_states_by_host: dict[str, dict[str, list[int]]] = {}
     degraded_retry_budget = max(0, int(os.environ.get("SCAN_DEGRADED_RETRY") or 0))
     # Historical .env files frequently retain SCAN_IP_BUDGET_SEC=600.  It is
     # now a deprecated, diagnostic-only setting.  Never stop a Greenbone task,
@@ -941,12 +960,17 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 open_by_host = port_plan.get("open_ports") or {}
                 host_open = list(open_by_host.get(host) or [])
                 preprobe_by_host[host] = host_open
+                host_states = (port_plan.get("port_states") or {}).get(host)
+                if isinstance(host_states, dict):
+                    preprobe_states_by_host[host] = host_states
                 emit_ip_event(
                     job_id,
                     host,
                     "port_discovery",
                     open_ports=host_open,
                     open_port_count=len(host_open),
+                    closed_port_count=len((host_states or {}).get("closed") or []) if isinstance(host_states, dict) else None,
+                    filtered_port_count=len((host_states or {}).get("filtered") or []) if isinstance(host_states, dict) else None,
                     observed_port_range=observed_port_range,
                     scan_range_source="Greenbone effective policy (not reduced by pre-probe)",
                     fallback=bool(port_plan.get("fallback")),
@@ -1412,8 +1436,9 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     if st == "completed":
                         from agent.coverage_reconcile import reconcile_host_observations
                         details = reconcile_host_observations(
-                            details, host, preprobe_by_host.get(host),
+                            details, host, preprobe_by_host.get(host), preprobe_states_by_host.get(host),
                         )
+                        _refresh_service_coverage(details, host)
                     if st in {"completed", "failed", "stopped"}:
                         # V1.6.6: learn which NVTs hit their timeout so fast mode can
                         # cap repeat offenders instead of waiting 320 s on every host.
@@ -1424,6 +1449,19 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             )
                         except Exception:
                             log.debug("NVT hang statistics not recorded for %s", host, exc_info=True)
+                    if st == "completed":
+                        cov_p = ((details.get("evidence") or {}).get("host_coverage") or {}).get(host) or {}
+                        if cov_p.get("verdict") == "discovery_not_alive":
+                            # Ping-only discovery: a host that does not answer is a valid
+                            # result, reported as skipped/not alive rather than a failed scan.
+                            note = "No answer to ICMP, TCP-ACK or ARP ping (ping-only discovery)"
+                            _append_skipped(host, "not_alive", note)
+                            emit_ip_event(job_id, host, "not_alive", task_id=tid, chunk_index=idx)
+                            normalized = _skipped_ip_details(host, "not_alive", error=note, task_id=tid)
+                            poll_results[idx] = normalized
+                            done_details[idx] = normalized
+                            finished_idxs.append(idx)
+                            continue
                     if st in {"failed", "stopped"}:
                         # Do not let one bad IP fail 49 healthy peers. Preserve any
                         # partial findings in the per-IP log, mark the host skipped,
