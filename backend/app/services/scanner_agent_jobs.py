@@ -42,6 +42,24 @@ def _version_tuple(value: Any) -> tuple[int, int, int]:
     return nums[0], nums[1], nums[2]
 
 
+def agent_build_label(version: Any) -> str:
+    """Use the advertised build, never infer legacy from absence of the literal 'v45'.
+
+    Agent protocol versions (1.5.9) and forensic release builds (v47.2)
+    are independent. Missing build metadata is unknown, not proof of age.
+    """
+    raw = str(version or "").strip()
+    if not raw:
+        return "unknown"
+    builds = re.findall(r"(?i)(?<![0-9a-z])v?(\d{2,3})\.(\d+)(?:\.(\d+))?", raw)
+    if builds:
+        major, minor, patch = builds[-1]
+        number = (int(major), int(minor), int(patch or 0))
+        if number < (45, 4, 0):
+            return "legacy (pre-v45.4)"
+        return "v" + major + "." + minor + (("." + patch) if patch else "")
+    return "build unreported"
+
 def _agent_supports_resume(db, scanner_id: str) -> bool:
     row = fetchone(
         db,
@@ -908,9 +926,7 @@ def update_job_progress(
         )
         agent_ver = str((ver_row or {}).get("version") or "").strip()
         orch["edge_agent_version"] = agent_ver or None
-        orch["edge_agent_build"] = (
-            "v45.4" if "v45" in agent_ver else ("legacy (pre-V45.4)" if agent_ver else "unknown")
-        )
+        orch["edge_agent_build"] = agent_build_label(agent_ver)
     except Exception:
         orch["edge_agent_version"] = None
     if _normalize_agent_instance(agent_instance_id):

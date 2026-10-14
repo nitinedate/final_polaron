@@ -144,7 +144,7 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
         pass
     # These OIDs are NVTs visible in report RESULTS/EXIT_CODE details, not an
     # authoritative total of executed tests. Do not claim thousands of checks ran.
-    out["nvts_launched"] = len(oids)
+    out["nvts_launched"] = len(oids)  # compatibility alias: NOT an execution count
     out["nvts_evidenced"] = len(oids)
     out["open_tcp_ports"] = sorted(tcp)[:512]
     out["open_udp_ports"] = sorted(udp)[:128]

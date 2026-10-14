@@ -738,7 +738,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         return
 
     # One permit == one IP.  Normal operation never drops below the requested
-    # five-IP floor; a critical capacity plan pauses new admissions instead.
+    # Capacity-aware IP concurrency; critical pressure pauses new admissions.
     ip_workers = max(1, min(max(IP_WORKERS_MIN, int(capacity["ip_workers"])), len(chunks)))
     for idx, chunk in enumerate(chunks):
         host = str(chunk[0]) if chunk else f"chunk-{idx}"
@@ -794,29 +794,62 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     # repeats the same Nmap kill, so the automatic re-run is off unless
     # SCAN_DEGRADED_RETRY is set.
     degraded_retries: dict[int, int] = {}
+    preprobe_by_host: dict[str, list[int]] = {}
     degraded_retry_budget = max(0, int(os.environ.get("SCAN_DEGRADED_RETRY") or 0))
+    # A 10-minute forced stop was ending full/Nexus scans prematurely while
+    # preserving partial findings as "100% done". Disabled by default; an
+    # operator can explicitly set a positive budget for bounded partial scans.
+    try:
+        configured_ip_budget = int(os.environ.get("SCAN_IP_BUDGET_SEC") or "0")
+    except ValueError:
+        configured_ip_budget = 0
+    ip_budget_sec = max(120, configured_ip_budget) if configured_ip_budget > 0 else 0
+    if ip_budget_sec:
+        log.warning(
+            "SCAN_IP_BUDGET_SEC=%ds: a running host will be interrupted at this limit; "
+            "findings will be partial and coverage unverified. Set to 0 for a full assessment.",
+            ip_budget_sec,
+        )
     in_flight: dict[int, str] = {}
+    lane_task_ids: dict[int, list[str]] = {}
     ip_started_mono: dict[int, float] = {}
     ip_last_state: dict[int, tuple[str, int]] = {}
     ip_progress_since: dict[int, tuple[int, float]] = {}
     slot_sem = AdaptiveIPSemaphore(max_permits=int(capacity.get("configured_ceiling") or 10))
 
     for idx, tid in resume_map.items():
-        task_ids[idx] = tid
-        in_flight[idx] = tid
+        ids = [part.strip() for part in str(tid).split(",") if part.strip()] or [str(tid)]
+        task_ids[idx] = ids[0]
+        lane_task_ids[idx] = ids
+        in_flight[idx] = ids[0]
         ip_started_mono[idx] = time.monotonic()
         if idx in pending:
             pending.remove(idx)
         host = str(chunks[idx][0]) if chunks[idx] else f"chunk-{idx}"
-        emit_ip_event(job_id, host, "resumed", task_id=tid, chunk_index=idx)
+        emit_ip_event(job_id, host, "resumed", task_id=",".join(ids), chunk_index=idx)
     slot_sem.restore(len(in_flight))
 
+    def _ids_for(idx: int) -> list[str]:
+        ids = [tid for tid in (lane_task_ids.get(idx) or []) if tid]
+        if ids:
+            return ids
+        tid = in_flight.get(idx) or task_ids[idx]
+        return [tid] if tid else []
+
+    def _all_inflight_ids() -> list[str]:
+        ids: list[str] = []
+        for idx in list(in_flight):
+            ids.extend(_ids_for(idx))
+        return ids
+
     def _chunk_tasks_blob() -> list[dict[str, Any]]:
-        return [
-            {"task_id": tid, "hosts": list(chunks[idx])}
-            for idx, tid in enumerate(task_ids)
-            if tid
-        ]
+        rows: list[dict[str, Any]] = []
+        for idx, tid in enumerate(task_ids):
+            ids = lane_task_ids.get(idx) or ([tid] if tid else [])
+            for one in ids:
+                if one:
+                    rows.append({"task_id": one, "hosts": list(chunks[idx])})
+        return rows
 
     def _append_skipped(host: str, reason: str, error: str | None = None) -> None:
         if not any(str(x.get("host") or "") == host for x in skipped_hosts):
@@ -848,6 +881,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 discovered_range = None
                 open_by_host = port_plan.get("open_ports") or {}
                 host_open = list(open_by_host.get(host) or [])
+                preprobe_by_host[host] = host_open
                 emit_ip_event(
                     job_id,
                     host,
@@ -887,16 +921,90 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 log.warning("Port discovery failed for %s; continuing with configured OpenVAS profile", host, exc_info=True)
 
-        start_args = {"name": f"edge-{job_id[:8]}-c{idx}", "targets": chunk, "port_range": discovered_range}
-        if job.get("scan_policy_request"):
-            start_args["scan_policy"] = job["scan_policy_request"]
+        policy = job.get("scan_policy_request")
+        planned = ""
+        resolver = getattr(openvas, "resolve_port_range", None)
+        if callable(resolver):
+            try:
+                planned = str(resolver(chunk, discovered_range, policy) or "")
+            except Exception:
+                log.warning("Could not resolve the port range for %s; starting one OpenVAS task", host, exc_info=True)
+                planned = ""
+        from agent.service_lanes import lanes_for_port_range, service_parallelism
+
+        # One OpenVAS task scans the whole Nexus catalog. Four tasks used to
+        # split that list, and each task ended after hostname/OS/traceroute
+        # whenever its slice had no open port, so SSH, TLS, and SMB checks
+        # never ran. In-IP parallelism is the service-check concurrency.
+        checks = service_parallelism()
+        catalog = (
+            lanes_for_port_range(planned, lanes=1)[0]
+            if planned
+            else {"port_range": planned or "nexus catalog", "services": []}
+        )
+        log.info(
+            "Nexus scope IP %s — one catalog scan, %d service checks at a time (%d services)",
+            host,
+            checks,
+            len(catalog.get("services") or []),
+        )
+        _log_service_lane(host, idx, 0, catalog)
+        start_args = {
+            "name": f"edge-{job_id[:8]}-c{idx}",
+            "targets": chunk,
+            "max_checks": checks,
+        }
+        if not planned and not callable(resolver):
+            # Compatibility for local scan adapters exposing start_scan() but
+            # not resolve_port_range(): supply the configured broad policy,
+            # never the narrow fast pre-probe observation.
+            from agent.gmp_local import _default_scan_port_range
+            planned = _default_scan_port_range(str(getattr(openvas, "port_profile", "nexus") or "nexus"))
+        if planned:
+            start_args["port_range"] = planned
+        if policy:
+            start_args["scan_policy"] = policy
+        # Older injectable scanner adapters may not expose the optional
+        # per-task max_checks keyword. The native LocalOpenVAS implementation
+        # does and retains the quality settings; omit only for a legacy adapter.
+        import inspect
+        try:
+            params = inspect.signature(openvas.start_scan).parameters
+            if "max_checks" not in params and not any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            ):
+                start_args.pop("max_checks", None)
+        except (TypeError, ValueError):
+            pass
         tid = openvas.start_scan(**start_args)
         task_ids[idx] = tid
+        lane_task_ids[idx] = [tid]
         if getattr(openvas, "policy_snapshots", None):
             _patch_job_best_effort(api, job_id, {"policy_snapshots": clip_policy_snapshots(openvas.policy_snapshots, selected_targets)})
         ip_started_mono[idx] = time.monotonic()
-        emit_ip_event(job_id, host, "started", task_id=tid, chunk_index=idx)
+        emit_ip_event(
+            job_id, host, "started", task_id=",".join(lane_task_ids.get(idx) or [tid]),
+            service_lanes=len(lane_task_ids.get(idx) or [tid]), chunk_index=idx,
+        )
         return tid
+
+    def _log_service_lane(host: str, chunk_index: int, lane_index: int, lane: dict[str, Any]) -> None:
+        names = [str(name).strip() for name in (lane.get("services") or []) if str(name).strip()]
+        port_range = str(lane.get("port_range") or "").strip()
+        if not names:
+            label = port_range or "service lane"
+            log.info("Scanning IP %s service %s", host, label)
+            emit_ip_event(
+                job_id, host, "service_scan", service=label, ip=host,
+                lane=lane_index, port_range=port_range, chunk_index=chunk_index,
+            )
+            return
+        for service_name in names:
+            log.info("Scanning IP %s service %s", host, service_name)
+            emit_ip_event(
+                job_id, host, "service_scan", service=service_name, ip=host,
+                lane=lane_index, port_range=port_range, chunk_index=chunk_index,
+            )
 
     def _fill_slots(workers: int, *, admission_paused: bool = False) -> None:
         if admission_paused:
@@ -924,7 +1032,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     _fill_slots(ip_workers, admission_paused=bool(capacity.get("admission_paused")))
 
     def _external_blob() -> str:
-        return _encode_external_task_ids([t for t in task_ids if t])
+        ids: list[str] = []
+        for idx, tid in enumerate(task_ids):
+            lane_ids = lane_task_ids.get(idx) or ([tid] if tid else [])
+            ids.extend(one for one in lane_ids if one)
+        return _encode_external_task_ids(ids)
 
     external_blob = _external_blob()
     _patch_job_best_effort(
@@ -978,7 +1090,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     origin_fp.get("gateway"),
                     current_fp.get("gateway"),
                 )
-                for tid in list(in_flight.values()):
+                for tid in _all_inflight_ids():
                     try:
                         openvas.stop(tid)
                     except Exception:
@@ -997,7 +1109,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 return
         capacity = probe_laptop_capacity()
-        # Adaptive semaphore: >=5 permits whenever admission is allowed.  At a
+        # Adaptive semaphore: 6 IP permits whenever admission is allowed. At a
         # critical thermal/memory state, new starts pause while in-flight IPs finish.
         ip_workers = max(1, min(max(IP_WORKERS_MIN, int(capacity["ip_workers"])), len(chunks)))
 
@@ -1006,22 +1118,27 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         poll_workers = max(1, min(ip_workers, len(in_flight) or 1))
 
         def _poll_one(idx: int) -> tuple[int, dict[str, Any]]:
-            tid = in_flight[idx]
+            from agent.service_lanes import merge_service_lane_polls
+
+            ids = _ids_for(idx)
+            primary = ids[0] if ids else in_flight.get(idx)
             host = str(chunks[idx][0]) if chunks[idx] else f"chunk-{idx}"
-            try:
-                return idx, openvas.poll(tid, expected_targets=chunks[idx])
-            except Exception as exc:
-                err = f"{exc.__class__.__name__}: {exc}"
-                emit_ip_event(job_id, host, "poll_error", task_id=tid, error=err, chunk_index=idx)
+            parts: list[dict[str, Any]] = []
+            last_err = ""
+            for tid in ids:
                 try:
-                    openvas.stop(tid)
-                    emit_ip_event(job_id, host, "stop_after_error", task_id=tid)
-                except Exception as stop_exc:
-                    emit_ip_event(
-                        job_id, host, "stop_after_error_failed", task_id=tid,
-                        error=f"{stop_exc.__class__.__name__}: {stop_exc}",
-                    )
-                return idx, _skipped_ip_details(host, "poll_error", error=err, task_id=tid)
+                    parts.append(openvas.poll(tid, expected_targets=chunks[idx]))
+                except Exception as exc:
+                    last_err = f"{exc.__class__.__name__}: {exc}"
+                    emit_ip_event(job_id, host, "poll_error", task_id=tid, error=last_err, chunk_index=idx)
+                    # A single GMP read failure is transient, particularly while
+                    # gvmd is assembling a report. Do NOT stop the engine or
+                    # classify the IP as scanned/failed; retry next polling cycle.
+                    parts.append({
+                        "status": "running", "progress": 0, "vulnerabilities": [],
+                        "evidence": {"poll_warning": last_err, "assessment_complete": False},
+                    })
+            return idx, merge_service_lane_polls(parts)
 
         poll_results: dict[int, dict[str, Any]] = {}
         if in_flight:
@@ -1049,6 +1166,62 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         finished_idxs.append(idx)
                         continue
 
+                    elapsed = time.monotonic() - ip_started_mono.get(idx, time.monotonic())
+                    if st == "running" and ip_budget_sec > 0 and elapsed >= ip_budget_sec:
+                        log.warning(
+                            "IP %s reached the %d minute Nexus budget; stopping its service lanes",
+                            host,
+                            max(1, ip_budget_sec // 60),
+                        )
+                        lane_ids = list(_ids_for(idx))
+                        harvested = None
+                        try:
+                            from agent.service_lanes import merge_service_lane_polls
+
+                            parts = [
+                                openvas.poll(
+                                    one,
+                                    expected_targets=chunks[idx],
+                                    include_running_report=True,
+                                )
+                                for one in lane_ids
+                            ]
+                            harvested = merge_service_lane_polls(parts) if parts else None
+                        except Exception:
+                            log.warning("Could not read the Nexus budget report for %s", host, exc_info=True)
+                        for one in lane_ids:
+                            try:
+                                openvas.stop(one)
+                            except Exception:
+                                log.warning("Failed to stop service lane %s at the Nexus budget", one, exc_info=True)
+                        if not isinstance(harvested, dict):
+                            harvested = dict(details)
+                        harvested["status"] = "completed"
+                        harvested["progress"] = 100
+                        evidence = dict(harvested.get("evidence") or {})
+                        evidence["time_budget_sec"] = ip_budget_sec
+                        evidence["assessment_complete"] = False
+                        evidence["assessment_verdict"] = "degraded_time_budget"
+                        host_cov = (evidence.get("host_coverage") or {}).get(host)
+                        if not isinstance(host_cov, dict):
+                            host_cov = {}
+                            evidence.setdefault("host_coverage", {})[host] = host_cov
+                        host_cov.update({
+                            "verdict": "degraded_time_budget",
+                            "coverage_complete": False,
+                            "service_checks_verified": False,
+                            "reason": f"Scanner stopped at configured per-IP time budget ({ip_budget_sec}s); "
+                                      "partial findings retained, service coverage unverified",
+                        })
+                        harvested["evidence"] = evidence
+                        harvested["_nexus_budget_complete"] = True
+                        details = harvested
+                        st = "completed"
+                        emit_ip_event(
+                            job_id, host, "nexus_budget", task_id=tid, status="completed",
+                            progress=progress_i, duration_sec=round(elapsed, 3), chunk_index=idx,
+                        )
+
                     if st == "running" and high_progress_stall_sec > 0:
                         pct_i = int(float(details.get("progress") or 0))
                         mark = ip_progress_since.get(idx)
@@ -1073,13 +1246,21 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             )
                             harvested_box: dict[str, Any] = {}
 
+                            lane_ids = list(_ids_for(idx))
+
                             def _read_report() -> None:
+                                from agent.service_lanes import merge_service_lane_polls
+
                                 try:
-                                    harvested_box["value"] = openvas.poll(
-                                        tid,
-                                        expected_targets=chunks[idx],
-                                        include_running_report=True,
-                                    )
+                                    parts = [
+                                        openvas.poll(
+                                            one,
+                                            expected_targets=chunks[idx],
+                                            include_running_report=True,
+                                        )
+                                        for one in lane_ids
+                                    ]
+                                    harvested_box["value"] = merge_service_lane_polls(parts)
                                 except Exception as exc:
                                     harvested_box["error"] = exc
 
@@ -1103,7 +1284,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             elif harvested is not None and seal_tail_harvest(harvested, host, reason=reason):
                                 # The report is already saved. Release the hung check
                                 # afterwards so a TCP 445 retry cannot run for days.
-                                threading.Thread(target=lambda: openvas.stop(tid), daemon=True).start()
+                                for one in lane_ids:
+                                    threading.Thread(target=lambda task_id=one: openvas.stop(task_id), daemon=True).start()
                                 details = harvested
                                 st = "completed"
                                 emit_ip_event(
@@ -1121,6 +1303,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                 )
                                 ip_progress_since[idx] = (pct_i, now_m - float(high_progress_stall_sec) + 20)
 
+                    if st == "completed":
+                        from agent.coverage_reconcile import reconcile_host_observations
+                        details = reconcile_host_observations(
+                            details, host, preprobe_by_host.get(host),
+                        )
                     if st in {"failed", "stopped"}:
                         # Do not let one bad IP fail 49 healthy peers. Preserve any
                         # partial findings in the per-IP log, mark the host skipped,
@@ -1143,8 +1330,12 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         poll_results[idx] = details
                         if st == "completed":
                             cov = ((details.get("evidence") or {}).get("host_coverage") or {}).get(host) or {}
-                            cov_verdict = str(cov.get("verdict") or "full")
-                            if cov_verdict.startswith("degraded") and degraded_retries.get(idx, 0) < degraded_retry_budget:
+                            cov_verdict = str(cov.get("verdict") or "unverified")
+                            if (
+                                cov_verdict.startswith("degraded")
+                                and not details.get("_nexus_budget_complete")
+                                and degraded_retries.get(idx, 0) < degraded_retry_budget
+                            ):
                                 degraded_retries[idx] = degraded_retries.get(idx, 0) + 1
                                 log.warning(
                                     "Job %s IP %s: scan DEGRADED (%s) — %s; re-running once",
@@ -1154,6 +1345,15 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                     job_id, host, "coverage_retry", task_id=tid, verdict=cov_verdict,
                                     reason=cov.get("reason"), attempt=degraded_retries[idx], chunk_index=idx,
                                 )
+                                # st == completed above: the old Greenbone task
+                                # has already reached a terminal state and its
+                                # evidence has been saved. Starting a fresh task
+                                # is sufficient; do not issue stop_task on Done.
+                                log.info(
+                                    "Coverage retry for %s: preserving terminal Greenbone task %s; no stop_task",
+                                    host, tid,
+                                )
+                                lane_task_ids.pop(idx, None)
                                 task_ids[idx] = None
                                 poll_results.pop(idx, None)
                                 in_flight.pop(idx, None)
@@ -1269,7 +1469,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         if capacity.get("admission_paused"):
             message += " · thermal admission pause"
         elif capacity.get("hot"):
-            message += " · capacity floor=5"
+            message += " · capacity floor=6"
         if status == "running" and progress >= 95 and unchanged_sec >= high_progress_warn_sec:
             message = (
                 f"OpenVAS {gmp_status} at {progress:.0f}% - "
@@ -1307,7 +1507,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     "Job %s is not on the central server for this scanner; stopping the local OpenVAS tasks",
                     job_id,
                 )
-                for tid in list(in_flight.values()):
+                for tid in _all_inflight_ids():
                     openvas.stop(tid)
                 return
 
@@ -1371,12 +1571,22 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 job_id,
                 max_scan_runtime_sec,
             )
-            for tid in list(in_flight.values()):
+            for tid in _all_inflight_ids():
                 openvas.stop(tid)
             time.sleep(3)
             for idx in list(in_flight):
-                details = openvas.poll(in_flight[idx], expected_targets=chunks[idx])
-                done_details[idx] = details
+                from agent.service_lanes import merge_service_lane_polls
+
+                parts = [
+                    openvas.poll(one, expected_targets=chunks[idx])
+                    for one in _ids_for(idx)
+                ]
+                done_details[idx] = merge_service_lane_polls(parts) if parts else {
+                    "status": "stopped",
+                    "progress": 0,
+                    "vulnerabilities": [],
+                    "evidence": {},
+                }
             in_flight.clear()
             pending.clear()
             final_live = [
@@ -1473,12 +1683,13 @@ def main() -> None:
     allow_degraded = (os.environ.get("ALLOW_DEGRADED_SCAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
     spt = int(getattr(openvas, "scanner_plugins_timeout", 0) or 0)
     pt = int(getattr(openvas, "plugins_timeout", 0) or 0)
-    while (spt < 1800 or pt < 120) and not allow_degraded:
+    nexus_scope = str(getattr(openvas, "port_profile", "") or "") in {"nexus", "nessus", "vuln"}
+    min_scanner_timeout = 120 if nexus_scope else 1800
+    min_plugin_timeout = 60 if nexus_scope else 120
+    while (spt < min_scanner_timeout or pt < min_plugin_timeout) and not allow_degraded:
         log.error(
-            "DEGRADED SCAN CONFIG - scanner_plugins_timeout=%ss plugins_timeout=%ss would kill the port-scanner "
-            "NVT before a full-port sweep finishes (hosts finish with ~3 informational results). "
-            "Set SCANNER_PLUGINS_TIMEOUT_SEC=36000 and PLUGINS_TIMEOUT_SEC=320 in laptop-scanner/.env and "
-            "recreate scanner-agent (Deploy-V45-Laptop.cmd). Not claiming jobs. Override: ALLOW_DEGRADED_SCAN=true",
+            "DEGRADED SCAN CONFIG - scanner_plugins_timeout=%ss plugins_timeout=%ss is too short "
+            "for this port scope. Not claiming jobs. Override: ALLOW_DEGRADED_SCAN=true",
             spt, pt,
         )
         time.sleep(60)
@@ -1667,6 +1878,19 @@ def main() -> None:
                         continue
                     log.error(
                         "Central rejected AGENT_TOKEN (HTTP 401). Re-run Start-Laptop.cmd to auto-match it."
+                    )
+                    time.sleep(queue_poll)
+                    continue
+                retryable = False
+                try:
+                    retryable = bool(api.is_retryable(exc))
+                except Exception:
+                    retryable = False
+                if retryable or status in {408, 425, 429, 500, 502, 503, 504}:
+                    log.warning(
+                        "Central request failed (%s); will retry — active=%d",
+                        status or exc.__class__.__name__,
+                        len(active),
                     )
                     time.sleep(queue_poll)
                     continue

@@ -146,6 +146,10 @@ function downloadTextFile(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+function jobCoverageIncomplete(job: ScanJob): boolean {
+  return job.status === "completed" && /[1-9]\d* host\(s\) incomplete|service coverage unverified|coverage incomplete/i.test(job.progress_label || "");
+}
+
 function scanJobProgressPct(job: ScanJob): number {
   if (typeof job.progress_pct === "number") return Math.min(100, Math.max(0, job.progress_pct));
   if (job.status === "completed") return 100;
@@ -157,6 +161,7 @@ function scanJobProgressPct(job: ScanJob): number {
 
 function progressCircleStroke(job: { status: string }): string {
   if (job.status === "failed") return "rgb(var(--chart-danger))";
+  if (job.status === "coverage-incomplete") return "rgb(var(--chart-3))";
   if (job.status === "completed") return "rgb(var(--chart-success))";
   return "rgb(var(--chart-1))";
 }
@@ -628,7 +633,9 @@ export function ScanJobsPage() {
                       </div>
                     </td>
                     <td className="px-5 py-3">
-                      <Badge tone={STATUS_TONE[j.status] ?? "neutral"}>{j.status}</Badge>
+                      <Badge tone={jobCoverageIncomplete(j) ? "amber" : (STATUS_TONE[j.status] ?? "neutral")}>
+                        {jobCoverageIncomplete(j) ? "Completed · coverage incomplete" : j.status}
+                      </Badge>
                       {j.status === "failed" && j.error ? (
                         <p className="mt-1 max-w-xs text-xs text-red-700" title={j.error}>
                           {j.error}
@@ -638,7 +645,7 @@ export function ScanJobsPage() {
                     <td className="px-5 py-3">
                       <ProgressCircle
                         pct={scanJobProgressPct(j)}
-                        status={j.status}
+                        status={jobCoverageIncomplete(j) ? "coverage-incomplete" : j.status}
                         title={j.progress_label || `${scanJobProgressPct(j)}%`}
                       />
                     </td>
@@ -798,6 +805,11 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
         low: 0,
       }));
   const showFindings = complete || (summary?.total ?? 0) > 0;
+  const coverageIncomplete = jobStatus === "completed" && (
+    targetRows.some((row) => ["incomplete", "failed", "skipped"].includes(String(row.status).toLowerCase())) ||
+    /service coverage unverified|host\(s\) incomplete|coverage incomplete/i.test(summary?.assessment?.label || summary?.progress_label || "")
+  );
+  const shownStatus = coverageIncomplete ? "Completed · coverage incomplete" : (summary?.status || job.status);
 
   return (
     <Modal open onClose={onClose} title={`Scan details · ${job.id.slice(0, 8)}…`} size="lg">
@@ -806,16 +818,21 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
       ) : (
         <div className="space-y-5">
           <div className="flex flex-wrap items-center gap-4">
-            <ProgressCircle pct={pct} status={summary?.status || job.status} size={56} />
+            <ProgressCircle pct={pct} status={coverageIncomplete ? "coverage-incomplete" : (summary?.status || job.status)} size={56} title="Engine processing progress; not verified service coverage" />
             <div>
-              <Badge tone={STATUS_TONE[summary?.status || job.status] ?? "neutral"}>
-                {summary?.status || job.status}
+              <Badge tone={coverageIncomplete ? "amber" : (STATUS_TONE[summary?.status || job.status] ?? "neutral")}>
+                {shownStatus}
               </Badge>
               {summary?.progress_label ? (
                 <p className="mt-1 text-sm text-ink-500">{summary.progress_label}</p>
               ) : (
                 <p className="mt-1 text-sm text-ink-500">{Math.round(pct)}% complete</p>
               )}
+              {coverageIncomplete ? (
+                <p className="mt-2 max-w-xl text-sm font-medium text-amber-800">
+                  Engine processing is finished (100%); vulnerability-test coverage is not verified. Retained findings are valid observations, not proof of a clean host.
+                </p>
+              ) : null}
               {(summary?.error || job.error) && (summary?.status || job.status) === "failed" ? (
                 <p className="mt-2 max-w-xl text-sm text-red-700">{summary?.error || job.error}</p>
               ) : null}
@@ -834,7 +851,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                 <p className="text-xs text-ink-500">
                   {targetRows.filter((t) => t.status === "scanning" || t.status === "running").length} scanning
                   {" · "}
-                  {targetRows.filter((t) => t.status === "completed").length} completed
+                  {targetRows.filter((t) => t.status === "completed").length} verified · {targetRows.filter((t) => t.status === "incomplete").length} incomplete
                   {" · "}
                   {targetRows.length} total
                 </p>
@@ -865,7 +882,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                           <td className="px-3 py-2">
                             <Badge tone={targetStatusTone(row.status)}>{({ pending: "Waiting", scanning: "In progress", running: "In progress", completed: "Completed", failed: "Fail", incomplete: "Incomplete", skipped: "Skipped", cancelled: "Cancelled" } as Record<string, string>)[row.status] || row.status}</Badge>
                           </td>
-                          <td className="px-3 py-2 text-right tabular-nums text-ink-700">{typeof row.progress_pct === "number" ? `${Math.round(Math.min(100, Math.max(0, row.progress_pct)))}%` : "—"}</td>
+                          <td className="px-3 py-2 text-right tabular-nums text-ink-700" title="Engine progress, not service coverage">{typeof row.progress_pct === "number" ? `${Math.round(Math.min(100, Math.max(0, row.progress_pct)))}%` : "—"}</td>
                           <td className="px-3 py-2 text-ink-600">{row.status === "completed" ? "Completed" : row.activity}</td>
                           <td className="px-2 py-2 text-right font-semibold text-red-700">{row.critical}</td>
                           <td className="px-2 py-2 text-right font-semibold text-orange-700">{row.high}</td>

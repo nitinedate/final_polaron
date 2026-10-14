@@ -9,21 +9,39 @@ from agent.gmp_local import (
 from agent.port_range import exclude_tcp_ports_from_range
 
 
-def test_full_tcp_and_priority_udp_is_default(monkeypatch):
+def test_nexus_catalog_is_the_default_scope(monkeypatch):
     monkeypatch.delenv("PORT_PROFILE", raising=False)
     monkeypatch.delenv("UDP_PROFILE", raising=False)
     monkeypatch.delenv("UDP_PORT_RANGE", raising=False)
+    monkeypatch.delenv("SCAN_ALLOW_FULL_RANGE", raising=False)
     scanner = LocalOpenVAS()
-    assert scanner.port_profile == "full"
+    assert scanner.port_profile == "nexus"
     assert scanner.udp_profile == "priority"
+    from agent.service_policy import port_numbers
+
     port_range = _default_scan_port_range(scanner.port_profile, scanner.udp_profile)
-    assert port_range.startswith("T:1-65535,U:")
-    assert "161" in port_range
-    assert "4500" in port_range
+    tcp = {port for token in port_range.split(",") if token.startswith("T:") for port in port_numbers(token[2:])}
+    udp = {port for token in port_range.split(",") if token.startswith("U:") for port in port_numbers(token[2:])}
+    assert not port_range.startswith("T:1-65535")
+    assert {22, 80, 443, 445, 3389} <= tcp
+    assert 65535 not in tcp
+    assert len(tcp) < 5000
+    assert {161, 4500} <= udp
+
+
+def test_explicit_full_scan_policy_is_never_silently_narrowed(monkeypatch):
+    from agent.gmp_local import _effective_scan_policy
+
+    monkeypatch.delenv("SCAN_ALLOW_FULL_RANGE", raising=False)
+    policy = _effective_scan_policy({"port_profile": "full"}, "nexus", "priority")
+    assert policy["port_profile"] == "full"
+    assert policy["tcp_port_count"] == 65535
+    assert "T:1-65535" in policy["port_range"]
 
 
 def test_full_udp_is_available(monkeypatch):
     monkeypatch.delenv("UDP_PORT_RANGE", raising=False)
+    monkeypatch.setenv("SCAN_ALLOW_FULL_RANGE", "1")
     port_range = _default_scan_port_range("full", "full")
     assert port_range == "T:1-65535,U:1-65535"
 

@@ -277,7 +277,12 @@ def scan_job_progress(db, job: dict[str, Any]) -> dict[str, Any]:
             ver = orch_done.get("edge_agent_version")
             build = orch_done.get("edge_agent_build")
             if ver:
-                parts.append(f"agent {ver}" + (f" - {build}" if build and build.startswith("legacy") else ""))
+                # Older job rows can contain a stale pre-v45 label even when
+                # their advertised build is newer (e.g. 1.5.9-v47.2).
+                from app.services.scanner_agent_jobs import agent_build_label
+                derived = agent_build_label(ver)
+                label = derived if derived not in {"unknown", "build unreported"} else str(build or "")
+                parts.append(f"agent {ver}" + (f" - {label}" if label and label != ver else ""))
             return {"progress_pct": 100, "progress_label": " · ".join(parts)[:120]}
         return {"progress_pct": 100, "progress_label": "Complete"}
     if status == "failed":

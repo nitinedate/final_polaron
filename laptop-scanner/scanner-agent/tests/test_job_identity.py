@@ -125,3 +125,20 @@ def test_resume_leftover_does_not_require_skipped_hosts():
     assert chunks == [["192.168.0.163"]]
     assert "192.168.0.103" not in {h for chunk in chunks for h in chunk}
 
+
+def test_same_host_service_lanes_resume_as_one_ip():
+    first = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    second = "11111111-2222-3333-4444-555555555555"
+    chunks, resume_map, dropped = plan_resume_chunks(
+        job_hosts=["10.0.0.5", "10.0.0.6"],
+        remaining=["10.0.0.5", "10.0.0.6"],
+        stored_tasks=[{"task_id": first, "hosts": ["10.0.0.5"]}, {"task_id": second, "hosts": ["10.0.0.5"]}],
+        live_hosts={first: ["10.0.0.5"], second: ["10.0.0.5"]},
+        chunk_size=1,
+    )
+    assert dropped == []
+    assert chunks[0] == ["10.0.0.5"]
+    assert chunks[1] == ["10.0.0.6"]
+    assert resume_map[0] == f"{first},{second}"
+    assert 1 not in resume_map
+

@@ -152,8 +152,24 @@ def plan_resume_chunks(
     new_hosts = [h for h in remaining if normalize_host(h) not in covered]
     size = max(1, int(chunk_size or 1))
     new_chunks = [new_hosts[i : i + size] for i in range(0, len(new_hosts), size)]
-    chunks: list[list[str]] = [list(hosts) for hosts, _ in resume_pairs] + new_chunks
-    resume_map = {i: tid for i, (_, tid) in enumerate(resume_pairs)}
+    # Service lanes for one IP share a host list. Keep them on one semaphore
+    # permit and remember every task id.
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    order: list[tuple[str, ...]] = []
+    for hosts, tid in resume_pairs:
+        key = tuple(hosts)
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        if tid not in grouped[key]:
+            grouped[key].append(tid)
+    grouped_pairs: list[tuple[list[str], str]] = []
+    for key in order:
+        tids = grouped[key]
+        joined = tids[0] if len(tids) == 1 else ",".join(tids)
+        grouped_pairs.append((list(key), joined))
+    chunks: list[list[str]] = [list(hosts) for hosts, _ in grouped_pairs] + new_chunks
+    resume_map = {i: tid for i, (_, tid) in enumerate(grouped_pairs)}
     return chunks, resume_map, dropped
 
 
