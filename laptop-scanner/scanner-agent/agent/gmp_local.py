@@ -11,7 +11,16 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from agent.severity_policy import cvss_severity
-from agent.service_policy import analyze_services, effective_policy, port_numbers
+from agent.service_policy import (
+    NESSUS_IANA_PORT_LIST,
+    NESSUS_MODES,
+    analyze_services,
+    credential_gap,
+    effective_policy,
+    format_ports,
+    mark_cve_watchlist,
+    port_numbers,
+)
 
 log = logging.getLogger("scanner_agent.gmp")
 
@@ -97,9 +106,15 @@ def _effective_scan_policy(request: dict[str, Any] | None, port_profile: str,
     from agent.vuln_ports import port_document
 
     req = dict(request or {})
+    from agent.service_policy import expand_template
+
+    req = expand_template(req)
     mode = str(req.get("port_profile") or port_profile or os.environ.get("PORT_PROFILE") or "nexus").strip().lower()
     req["port_profile"] = mode
     port_profile = mode
+    if mode == "focused":
+        # Threat templates scan exactly their listed ports; no catalog padding.
+        return effective_policy(req, port_profile=mode, udp_profile=udp_profile, catalog_tcp=[], catalog_udp=[])
     catalog = port_document()
     tcp = [port for item in catalog["tcp"] for port in port_numbers(item["ports"])]
     udp = port_numbers(PRIORITY_UDP_PORTS.replace("U:", ""))
@@ -497,8 +512,17 @@ def _ensure_portscan_config(gmp: Any, base_name: str) -> str:
     The built-in config is predefined, so its Nmap technique stays connect().
     A connect scan of T:1-65535 plus UDP holds OpenVAS around 15% until nmap exits.
     """
-    wanted = AETHERIS_SCAN_CONFIG.casefold()
-    base_wanted = (base_name or "Full and fast").strip().casefold()
+    base_label = (base_name or "Full and fast").strip()
+    # V1.6.5: one writable clone per base config. Previously every base name
+    # resolved to the "Full and fast" clone, so a Discovery policy silently ran
+    # the full vulnerability config.
+    clone_name = (
+        AETHERIS_SCAN_CONFIG
+        if base_label.casefold() in {"full and fast", FULL_AND_FAST_ID.casefold()}
+        else f"Aetheris {base_label}"
+    )
+    wanted = clone_name.casefold()
+    base_wanted = base_label.casefold()
     resp = gmp.get_scan_configs(filter_string="rows=-1")
     existing = ""
     base_id = ""
@@ -521,10 +545,66 @@ def _ensure_portscan_config(gmp: Any, base_name: str) -> str:
     new_id = str(cloned.get("id") or "").strip()
     if not new_id:
         raise RuntimeError("Greenbone did not return a cloned scan config id")
-    gmp.modify_scan_config_set_name(new_id, AETHERIS_SCAN_CONFIG)
+    gmp.modify_scan_config_set_name(new_id, clone_name)
     _apply_nmap_speed_prefs(gmp, new_id)
-    log.info("Created scan config %s (%s) with Nmap SYN scan", AETHERIS_SCAN_CONFIG, new_id)
+    log.info("Created scan config %s (%s) with Nmap SYN scan", clone_name, new_id)
     return new_id
+
+
+# Families every scoped config keeps, otherwise ports/services/products are
+# never discovered and the selected families have nothing to test.
+BASE_FAMILIES = ("Port scanners", "Service detection", "Product detection", "Settings", "General", "Credentials")
+
+
+def _ensure_family_config(gmp: Any, config_id: str, families: list[str]) -> tuple[str, str]:
+    """Clone ``config_id`` restricted to ``families`` (+ base families).
+
+    Returns (config_id_to_use, status). Any GMP rejection falls back to the
+    unscoped config: a superset of tests is safer than a silently empty scan.
+    """
+    import hashlib
+
+    wanted = sorted(set(families) | set(BASE_FAMILIES))
+    digest = hashlib.sha256("|".join(wanted).encode()).hexdigest()[:10]
+    name = f"Aetheris families {digest}"
+    try:
+        resp = gmp.get_scan_configs(filter_string=f'name="{name}" rows=5')
+        for node in resp.xpath("config"):
+            if (node.findtext("name") or "").strip() == name and node.get("id"):
+                return str(node.get("id")), f"scoped to {len(wanted)} families (reused {name})"
+        cloned = gmp.clone_scan_config(config_id)
+        new_id = str(cloned.get("id") or "").strip()
+        if not new_id:
+            raise RuntimeError("clone returned no id")
+        gmp.modify_scan_config_set_name(new_id, name)
+        gmp.modify_scan_config_set_family_selection(
+            new_id, [(fam, True, True) for fam in wanted], auto_add_new_families=False,
+        )
+        log.info("Created family-scoped scan config %s (%s): %s", name, new_id, ", ".join(wanted))
+        return new_id, f"scoped to {len(wanted)} families ({name})"
+    except Exception as exc:
+        log.warning("Family scoping rejected by Greenbone (%s); using the unscoped config", exc)
+        return config_id, f"not applied ({str(exc)[:120]}); full config used"
+
+
+def _named_port_list_tcp(gmp: Any, name: str) -> set[int]:
+    """TCP ports of a Greenbone port list, looked up by name (feed data object)."""
+    resp = gmp.get_port_lists(filter_string=f'name="{name}" rows=5', details=True)
+    for node in resp.xpath(".//port_list"):
+        if (node.findtext("name") or "").strip().casefold() != name.casefold():
+            continue
+        ports: set[int] = set()
+        for rng in node.xpath(".//port_ranges/port_range"):
+            kind = (rng.findtext("type") or "tcp").strip().lower()
+            if kind != "tcp":
+                continue
+            lo = _as_int(rng.findtext("start"), 0)
+            hi = _as_int(rng.findtext("end"), lo)
+            if 1 <= lo <= hi <= 65535:
+                ports.update(range(lo, hi + 1))
+        if ports:
+            return ports
+    raise LookupError(f"Greenbone port list not found or empty: {name}")
 
 
 def _ospd_feed_state(gmp: Any) -> dict[str, Any]:
@@ -744,8 +824,12 @@ def _report_evidence_from_xml(
     progress: float,
     expected_targets: list[str],
     alive_test: str,
+    detail_response: Any | None = None,
 ) -> dict[str, Any]:
     report = _inner_report(response)
+    # V1.6.5: host <detail> rows and <error> rows only exist on a details=True
+    # page. Use it for coverage/error evidence when the metadata page lacks them.
+    detail_report = _inner_report(detail_response) if detail_response is not None else None
 
     # Greenbone native XML contains direct report/host/ip and host_start/host /
     # host_end/host nodes for hosts that actually entered the scan. Result host
@@ -757,6 +841,9 @@ def _report_evidence_from_xml(
     host_ips.update(_text_values(report, "./host_end/host/text()"))
     host_ips.update(_text_values(report, ".//results/result/host/text()"))
     host_ips.update(_text_values(report, ".//host/ip/text()"))
+    if detail_report is not None:
+        host_ips.update(_text_values(detail_report, "./host/ip/text()"))
+        host_ips.update(_text_values(detail_report, ".//host/ip/text()"))
     # Some Greenbone builds stash the address on host/@ip or asset attributes.
     try:
         for node in report.xpath(".//host"):
@@ -798,7 +885,13 @@ def _report_evidence_from_xml(
     else:
         result_count = 0
     plugin_error_details = _plugin_error_details(report)
-    plugin_errors = max(_as_int(report.findtext("errors/count"), 0), len(plugin_error_details))
+    declared_errors = _as_int(report.findtext("errors/count"), 0)
+    if detail_report is not None:
+        if not plugin_error_details:
+            plugin_error_details = _plugin_error_details(detail_report)
+        declared_errors = max(declared_errors, _as_int(detail_report.findtext("errors/count"), 0))
+    plugin_errors = max(declared_errors, len(plugin_error_details))
+    coverage_source = detail_report if detail_report is not None else report
     # V45.4: explicit per-host coverage verdict (port scanner killed => degraded).
     host_coverage: dict[str, dict[str, Any]] = {}
     try:
@@ -806,7 +899,10 @@ def _report_evidence_from_xml(
 
         cov_hosts = [str(t).strip() for t in expected_targets if str(t).strip()] or sorted(host_ips)
         for cov_host in cov_hosts:
-            host_coverage[cov_host] = coverage_from_report(report, host=cov_host, errors=plugin_error_details)
+            host_coverage[cov_host] = coverage_from_report(
+                coverage_source, host=cov_host, errors=plugin_error_details
+            )
+            host_coverage[cov_host]["detail_page_available"] = detail_report is not None
     except Exception:
         log.debug("coverage verdict failed for report %s", report_id, exc_info=True)
     scan_start = (report.findtext("scan_start") or "").strip() or None
@@ -905,6 +1001,7 @@ def _report_evidence_from_xml(
         "report_result_count_filtered": filtered_result_count,
         "report_materialized_result_count": materialized_result_count,
         "plugin_error_count": plugin_errors,
+        "plugin_errors_unclassified": max(0, plugin_errors - len(plugin_error_details)),
         "plugin_error_details": plugin_error_details,
         "host_coverage": host_coverage,
         "scan_start": scan_start,
@@ -1068,12 +1165,28 @@ def _get_report_once(gmp: Any, report_id: str, **kwargs: Any) -> Any:
 
 
 def _harvest_report_xml(gmp: Any, report_id: str) -> tuple[Any | None, list[dict[str, Any]], Exception | None]:
+    """Compatibility wrapper: (metadata report, parsed results, last error)."""
+    meta, vulns, last_exc, _detail = _harvest_report_bundle(gmp, report_id)
+    return meta, vulns, last_exc
+
+
+def _harvest_report_bundle(
+    gmp: Any, report_id: str
+) -> tuple[Any | None, list[dict[str, Any]], Exception | None, Any | None]:
     """Load a Greenbone report without assuming one giant GMP reply.
 
     gvmd often closes the Unix socket when ``details=True`` + ``rows=-1`` is
     asked in one shot after a long scan. Metadata first, then paged results,
     then a full dump as last resort.
+
+    V1.6.5: the metadata request uses ``details=False``. gvmd then omits the
+    per-host ``<detail>`` rows (``ports``/``tcp_ports``) and the individual
+    ``<error>`` rows while still sending ``<errors><count>``. Classifying
+    coverage from that page alone produced "no open ports" on hosts whose
+    results were on 139/445 and could not tell an NVT timeout from a killed
+    port scanner. The first ``details=True`` page is therefore returned too.
     """
+    detail_chunk: Any | None = None
     last_exc: Exception | None = None
     page_rows = _report_page_rows()
 
@@ -1121,6 +1234,8 @@ def _harvest_report_xml(gmp: Any, report_id: str) -> tuple[Any | None, list[dict
                     details=details,
                 )
                 last_exc = None
+                if details and detail_chunk is None:
+                    detail_chunk = chunk
                 break
             except Exception as exc:
                 last_exc = exc
@@ -1167,77 +1282,129 @@ def _harvest_report_xml(gmp: Any, report_id: str) -> tuple[Any | None, list[dict
             last_exc = exc
             log.warning("get_report(%s) compact dump failed: %s", report_id, exc)
 
-    return meta, vulns, last_exc
+    if detail_chunk is None:
+        log.warning(
+            "OpenVAS report %s: no details=True page was readable; host port details and "
+            "per-NVT error rows are unavailable, coverage is classified from results only",
+            report_id,
+        )
+    return meta, vulns, last_exc, detail_chunk
+
+
+_TERMINAL_GMP = {"done", "finished", "succeeded"}
+
+
+def _same_host(a: Any, b: Any) -> bool:
+    import ipaddress
+
+    def canon(v: Any) -> str:
+        raw = str(v or "").strip()
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return raw.casefold()
+
+    return canon(a) == canon(b)
 
 
 def _coverage_includes_parsed_results(evidence: dict[str, Any], vulns: list[dict[str, Any]]) -> None:
-    """Fold paged findings into the coverage verdict.
+    """Fold paged findings into the per-host coverage verdict (V1.6.5).
 
-    The metadata report is only the first result row, so a finished host can be
-    marked ``degraded_no_ports`` with "0 NVTs" while the parsed report already
-    holds hostname, traceroute, and OS rows. Those rows prove the task ended.
-    They do not prove a catalog service was tested.
+    Rules:
+    * Only a *port-scanner* NVT error (Nmap / Ping Host / Services / Open TCP
+      Port) degrades a host. Ordinary NVT errors such as "NVT timed out after
+      320 seconds" are recorded as named warnings: those specific checks are
+      incomplete, the port enumeration is not.
+    * Open ports come from host details (``ports``/``tcp_ports``) and from
+      every result row of the form ``N/tcp``/``N/udp``.
+    * ``nvts_evidenced`` counts distinct NVT OIDs, never result rows.
+    * Hostname/OS/traceroute rows alone still do not prove a port scan.
     """
     coverage = evidence.get("host_coverage")
     if not isinstance(coverage, dict) or not coverage:
         return
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in vulns:
-        host = str(row.get("host") or "").strip()
-        if host:
-            grouped.setdefault(host, []).append(row)
     hosts = [host for host, cov in coverage.items() if isinstance(cov, dict)]
-    scanner_failed = int(evidence.get("plugin_error_count") or 0) > 0
+    task_done = str(evidence.get("task_status") or "").strip().lower() in _TERMINAL_GMP
+    error_details = [e for e in (evidence.get("plugin_error_details") or []) if isinstance(e, dict)]
+    unclassified_total = int(evidence.get("plugin_errors_unclassified") or 0)
+    if not unclassified_total:
+        unclassified_total = max(0, int(evidence.get("plugin_error_count") or 0) - len(error_details))
     for host, cov in coverage.items():
         if not isinstance(cov, dict):
             continue
-        rows = list(grouped.get(str(host).strip(), []))
+        rows = [r for r in vulns if _same_host(r.get("host"), host)]
         if not rows and len(hosts) == 1:
             rows = list(vulns)
         tcp = {int(p) for p in (cov.get("open_tcp_ports") or []) if str(p).isdigit()}
         udp = {int(p) for p in (cov.get("open_udp_ports") or []) if str(p).isdigit()}
+        oids: set[str] = set()
         for row in rows:
             port = row.get("port")
             proto = str(row.get("protocol") or "").lower()
-            if isinstance(port, int) and 1 <= port <= 65535:
+            if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
                 (udp if proto == "udp" else tcp).add(port)
-        launched = max(int(cov.get("nvts_launched") or 0), len(rows))
+            oid = str(row.get("nvt_oid") or row.get("plugin_id") or "").strip()
+            if oid:
+                oids.add(oid)
+        nvts = max(int(cov.get("nvts_evidenced") or 0), len(oids))
         cov["open_tcp_ports"] = sorted(tcp)[:512]
         cov["open_udp_ports"] = sorted(udp)[:128]
-        cov["nvts_launched"] = launched
-        if str(cov.get("verdict") or "") != "degraded_no_ports":
-            continue
-        if cov.get("port_scanner_errors") or scanner_failed:
+        cov["nvts_evidenced"] = nvts
+        cov["nvts_launched"] = nvts  # compatibility alias: evidenced, not an execution inventory
+        cov["results_evidenced"] = len(rows)
+
+        scanner_errors = [e for e in (cov.get("port_scanner_errors") or []) if isinstance(e, dict)]
+        scanner_keys = {(str(e.get("nvt_oid") or ""), str(e.get("nvt_name") or "")) for e in scanner_errors}
+        host_errors = [
+            e for e in error_details
+            if (not e.get("host") or _same_host(e.get("host"), host))
+            and (str(e.get("nvt_oid") or ""), str(e.get("nvt_name") or "")) not in scanner_keys
+        ]
+        unclassified = unclassified_total if len(hosts) == 1 else 0
+        warnings: list[str] = []
+        for err in host_errors[:20]:
+            label = str(err.get("nvt_name") or err.get("nvt_oid") or "NVT")
+            port = f" on {err.get('port')}" if err.get("port") else ""
+            desc = str(err.get("description") or "error").strip().splitlines()[0][:160]
+            warnings.append(f"{label}{port}: {desc}"[:240])
+        if unclassified:
+            warnings.append(
+                f"{unclassified} scanner error(s) reported by count only; the detailed report page was unavailable"
+            )
+        cov["warnings"] = warnings
+        cov["plugin_error_count"] = len(scanner_errors) + len(host_errors) + unclassified
+        cov["coverage_complete"] = False
+        cov["service_checks_verified"] = False
+
+        if scanner_errors:
+            first = scanner_errors[0]
+            cov["verdict"] = "degraded_port_scan_failed"
+            cov["network_scan_complete"] = False
             cov["reason"] = (
-                f"no open ports enumerated and only {launched} NVT(s) ran — "
-                "host filtered, scanner timed out, or feed not loaded"
+                f"port scanner NVT failed ({first.get('nvt_name') or first.get('nvt_oid') or 'scanner'}: "
+                f"{str(first.get('description') or 'error')[:120]}); service NVTs may not have run"
             )
             continue
-        scored = any(
-            str(row.get("severity") or "").lower() not in {"", "info", "log", "none"}
-            for row in rows
-        )
-        # A finished task that only recorded hostname, traceroute, and OS
-        # consolidation did probe the port list. It did not test SSH, TLS,
-        # SMB, or the rest of the catalog. Promoting that to "full" made the
-        # UI say the service lanes were merged while every family stayed
-        # not-tested.
-        if tcp or udp or scored:
-            # A result is positive evidence for that specific endpoint/NVT,
-            # not proof that the requested service catalog finished executing.
+        if tcp or udp:
             cov["verdict"] = "observed_unverified"
-            cov["coverage_complete"] = False
-            cov["service_checks_verified"] = False
-            cov["reason"] = (
-                f"{len(tcp)} TCP / {len(udp)} UDP endpoint(s) seen in report; "
-                f"{launched} result-backed NVT(s) evidenced. "
-                "Full requested-service execution is not verified"
+            cov["network_scan_complete"] = bool(task_done)
+            cov["assessment_scope"] = cov.get("assessment_scope") or "network"
+            port_text = ", ".join(
+                [f"{p}/tcp" for p in sorted(tcp)[:12]] + [f"{p}/udp" for p in sorted(udp)[:6]]
             )
+            more = "" if len(tcp) + len(udp) <= 18 else f" (+{len(tcp) + len(udp) - 18} more)"
+            reason = (
+                f"Network scan finished: {len(tcp)} open TCP / {len(udp)} UDP port(s) [{port_text}{more}]; "
+                f"{nvts} distinct NVT(s) produced {len(rows)} result(s)"
+            )
+            if warnings:
+                reason += f"; {len(warnings)} NVT warning(s), those specific checks are incomplete"
+            cov["reason"] = reason + ". Per-service execution and authenticated checks are not proven"
             continue
         cov["verdict"] = "degraded_no_ports"
+        cov["network_scan_complete"] = False
         cov["reason"] = (
-            f"Greenbone reported no open listeners "
-            f"({launched} informational result(s), 0 open ports). "
+            f"Greenbone reported no open listeners ({len(rows)} result(s) from {nvts} NVT(s), 0 open ports). "
             "This does not prove the host is unreachable or that all catalog probes ran; "
             "verify Docker-to-target routing, firewall and port scanner evidence"
         )
@@ -1251,6 +1418,7 @@ def _report_payload(
     alive_test: str,
     task_status: str,
     progress: float,
+    policy_snapshot: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     _, _, task = _task_status(gmp, task_id)
     report_id = _task_report_id(task)
@@ -1273,7 +1441,7 @@ def _report_payload(
         }
         return [], evidence
 
-    response, paged_vulns, last_exc = _harvest_report_xml(gmp, report_id)
+    response, paged_vulns, last_exc, detail_response = _harvest_report_bundle(gmp, report_id)
     if response is None:
         evidence = {
             "report_id": report_id,
@@ -1301,6 +1469,7 @@ def _report_payload(
         progress=progress,
         expected_targets=expected_targets,
         alive_test=alive_test,
+        detail_response=detail_response,
     )
     vulns = paged_vulns
     if not vulns:
@@ -1367,11 +1536,60 @@ def _report_payload(
         assessed.update(extra_hosts)
         evidence["assessed_hosts"] = sorted(assessed)
         evidence["hosts_assessed"] = max(int(evidence.get("hosts_assessed") or 0), len(assessed))
+    snapshot = policy_snapshot if isinstance(policy_snapshot, dict) else {}
+    watch = mark_cve_watchlist(vulns, snapshot.get("cve_watchlist"))
+    if watch:
+        evidence["cve_watchlist"] = watch
     evidence["service_coverage"] = {
-        host: analyze_services(vulns, host=host, coverage=(evidence.get("host_coverage") or {}).get(host))
+        host: analyze_services(
+            vulns,
+            host=host,
+            coverage=(evidence.get("host_coverage") or {}).get(host),
+            scanned_port_range=snapshot.get("port_range"),
+        )
         for host in expected_targets
     }
     return vulns, evidence
+
+
+def _task_port_range_with(gmp: Any, tid: str) -> str:
+    """Target port range of a GMP task using an existing session ("" when unknown)."""
+    _, _, task = _task_status(gmp, tid)
+    if task is None or not hasattr(task, "find"):
+        return ""
+    target = task.find("target")
+    target_id = (target.get("id") if target is not None else None) or None
+    if not target_id:
+        return ""
+    try:
+        tresp = gmp.get_target(str(target_id))
+    except Exception:
+        tresp = gmp.get_targets(filter_string=f"uuid={target_id}")
+    tnode = tresp.find("target") if hasattr(tresp, "find") else None
+    if tnode is None and hasattr(tresp, "xpath"):
+        nodes = tresp.xpath(".//target")
+        tnode = nodes[0] if nodes else None
+    if tnode is None or not hasattr(tnode, "find"):
+        return ""
+    node = tnode.find("port_range")
+    direct = (node.text or "").strip() if node is not None and node.text else ""
+    if direct:
+        return direct
+    port_list = tnode.find("port_list")
+    port_list_id = (port_list.get("id") if port_list is not None else None) or None
+    if not port_list_id:
+        return ""
+    presp = gmp.get_port_list(str(port_list_id))
+    parts: list[str] = []
+    for item in presp.xpath(".//port_range") if hasattr(presp, "xpath") else []:
+        start = (item.findtext("start") or "").strip()
+        end = (item.findtext("end") or "").strip()
+        kind = (item.findtext("type") or "tcp").strip().lower()
+        prefix = "U" if kind == "udp" else "T"
+        if not start or not end:
+            continue
+        parts.append(f"{prefix}:{start}" if start == end else f"{prefix}:{start}-{end}")
+    return ",".join(parts)
 
 
 class LocalOpenVAS:
@@ -1431,22 +1649,13 @@ class LocalOpenVAS:
         self.timeout_retry = retry_raw
         self.open_sock_max_attempts = sock_raw
         self.scan_config_name = (os.environ.get("GVM_SCAN_CONFIG") or "Full and fast").strip()
-        # Nessus/Nexus catalog scanning must not optimize away service checks.
-        # The fast/common profiles can retain their explicitly fast behavior.
-        full_assessment = self.port_profile == "full" or self.port_profile in _VULN_PROFILES
+        # V1.6.5 Nessus parity: Nessus ships optimize_test=yes (Tenable notes that
+        # disabling it lengthens scans and increases false positives). OpenVAS
+        # optimize_test=yes likewise only launches an NVT when its required
+        # ports/services were detected. GVM_OPTIMIZE_TEST=no restores the old
+        # forced behaviour; a scan policy/template can set it per job.
         configured_optimization = (os.environ.get("GVM_OPTIMIZE_TEST") or "").strip().lower()
-        # Important: old production .env files still contain GVM_OPTIMIZE_TEST=yes.
-        # Never silently let that override a full/Nexus service assessment.
-        # Optimization is an engine speed hint, NOT proof that a check ran.
-        if full_assessment:
-            if configured_optimization not in {"", "no", "false", "0", "off"}:
-                log.warning(
-                    "Ignoring GVM_OPTIMIZE_TEST=%s for full/Nexus coverage: mandatory checks must not be optimized away",
-                    configured_optimization,
-                )
-            self.optimize_test = "no"
-        else:
-            self.optimize_test = "no" if configured_optimization in {"no", "false", "0", "off"} else "yes"
+        self.optimize_test = "no" if configured_optimization in {"no", "false", "0", "off"} else "yes"
         # Use current OpenVAS scanner preference names.  A previous build sent
         # `thorough_tests`, which is not a current scanner preference and can
         # make gvmd reject the entire preference payload on some releases.
@@ -1463,6 +1672,8 @@ class LocalOpenVAS:
         self._next_not_ready_log = 0.0
         self.last_readiness_detail = "Greenbone readiness has not been checked yet"
         self.policy_snapshots: dict[str, dict[str, Any]] = {}
+        self._iana_tcp_cache: tuple[float, set[int]] | None = None
+        self._port_list_status = ""
         # Completed report tasks are never eligible for a second stop request.
         self._terminal_task_ids: set[str] = set()
 
@@ -1517,10 +1728,13 @@ class LocalOpenVAS:
         host_list = [t.strip() for t in targets if t and t.strip()]
         snapshot = _effective_scan_policy(scan_policy, self.port_profile, self.udp_profile)
         supplied_range = (port_range or "").strip()
+        udp_profile = str(snapshot.get("udp_profile") or self.udp_profile)
         if supplied_range:
-            resolved = _with_udp_range(supplied_range, self.udp_profile) if apply_udp else supplied_range
+            resolved = _with_udp_range(supplied_range, udp_profile) if apply_udp else supplied_range
         else:
             resolved = str(snapshot["port_range"] or "")
+            if snapshot.get("port_profile") in NESSUS_MODES:
+                resolved = self._widen_with_iana(resolved)
         try:
             from agent.control_plane import port_range_without_control_plane
 
@@ -1532,6 +1746,42 @@ class LocalOpenVAS:
             log.debug("Control-plane port exclusion skipped", exc_info=True)
         return resolved
 
+    def _iana_tcp_ports(self) -> set[int]:
+        """Greenbone "All IANA assigned TCP" ports, cached for 6 h (retry failures after 10 min)."""
+        now = time.monotonic()
+        if self._iana_tcp_cache is not None:
+            stamp, ports = self._iana_tcp_cache
+            if now - stamp < (21600 if ports else 600):
+                return ports
+        try:
+            with _session(**self._session_kwargs()) as gmp:
+                ports = _named_port_list_tcp(gmp, NESSUS_IANA_PORT_LIST)
+            log.info("Nessus profile: loaded %d TCP ports from Greenbone port list '%s'",
+                     len(ports), NESSUS_IANA_PORT_LIST)
+        except Exception as exc:
+            log.warning("Nessus profile: Greenbone port list '%s' unavailable (%s); using TCP 1-1024 + catalog",
+                        NESSUS_IANA_PORT_LIST, exc)
+            ports = set()
+        self._iana_tcp_cache = (now, ports)
+        return ports
+
+    def _widen_with_iana(self, port_range: str) -> str:
+        iana = self._iana_tcp_ports()
+        if not iana:
+            self._port_list_status = "fallback: TCP 1-1024 + 52-family catalog (IANA list unavailable)"
+            return port_range
+        tcp: set[int] = set()
+        udp_tokens: list[str] = []
+        for token in (port_range or "").split(","):
+            piece = token.strip()
+            if piece.upper().startswith("U:"):
+                udp_tokens.append(piece)
+            elif piece:
+                tcp.update(port_numbers(piece[2:] if piece.upper().startswith("T:") else piece))
+        tcp |= iana
+        self._port_list_status = f"widened with '{NESSUS_IANA_PORT_LIST}' ({len(iana)} ports)"
+        return ",".join(x for x in [format_ports(sorted(tcp), "T"), *udp_tokens] if x)
+
     def start_scan(self, *, name: str, targets: list[str], port_range: str | None = None,
                    scan_policy: dict[str, Any] | None = None,
                    max_checks: int | None = None,
@@ -1540,9 +1790,22 @@ class LocalOpenVAS:
         if not host_list:
             raise ValueError("At least one target is required")
         snapshot = _effective_scan_policy(scan_policy, self.port_profile, self.udp_profile)
+        gap = credential_gap(snapshot)
+        if gap:
+            # Fail before any target/task exists: a patch audit without
+            # credentials would look complete while testing nothing it promised.
+            raise ValueError(gap)
+        self._port_list_status = ""
         port_range = self.resolve_port_range(
             host_list, port_range, scan_policy, apply_udp=apply_udp,
         )
+        if snapshot.get("port_profile") in NESSUS_MODES:
+            snapshot["port_list_status"] = self._port_list_status or "supplied port range (resolved earlier)"
+        base_config = str(snapshot.get("scan_config") or self.scan_config_name)
+        alive_test = str(snapshot.get("alive_test") or self.alive_test)
+        safe_checks = str(snapshot.get("safe_checks") or self.safe_checks)
+        optimize_test = str(snapshot.get("optimize_test") or self.optimize_test)
+        families = list(snapshot.get("nvt_families") or [])
         lane_checks = self.max_checks if max_checks is None else max(1, min(16, int(max_checks)))
         snapshot["requested_port_range"] = snapshot["port_range"]
         for transport, key in (("T", "tcp_port_count"), ("U", "udp_port_count")):
@@ -1556,11 +1819,19 @@ class LocalOpenVAS:
             password=self.password,
         ) as gmp:
             try:
-                config_id = _ensure_portscan_config(gmp, self.scan_config_name)
+                config_id = _ensure_portscan_config(gmp, base_config)
             except Exception:
-                log.warning("Nmap SYN config unavailable; using %s", self.scan_config_name, exc_info=True)
-                config_id = _find_config_id(gmp, self.scan_config_name)
-            health = _assert_feed_quality(gmp, config_id)
+                log.warning("Nmap SYN config unavailable; using %s", base_config, exc_info=True)
+                config_id = _find_config_id(gmp, base_config)
+            full_config = base_config.casefold() == "full and fast"
+            if families:
+                config_id, snapshot["family_scope_status"] = _ensure_family_config(gmp, config_id, families)
+            # The 10k-NVT config floor only applies to an unscoped Full-and-fast
+            # config; Discovery or family-scoped configs are smaller by design.
+            # The feed-wide NVT floor is always enforced.
+            health = _assert_feed_quality(
+                gmp, config_id if full_config and not str(snapshot.get("family_scope_status") or "").startswith("scoped") else None
+            )
             scanner_id = _find_scanner_id(gmp)
             bindings: dict[str, str] = {}
             credential_status: dict[str, str] = {}
@@ -1576,7 +1847,7 @@ class LocalOpenVAS:
                 except Exception:
                     credential_status[kind] = "not-tested; local credential reference lookup failed"
             target_args = {"name": f"{name}-tgt-{int(time.time())}", "hosts": host_list,
-                           "port_range": port_range, "alive_test": self.alive_test}
+                           "port_range": port_range, "alive_test": alive_test}
             try:
                 target = gmp.create_target(**target_args, **bindings)
             except Exception as exc:
@@ -1598,8 +1869,8 @@ class LocalOpenVAS:
                 "checks_read_timeout": str(self.checks_read_timeout),
                 "timeout_retry": str(self.timeout_retry),
                 "open_sock_max_attempts": str(self.open_sock_max_attempts),
-                "optimize_test": "no" if snapshot["port_profile"] in ({"full"} | _VULN_PROFILES) else self.optimize_test,
-                "safe_checks": self.safe_checks,
+                "optimize_test": optimize_test,
+                "safe_checks": safe_checks,
                 "plugins_timeout": str(self.plugins_timeout),
                 "scanner_plugins_timeout": str(self.scanner_plugins_timeout),
                 "expand_vhosts": self.expand_vhosts,
@@ -1618,8 +1889,8 @@ class LocalOpenVAS:
                 self.open_sock_max_attempts,
                 self.plugins_timeout,
                 self.scanner_plugins_timeout,
-                self.optimize_test,
-                self.safe_checks,
+                optimize_test,
+                safe_checks,
                 self.expand_vhosts,
                 self.test_empty_vhost,
             )
@@ -1642,7 +1913,7 @@ class LocalOpenVAS:
                     "max_checks": str(self.max_checks),
                     "max_hosts": str(self.max_hosts),
                     "optimize_test": prefs["optimize_test"],
-                    "safe_checks": self.safe_checks,
+                    "safe_checks": safe_checks,
                 }
                 log.warning(
                     "create_task full preferences failed (%s); retrying quality-critical preferences",
@@ -1682,7 +1953,8 @@ class LocalOpenVAS:
             start_response = gmp.start_task(str(task_id))
             snapshot.update({"port_range": port_range, "targets": host_list, "task_id": str(task_id),
                              "config_id": config_id, "scanner_id": scanner_id,
-                             "scan_config_name": self.scan_config_name, "preferences": applied_prefs,
+                             "scan_config_name": base_config, "alive_test": alive_test,
+                             "preferences": applied_prefs,
                              "preference_status": preference_status, "credential_status": credential_status,
                              "nvt_count": (health or {}).get("nvt_count"),
                              "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1706,14 +1978,16 @@ class LocalOpenVAS:
                 report_id = None
             log.info(
                 "Started local OpenVAS task %s report=%s hosts=%s alive_test=%s "
-                "port_profile=%s udp_profile=%s port_range=%s",
+                "port_profile=%s udp_profile=%s template=%s config=%s port_range=%s",
                 task_id,
                 report_id,
                 host_list,
-                self.alive_test,
-                self.port_profile,
-                self.udp_profile,
-                port_range,
+                alive_test,
+                snapshot.get("port_profile"),
+                snapshot.get("udp_profile"),
+                snapshot.get("template") or "-",
+                base_config,
+                port_range if len(port_range) <= 400 else port_range[:400] + "...",
             )
             return str(task_id)
 
@@ -1771,42 +2045,7 @@ class LocalOpenVAS:
             return ""
         try:
             with _session(**self._session_kwargs()) as gmp:
-                _, _, task = _task_status(gmp, tid)
-                if task is None or not hasattr(task, "find"):
-                    return ""
-                target = task.find("target")
-                target_id = (target.get("id") if target is not None else None) or None
-                if not target_id:
-                    return ""
-                try:
-                    tresp = gmp.get_target(str(target_id))
-                except Exception:
-                    tresp = gmp.get_targets(filter_string=f"uuid={target_id}")
-                tnode = tresp.find("target") if hasattr(tresp, "find") else None
-                if tnode is None and hasattr(tresp, "xpath"):
-                    nodes = tresp.xpath(".//target")
-                    tnode = nodes[0] if nodes else None
-                if tnode is None or not hasattr(tnode, "find"):
-                    return ""
-                node = tnode.find("port_range")
-                direct = (node.text or "").strip() if node is not None and node.text else ""
-                if direct:
-                    return direct
-                port_list = tnode.find("port_list")
-                port_list_id = (port_list.get("id") if port_list is not None else None) or None
-                if not port_list_id:
-                    return ""
-                presp = gmp.get_port_list(str(port_list_id))
-                parts: list[str] = []
-                for item in presp.xpath(".//port_range") if hasattr(presp, "xpath") else []:
-                    start = (item.findtext("start") or "").strip()
-                    end = (item.findtext("end") or "").strip()
-                    kind = (item.findtext("type") or "tcp").strip().lower()
-                    prefix = "U" if kind == "udp" else "T"
-                    if not start or not end:
-                        continue
-                    parts.append(f"{prefix}:{start}" if start == end else f"{prefix}:{start}-{end}")
-                return ",".join(parts)
+                return _task_port_range_with(gmp, tid)
         except Exception:
             log.debug("Could not read port range for OpenVAS task %s", tid, exc_info=True)
             return ""
@@ -1859,12 +2098,22 @@ class LocalOpenVAS:
             "alive_test": self.alive_test,
         }
         if mapped in {"completed", "stopped", "failed"} or include_running_report:
+            snapshot_for_report = self.policy_snapshots.get(task_id)
             last_exc: Exception | None = None
             for attempt in range(8):
                 try:
                     # Never reuse a GMP socket after get_report. gvmd closes it
                     # under large XML and every retry on that handle fails fast.
                     with _session(**self._session_kwargs()) as gmp:
+                        if not snapshot_for_report and mapped == "completed":
+                            # Resumed after an agent restart: recover the scanned
+                            # range from the GMP target (same session) so closed
+                            # services are not shown as untested.
+                            try:
+                                recovered = _task_port_range_with(gmp, task_id)
+                            except Exception:
+                                recovered = ""
+                            snapshot_for_report = {"port_range": recovered} if recovered else None
                         vulns, evidence = _report_payload(
                             gmp,
                             task_id,
@@ -1872,6 +2121,7 @@ class LocalOpenVAS:
                             alive_test=self.alive_test,
                             task_status=status,
                             progress=progress,
+                            policy_snapshot=snapshot_for_report,
                         )
                     last_exc = None
                 except Exception as exc:

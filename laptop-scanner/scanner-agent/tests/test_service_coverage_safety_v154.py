@@ -50,7 +50,8 @@ def test_nexus_profile_keeps_baseline_critical_ports_and_disables_optimization(m
     assert {22, 443, 445, 3389, 8443} <= tcp
     assert p['tcp_port_count'] >= 52
     agent = LocalOpenVAS()
-    assert agent.optimize_test == 'no'
+    # V1.6.5: Nessus default (optimize_test=yes) unless explicitly disabled.
+    assert agent.optimize_test == 'yes'
 
 
 def test_open_port_is_hint_not_service_pass():

@@ -781,6 +781,64 @@ def _target_event_state(event: str, *, status: str | None = None,
     return {"status": state, "progress_pct": pct, "activity": activity}
 
 
+def classify_host_coverage(
+    host_cov: dict[str, Any], target_progress: Any
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Map agent per-host coverage to UI target rows (V1.6.5).
+
+    Returns (target_progress, degraded_hosts, network_complete_hosts).
+    """
+    tp = dict(target_progress) if isinstance(target_progress, dict) else {}
+    degraded_now: list[str] = []
+    network_complete: list[str] = []
+    for cov_host, cov in host_cov.items():
+        if not isinstance(cov, dict):
+            continue
+        verdict = str(cov.get("verdict") or "unknown")
+        entry = dict(tp.get(cov_host) or {})
+        warnings = [str(w)[:240] for w in (cov.get("warnings") or []) if str(w).strip()]
+        tcp_ports = [int(p) for p in (cov.get("open_tcp_ports") or []) if str(p).isdigit()]
+        udp_ports = [int(p) for p in (cov.get("open_udp_ports") or []) if str(p).isdigit()]
+        # V1.6.5: a host whose GMP task is Done, whose port scanner did not
+        # fail and whose listeners were enumerated finished its network
+        # scan. Before, every verdict except "full" (which the agent no
+        # longer emits) became "incomplete", so no host could ever finish.
+        # This is still not a clean claim: service_scope_verified and
+        # clean_eligible stay false for unauthenticated/unverified scans.
+        network_ok = verdict == "observed_unverified" and cov.get("network_scan_complete") is True
+        if verdict == "full" and cov.get("coverage_complete") is True:
+            entry["status"] = "completed"
+            entry["activity"] = "Completed"
+        elif network_ok:
+            network_complete.append(str(cov_host))
+            entry["status"] = "completed"
+            entry["activity"] = (
+                ("Completed with warnings - " if warnings else "Completed - ")
+                + f"network scan finished, {len(tcp_ports)} open TCP"
+                + (f" / {len(udp_ports)} UDP" if udp_ports else "")
+                + " port(s)"
+                + (f"; {len(warnings)} check warning(s)" if warnings else "")
+                + "; service checks unverified"
+            )[:200]
+        else:
+            degraded_now.append(str(cov_host))
+            entry["status"] = "incomplete"
+            entry["activity"] = f"Incomplete — {str(cov.get('reason') or verdict)[:160]}"
+        entry["warnings"] = warnings[:20]
+        entry["coverage"] = {
+            "verdict": verdict,
+            "network_scan_complete": bool(network_ok),
+            "open_tcp_ports": len(tcp_ports),
+            "open_tcp_port_list": sorted(tcp_ports)[:64],
+            "open_udp_port_list": sorted(udp_ports)[:32],
+            "nvts_launched": int(cov.get("nvts_evidenced") or cov.get("nvts_launched") or 0),
+            "results_evidenced": int(cov.get("results_evidenced") or 0),
+            "warnings": len(warnings),
+        }
+        tp[str(cov_host)] = entry
+    return tp, degraded_now, network_complete
+
+
 def _merge_edge_target_progress(previous: Any, incoming: Any, targets: list[str]) -> dict[str, Any]:
     """Merge only assigned, non-excluded hosts and keep verified terminal states."""
     allowed = {_normalize_host(host): str(host) for host in targets}
@@ -1581,10 +1639,32 @@ def ingest_agent_results(
     orch = _orch(job)
     from app.services.scanner_service_policy import analyze_services, clip_policy_snapshots
 
+    saved_policies = clip_policy_snapshots(orch.get("policy_snapshots"), target_list)
+    saved_policies.update(clip_policy_snapshots(policy_snapshots, target_list))
+
+    def _scanned_range(host: str) -> str | None:
+        # V1.6.5: the port range Greenbone was actually given for this host,
+        # so "closed in scanned range" is not mislabelled "not tested".
+        import ipaddress
+
+        def canon(value: Any) -> str:
+            try:
+                return str(ipaddress.ip_address(str(value).strip()))
+            except ValueError:
+                return str(value).strip().lower()
+
+        for snap in saved_policies.values():
+            if canon(host) in {canon(t) for t in (snap.get("targets") or [])} and snap.get("port_range"):
+                return str(snap["port_range"])
+        return None
+
     # Rebuild family status from source rows rather than trusting a client pass.
     # Scope and ownership are enforced by the same locked job as other evidence.
     orch["service_coverage"] = {
-        host: analyze_services(vulnerabilities, host=host, coverage=(host_coverage or {}).get(host))
+        host: analyze_services(
+            vulnerabilities, host=host, coverage=(host_coverage or {}).get(host),
+            scanned_port_range=_scanned_range(host),
+        )
         for host in target_list
     }
     # Engine completion is different from service-level assurance. Even a
@@ -1594,15 +1674,34 @@ def ingest_agent_results(
         isinstance(value, dict) and value.get("coverage_complete") is True
         for value in orch["service_coverage"].values()
     )
-    saved_policies = clip_policy_snapshots(orch.get("policy_snapshots"), target_list)
-    saved_policies.update(clip_policy_snapshots(policy_snapshots, target_list))
     orch["policy_snapshots"] = saved_policies
+    watch_cves = sorted({
+        str(c).upper() for snap in saved_policies.values() for c in (snap.get("cve_watchlist") or []) if c
+    })
+    if watch_cves:
+        from app.services.scanner_service_policy import mark_cve_watchlist
+
+        orch["cve_watchlist"] = mark_cve_watchlist(
+            [dict(v) for v in (vulnerabilities or []) if isinstance(v, dict)], watch_cves
+        )
+    else:
+        orch.pop("cve_watchlist", None)
     orch["edge_agent"] = True
     orch["enabled"] = False
     if _normalize_agent_instance(agent_instance_id):
         orch["edge_owner_instance"] = _normalize_agent_instance(agent_instance_id)
         orch["edge_owner_seen_at"] = datetime.now(timezone.utc).isoformat()
-    if final_status == "completed" and not service_scope_verified:
+    network_done_all = bool(target_list) and all(
+        isinstance((host_coverage or {}).get(h), dict)
+        and (host_coverage or {})[h].get("network_scan_complete") is True
+        for h in target_list
+    )
+    if final_status == "completed" and not service_scope_verified and network_done_all:
+        progress_message = (
+            "Network scan complete - service checks unverified"
+            + (f" ({plugin_errors} scanner warning(s))" if plugin_errors > 0 else "")
+        )
+    elif final_status == "completed" and not service_scope_verified:
         progress_message = (
             "Engine complete - service coverage unverified"
             + (f" ({plugin_errors} scanner warning(s))" if plugin_errors > 0 else "")
@@ -1654,29 +1753,16 @@ def ingest_agent_results(
         orch["service_scope_verified"] = False
         orch["coverage_limitation"] = "No per-host scanner/port evidence was submitted"
     if isinstance(host_cov, dict) and host_cov:
-        tp = dict(orch.get("target_progress") or {}) if isinstance(orch.get("target_progress"), dict) else {}
-        degraded_now: list[str] = []
-        for cov_host, cov in host_cov.items():
-            if not isinstance(cov, dict):
-                continue
-            verdict = str(cov.get("verdict") or "unknown")
-            entry = dict(tp.get(cov_host) or {})
-            if verdict != "full" or cov.get("coverage_complete") is not True:
-                degraded_now.append(str(cov_host))
-                entry["status"] = "incomplete"
-                entry["activity"] = f"Incomplete — {str(cov.get('reason') or verdict)[:160]}"
-            else:
-                entry["status"] = "completed"
-                entry["activity"] = "Completed"
-            entry["coverage"] = {
-                "verdict": verdict,
-                "open_tcp_ports": len(cov.get("open_tcp_ports") or []),
-                "nvts_launched": int(cov.get("nvts_launched") or 0),
-            }
-            tp[str(cov_host)] = entry
+        tp, degraded_now, network_complete = classify_host_coverage(host_cov, orch.get("target_progress"))
         orch["target_progress"] = tp
         orch["host_coverage"] = host_cov
         orch["degraded_hosts"] = degraded_now
+        orch["network_complete_hosts"] = network_complete
+        if network_complete:
+            # Network scans finished, but service checks/credentials are not
+            # proven: amber "completed with warnings", never a clean result.
+            orch["completed_with_warnings"] = True
+            orch["clean_eligible"] = False
         if degraded_now:
             orch["completed_with_warnings"] = True
             orch["clean_eligible"] = False
@@ -1709,6 +1795,7 @@ def ingest_agent_results(
         "service_coverage": orch["service_coverage"],
         "policy_snapshots": orch["policy_snapshots"],
         "degraded_hosts": list(orch.get("degraded_hosts") or []),
+        "network_complete_hosts": list(orch.get("network_complete_hosts") or []),
     })
     record_scan_result(
         db,

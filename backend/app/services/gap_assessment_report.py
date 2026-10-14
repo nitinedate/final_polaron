@@ -689,7 +689,19 @@ def render_gap_docx(ctx: dict[str, Any]) -> bytes:
             doc.add_heading(f"Job {job['job_id']} ({job.get('status') or 'unknown'})", level=2)
             for host, evidence in job["service_coverage"].items():
                 counts = evidence.get("counts") or {}
-                doc.add_paragraph(f"{host}: {counts.get('finding', 0)} families with findings; {counts.get('observation', 0)} observed; {counts.get('not-tested', 0)} not tested; {counts.get('unsupported', 0)} unsupported.")
+                doc.add_paragraph(
+                    f"{host}: {counts.get('finding', 0)} families with findings; {counts.get('observation', 0)} observed; "
+                    f"{counts.get('not-tested', 0)} not tested; {counts.get('not-observed', 0)} not observed in the scanned "
+                    f"port range; {counts.get('not-in-scope', 0)} outside the scanned port range; "
+                    f"{counts.get('unsupported', 0)} unsupported."
+                )
+                host_level = evidence.get("host_level") or {}
+                if host_level.get("source_result_ids"):
+                    sev = host_level.get("severity_counts") or {}
+                    doc.add_paragraph(
+                        f"{host}: host-level results (OS, ICMP/TCP stack): "
+                        + ", ".join(f"{k} {v}" for k, v in sev.items() if v)
+                    )
                 doc.add_paragraph(evidence.get("limitation") or job["limitation"])
             for task, policy in job["policy_snapshots"].items():
                 doc.add_paragraph(f"Task {task}: {policy.get('snapshot_status', 'unknown')}; ports {policy.get('port_range') or 'not captured'}; configuration SHA-256 {policy.get('configuration_sha256') or 'not captured'}")

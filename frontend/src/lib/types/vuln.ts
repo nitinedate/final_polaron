@@ -48,6 +48,7 @@ export interface ScanPolicy {
   policy_type: string;
   scanner_id: string | null;
   settings_json: Record<string, unknown> | null;
+  template_key?: string | null;
   compliance_framework: string | null;
   created_by: string | null;
   created_at: string;
@@ -60,6 +61,46 @@ export interface ScanPolicyCreate {
   scanner_id?: string | null;
   settings_json?: Record<string, unknown> | null;
   compliance_framework?: string | null;
+  template_key?: string | null;
+}
+
+/** Nessus-equivalent scan template (GET /api/scan-policy-templates). */
+export interface ScanPolicyTemplate {
+  key: string;
+  name: string;
+  nessus_template: string;
+  category: "discovery" | "vulnerability" | "compliance" | "threat" | string;
+  description: string;
+  compliance_framework?: string | null;
+  nessus_reference: string;
+  deviations: string;
+  settings: {
+    port_profile?: string;
+    udp_profile?: string;
+    scan_config?: string;
+    alive_test?: string;
+    safe_checks?: string;
+    optimize_test?: string;
+    custom_tcp_ports?: number[];
+    require_credentials?: string[];
+    nvt_families?: string[];
+    cve_watchlist?: string[];
+    [key: string]: unknown;
+  };
+  tcp_port_count_floor: number | null;
+  udp_port_count: number | null;
+  requires_credentials: string[];
+}
+
+export interface ServiceResultBucket {
+  service_id: string;
+  name: string;
+  status: string;
+  severity_counts: Record<string, number>;
+  source_result_ids: string[];
+  finding_result_ids: string[];
+  results: { result_id: string; title: string; port: string; severity: string; cvss: number; nvt_oid: string }[];
+  ports: string[];
 }
 
 export interface ScanPolicyUpdate {
@@ -157,6 +198,16 @@ export interface ScanJobTargetProgress {
   low: number;
   engines?: Record<string, string>;
   excluded?: boolean;
+  warnings?: string[];
+  coverage?: {
+    verdict?: string;
+    network_scan_complete?: boolean;
+    open_tcp_port_list?: number[];
+    open_udp_port_list?: number[];
+    nvts_launched?: number;
+    results_evidenced?: number;
+    warnings?: number;
+  };
 }
 
 export interface ScanJobSeveritySummary {
@@ -176,12 +227,25 @@ export interface ScanJobSeveritySummary {
     counts: Record<string, number>;
     services: { service_id: string; name: string; status: string; reason: string;
       endpoint_count: number; port_hint_count?: number; port_hints?: string[];
-      source_result_ids: string[]; credentialed_checks: string }[];
+      source_result_ids: string[]; finding_result_ids?: string[];
+      severity_counts?: Record<string, number>; attribution?: string[]; credentialed_checks: string }[];
+    host_level?: ServiceResultBucket;
+    other_ports?: ServiceResultBucket;
+    network_scan_complete?: boolean;
     ip_forwarding: { status: string; reason: string };
   }>;
   policy_snapshots?: Record<string, { port_range?: string; snapshot_status: string;
     configuration_sha256?: string; feed_versions?: Record<string, string>;
-    credential_status?: Record<string, string> }>;
+    credential_status?: Record<string, string>; template?: string; template_name?: string;
+    scan_config_name?: string; port_list_status?: string; family_scope_status?: string;
+    tcp_port_count?: number; udp_port_count?: number }>;
+  cve_watchlist?: {
+    cves: string[];
+    hit_count: number;
+    status: "hit" | "no_hit_in_scanned_scope" | string;
+    note: string;
+    hits: { result_id: string; host?: string; port?: number; title: string; cves: string[]; severity: string; cvss: number }[];
+  } | null;
   accel?: { gpu_present: boolean; used_for_scan: boolean; detail: string };
   assessment?: {
     assessed: number;
@@ -191,6 +255,10 @@ export interface ScanJobSeveritySummary {
     label: string;
     clean_eligible: boolean;
     plugin_error_count?: number;
+    network_scan_complete?: boolean;
+    network_complete_hosts?: string[];
+    degraded_hosts?: string[];
+    clean_blockers?: string[];
   };
 }
 

@@ -13,8 +13,28 @@ from typing import Any
 from uuid import UUID
 
 CATALOG_PATH = Path(__file__).with_name("service_catalog.json")
-MODES = {"full", "fast", "common", "vuln", "nessus", "nexus"}
+TEMPLATES_PATH = Path(__file__).with_name("scan_templates.json")
+# full     TCP 1-65535
+# nessus   Nessus "default" parity: TCP 1-1024 + 52-family catalog, widened at
+#          scan time with Greenbone's "All IANA assigned TCP" port list
+# nexus    legacy alias of nessus (field .env files use this spelling)
+# catalog  the 52-family catalog only (the pre-1.6.5 meaning of nexus)
+# vuln/fast/common  legacy catalog-based profiles
+# focused  only custom_tcp_ports / custom_udp_ports (threat templates)
+MODES = {"full", "fast", "common", "vuln", "nessus", "nexus", "catalog", "focused"}
+NESSUS_MODES = {"nessus", "nexus"}
 UDP_MODES = {"priority", "full", "off"}
+NESSUS_IANA_PORT_LIST = "All IANA assigned TCP"
+SCAN_CONFIGS = {"Full and fast", "Discovery", "Host Discovery", "System Discovery", "Base"}
+ALIVE_TESTS = {
+    "Scan Config Default", "ICMP Ping", "TCP-ACK Service Ping", "TCP-SYN Service Ping",
+    "ARP Ping", "ICMP & TCP-ACK Service Ping", "ICMP & ARP Ping",
+    "TCP-ACK Service & ARP Ping", "ICMP, TCP-ACK Service & ARP Ping", "Consider Alive",
+}
+CREDENTIAL_KINDS = {"ssh", "smb", "snmp", "esxi"}
+_FAMILY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 :._/&()+,-]{0,79}$")
+_CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,7}$")
+_YES_NO = {"yes": "yes", "no": "no", "true": "yes", "false": "no", "1": "yes", "0": "no", "on": "yes", "off": "no"}
 SNAPSHOT_FIELDS = {
     "ssh_credential_port",
     "policy_version",
@@ -46,6 +66,18 @@ SNAPSHOT_FIELDS = {
     "configuration_sha256",
     "network_scoped_methods",
     "rule_engine",
+    "template",
+    "template_name",
+    "alive_test",
+    "safe_checks",
+    "optimize_test",
+    "require_credentials",
+    "require_credentials_mode",
+    "nvt_families",
+    "family_scope_status",
+    "cve_watchlist",
+    "port_list_name",
+    "port_list_status",
 }
 PREFERENCE_FIELDS = {
     "max_checks",
@@ -155,11 +187,91 @@ def port_numbers(value: Any) -> list[int]:
     return sorted(ports)
 
 
+@lru_cache(maxsize=1)
+def scan_templates() -> dict[str, Any]:
+    """Nessus-equivalent scan templates (single source for agent and central)."""
+    doc = json.loads(TEMPLATES_PATH.read_text(encoding="utf-8"))
+    keys = [t["key"] for t in doc["templates"]]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Duplicate scan template key")
+    for template in doc["templates"]:
+        _validate_fields(dict(template["settings"]))  # fail loudly on a bad shipped template
+    return doc
+
+
+def template_by_key(key: str) -> dict[str, Any]:
+    for template in scan_templates()["templates"]:
+        if template["key"] == key:
+            return template
+    raise ValueError(f"Unknown scan template: {key}")
+
+
+def expand_template(settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Template defaults first, explicit policy settings override them."""
+    raw = dict(settings or {})
+    key = raw.get("template")
+    if key in (None, ""):
+        return raw
+    template = template_by_key(str(key).strip())
+    merged = dict(template["settings"])
+    merged.update({k: v for k, v in raw.items() if k != "template"})
+    merged["template"] = template["key"]
+    merged["template_name"] = template["name"]
+    return merged
+
+
 def validate_request(settings: dict[str, Any] | None) -> dict[str, Any]:
     raw = settings or {}
     if not isinstance(raw, dict):
         raise ValueError("Scan settings must be an object")
+    return _validate_fields(expand_template(raw))
+
+
+def _validate_fields(raw: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    if raw.get("template") not in (None, ""):
+        out["template"] = str(raw["template"])[:64]
+        out["template_name"] = str(raw.get("template_name") or raw["template"])[:120]
+    if raw.get("scan_config") not in (None, ""):
+        value = str(raw["scan_config"]).strip()
+        if value not in SCAN_CONFIGS:
+            raise ValueError(f"Unsupported scan_config; allowed: {sorted(SCAN_CONFIGS)}")
+        out["scan_config"] = value
+    if raw.get("alive_test") not in (None, ""):
+        value = str(raw["alive_test"]).strip()
+        if value not in ALIVE_TESTS:
+            raise ValueError("Unsupported alive_test")
+        out["alive_test"] = value
+    for key in ("safe_checks", "optimize_test"):
+        if raw.get(key) is not None:
+            value = _YES_NO.get(str(raw[key]).strip().lower())
+            if value is None:
+                raise ValueError(f"{key} must be yes or no")
+            out[key] = value
+    if raw.get("require_credentials") is not None:
+        kinds = raw["require_credentials"]
+        if not isinstance(kinds, list) or not set(map(str, kinds)) <= CREDENTIAL_KINDS:
+            raise ValueError("require_credentials must be a list of ssh/smb/snmp/esxi")
+        out["require_credentials"] = sorted(set(map(str, kinds)))
+        mode = str(raw.get("require_credentials_mode") or "any").lower()
+        if mode not in {"any", "all"}:
+            raise ValueError("require_credentials_mode must be any or all")
+        out["require_credentials_mode"] = mode
+    if raw.get("nvt_families") is not None:
+        fams = raw["nvt_families"]
+        if not isinstance(fams, list) or len(fams) > 64 or not all(
+            isinstance(f, str) and _FAMILY_RE.match(f) for f in fams
+        ):
+            raise ValueError("nvt_families must be up to 64 Greenbone family names")
+        out["nvt_families"] = sorted(set(fams))
+    if raw.get("cve_watchlist") is not None:
+        cves = raw["cve_watchlist"]
+        if not isinstance(cves, list) or len(cves) > 200:
+            raise ValueError("cve_watchlist must be a list of up to 200 CVE identifiers")
+        norm = sorted({str(c).strip().upper() for c in cves})
+        if not all(_CVE_RE.match(c) for c in norm):
+            raise ValueError("cve_watchlist entries must look like CVE-YYYY-NNNN")
+        out["cve_watchlist"] = norm
     for key, allowed in (("port_profile", MODES), ("udp_profile", UDP_MODES)):
         value = raw.get(key, raw.get("mode") if key == "port_profile" else None)
         if value is not None:
@@ -188,8 +300,26 @@ def validate_request(settings: dict[str, Any] | None) -> dict[str, Any]:
             if kind not in {"ssh", "smb", "snmp", "esxi"}:
                 raise ValueError("Unsupported GMP credential kind")
             out["gmp_credential_refs"][kind] = str(UUID(str(value)))
+    if out.get("port_profile") == "focused" and not (out.get("custom_tcp_ports") or out.get("custom_udp_ports")):
+        raise ValueError("The focused port profile requires custom_tcp_ports or custom_udp_ports")
     # No passwords, account tokens, URLs or arbitrary scanner preferences cross this contract.
     return out
+
+
+def credential_gap(request: dict[str, Any]) -> str | None:
+    """Return a human-readable reason when a template's credential requirement is unmet."""
+    need = list(request.get("require_credentials") or [])
+    if not need:
+        return None
+    have = set((request.get("gmp_credential_refs") or {}).keys())
+    mode = request.get("require_credentials_mode") or "any"
+    ok = bool(have & set(need)) if mode == "any" else set(need) <= have
+    if ok:
+        return None
+    sep = " or " if mode == "any" else " and "
+    joined = sep.join(k.upper() for k in need)
+    name = request.get("template_name") or request.get("template") or "This policy"
+    return f"{name} needs a credential reference for {joined} on the scanner (gmp_credential_refs)"
 
 
 def format_ports(ports: list[int], transport: str) -> str:
@@ -250,17 +380,25 @@ def effective_policy(
         str(os.environ.get("UDP_PORT_RANGE") or "").replace("U:", "").replace("u:", "")
     )
     extra_udp = sorted(set(extra_udp + port_numbers(legacy_udp)))
-    tcp = (
-        list(range(1, 65536))
-        if mode == "full"
-        else sorted(set(baseline_tcp + (catalog_tcp or []) + extra_tcp))
-    )
-    udp_ports = (
-        list(range(1, 65536))
-        if udp == "full"
-        else []
-        if udp == "off"
-        else sorted(
+    if mode == "full":
+        tcp = list(range(1, 65536))
+    elif mode == "focused":
+        # Threat templates: only the explicitly listed ports, nothing implied.
+        tcp = sorted(set(req.get("custom_tcp_ports") or []))
+    elif mode in NESSUS_MODES:
+        # Static floor; LocalOpenVAS widens this with the Greenbone
+        # "All IANA assigned TCP" port list when it is available.
+        tcp = sorted(set(range(1, 1025)) | set(baseline_tcp) | set(catalog_tcp or []) | set(extra_tcp))
+    else:
+        tcp = sorted(set(baseline_tcp + (catalog_tcp or []) + extra_tcp))
+    if udp == "full":
+        udp_ports = list(range(1, 65536))
+    elif udp == "off":
+        udp_ports = []
+    elif mode == "focused":
+        udp_ports = sorted(set(req.get("custom_udp_ports") or []))
+    else:
+        udp_ports = sorted(
             set(
                 doc["udp_baseline"]
                 + doc["udp_extensions"]
@@ -268,7 +406,6 @@ def effective_policy(
                 + extra_udp
             )
         )
-    )
     spec = ",".join(
         s for s in (format_ports(tcp, "T"), format_ports(udp_ports, "U")) if s
     )
@@ -289,6 +426,15 @@ def effective_policy(
         "network_scoped_methods": "DHCP/SSDP/mDNS are not implemented as a standalone network collector",
         "rule_engine": "OpenVAS native feed; per-rule success requires report evidence",
     }
+    for key in (
+        "template", "template_name", "scan_config", "alive_test", "safe_checks", "optimize_test",
+        "require_credentials", "require_credentials_mode", "nvt_families", "cve_watchlist",
+    ):
+        if key in req:
+            policy[key] = req[key]
+    if mode in NESSUS_MODES:
+        policy["port_list_name"] = NESSUS_IANA_PORT_LIST
+        policy["port_list_status"] = "static floor (TCP 1-1024 + catalog) until widened by the scanner"
     policy["configuration_sha256"] = hashlib.sha256(
         json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -340,13 +486,202 @@ def evaluate_ip_forwarding(
     }
 
 
+# ---------------------------------------------------------------------------
+# V1.6.5 evidence attribution
+# ---------------------------------------------------------------------------
+# Extra title rules for wording used by OpenVAS NVT names. Product patterns from
+# the catalog are matched with word boundaries as well (so "httpd" no longer
+# matches "lighttpd" and "ftp" no longer matches "tftp"/"sftp").
+_TITLE_RULES: dict[str, list[str]] = {
+    "SVC-01": [r"\bsmb(?:v?\d)?\b", r"\bcifs\b", r"\bnetbios\b", r"\bsamba\b", r"\blanman\b",
+               r"\bms17-010\b", r"\beternalblue\b"],
+    "SVC-02": [r"\bdce/?rpc\b", r"\bmsrpc\b", r"\bms-rpc\b", r"\bmicrosoft (?:windows )?rpc\b",
+               r"\bendpoint mapper\b", r"\bepmap\b"],
+    "SVC-04": [r"\bws-?management\b", r"\bwsman\b"],
+    "SVC-05": [r"\bms-wbt\b", r"\bterminal services?\b", r"\bcredssp\b"],
+    "SVC-06": [r"\bssh\b"],
+    "SVC-09": [r"\bhttp\b", r"\bweb ?server\b", r"\bwebdav\b", r"\bweb application\b"],
+    "SVC-10": [r"\bhttps\b", r"\bssl/tls\b", r"\bheartbleed\b", r"\bpoodle\b", r"\bciphers?\b",
+               r"\bcertificates?\b"],
+    "SVC-14": [r"\bdns\b"],
+    "SVC-20": [r"\bkerberos\b"],
+    "SVC-47": [r"\bntp\b", r"\bnetwork time\b"],
+}
+
+# Protocol owner of a well-known port. Used ONLY for results that GMP actually
+# reported on that port; it never creates a service from a catalog hint, and it
+# never routes product families (Tomcat/IIS/Jenkins share ports and need
+# product evidence).
+_PORT_OWNERS: dict[tuple[int, str], str] = {}
+for _svc, _tcp, _udp in (
+    ("SVC-01", (139, 445), (137, 138)), ("SVC-02", (135,), ()), ("SVC-04", (5985, 5986), ()),
+    ("SVC-05", (3389,), (3389,)), ("SVC-06", (22,), ()), ("SVC-07", (20, 21, 990), ()),
+    ("SVC-09", (80, 8000, 8080), ()), ("SVC-10", (443, 8443), ()), ("SVC-11", (25, 465, 587), ()),
+    ("SVC-12", (110, 995), ()), ("SVC-13", (143, 993), ()), ("SVC-14", (53,), (53,)),
+    ("SVC-15", (), (161, 162)), ("SVC-16", (23,), ()), ("SVC-17", (), (69,)),
+    ("SVC-18", (389,), (389,)), ("SVC-19", (636,), ()), ("SVC-20", (88,), (88,)),
+    ("SVC-21", (3268, 3269), ()), ("SVC-22", (1433,), (1434,)), ("SVC-23", (3306,), ()),
+    ("SVC-24", (5432,), ()), ("SVC-25", (1521,), ()), ("SVC-26", (27017,), ()),
+    ("SVC-27", (6379,), ()), ("SVC-28", (9200, 9300), ()), ("SVC-29", tuple(range(5900, 5910)), ()),
+    ("SVC-30", (902,), (902,)), ("SVC-31", (2375, 2376), ()), ("SVC-32", (6443,), ()),
+    ("SVC-33", (10250,), ()), ("SVC-35", (9418,), ()), ("SVC-36", (5672, 15672), ()),
+    ("SVC-37", (9092,), ()), ("SVC-38", (11211,), (11211,)), ("SVC-40", (9990,), ()),
+    ("SVC-44", (7001, 7002), ()), ("SVC-46", (), (500, 4500)), ("SVC-47", (), (123,)),
+    ("SVC-48", (), (67, 68)), ("SVC-49", (631,), ()), ("SVC-50", (9100,), ()),
+    ("SVC-51", (2049,), (2049,)), ("SVC-52", (111,), (111,)),
+):
+    for _p in _tcp:
+        _PORT_OWNERS[(_p, "tcp")] = _svc
+    for _p in _udp:
+        _PORT_OWNERS[(_p, "udp")] = _svc
+
+# Services whose checks need Windows/host credentials in Greenbone and Nessus.
+_CREDENTIAL_ONLY = {"SVC-03": "WMI checks run only with Windows (SMB) credentials"}
+_SEVERITIES = ("Critical", "High", "Medium", "Low", "Info", "Unscored")
+STATUSES = ("finding", "observation", "not-tested", "not-observed", "not-in-scope", "unsupported")
+
+
+@lru_cache(maxsize=1)
+def _title_regexes() -> dict[str, re.Pattern[str]]:
+    out: dict[str, re.Pattern[str]] = {}
+    for svc in service_catalog()["services"]:
+        parts = [r"(?<![a-z0-9])" + re.escape(p.lower()) + r"(?![a-z])" for p in svc["product_patterns"]]
+        parts += _TITLE_RULES.get(svc["key"], [])
+        if parts:
+            out[svc["key"]] = re.compile("|".join(f"(?:{x})" for x in parts), re.I)
+    return out
+
+
+def _row_severity(row: dict[str, Any]) -> str:
+    raw = str(row.get("severity") or "").strip().lower()
+    aliases = {"critical": "Critical", "high": "High", "medium": "Medium", "moderate": "Medium",
+               "low": "Low", "info": "Info", "informational": "Info", "log": "Info", "none": "Info"}
+    if raw in aliases:
+        return aliases[raw]
+    try:
+        score = float(row.get("cvss", row.get("score")))
+    except (TypeError, ValueError):
+        return "Unscored"
+    if not math.isfinite(score):
+        return "Unscored"
+    return ("Critical" if score >= 9 else "High" if score >= 7 else "Medium" if score >= 4
+            else "Low" if score > 0 else "Info")
+
+
+def _row_score(row: dict[str, Any]) -> float:
+    try:
+        score = float(row.get("cvss", row.get("score", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
+def _row_rid(row: dict[str, Any]) -> str:
+    return str(row.get("source_result_id") or row.get("result_id") or row.get("plugin_id") or "")
+
+
+def _row_endpoint(row: dict[str, Any]) -> tuple[int, str] | None:
+    port = row.get("port")
+    transport = str(row.get("protocol") or "").lower()
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return None
+    if transport not in {"tcp", "udp"}:
+        return None
+    return port, transport
+
+
+def attribute_row(row: dict[str, Any]) -> tuple[set[str], str]:
+    """Return (catalog service keys, method) for one native result row."""
+    keys: set[str] = set()
+    title = str(row.get("plugin_name") or "")
+    regexes = _title_regexes()
+    for svc in service_catalog()["services"]:
+        if matches_service(svc, row):
+            keys.add(svc["key"])
+            continue
+        rx = regexes.get(svc["key"])
+        if rx is not None and rx.search(title):
+            keys.add(svc["key"])
+    method = "title_or_protocol" if keys else ""
+    endpoint = _row_endpoint(row)
+    owner = _PORT_OWNERS.get(endpoint) if endpoint else None
+    if owner:
+        if owner not in keys:
+            method = f"{method}+port_owner" if method else "port_owner"
+        keys.add(owner)
+    return keys, method
+
+
+def _scanned_ports(spec: Any) -> tuple[set[int], set[int]] | None:
+    if not spec or not isinstance(spec, str):
+        return None
+    tcp: set[int] = set()
+    udp: set[int] = set()
+    current = "T"
+    for token in spec.split(","):
+        piece = token.strip()
+        if len(piece) >= 2 and piece[1] == ":" and piece[0].upper() in {"T", "U"}:
+            current = piece[0].upper()
+            piece = piece[2:].strip()
+        if not piece:
+            continue
+        try:
+            (tcp if current == "T" else udp).update(port_numbers(piece))
+        except ValueError:
+            return None
+    return tcp, udp
+
+
+def _bucket(name: str, rows: list[dict[str, Any]], *, key: str) -> dict[str, Any]:
+    counts = {sev: 0 for sev in _SEVERITIES}
+    findings: list[str] = []
+    ids: list[str] = []
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        sev = _row_severity(row)
+        counts[sev] += 1
+        rid = _row_rid(row)
+        if rid:
+            ids.append(rid)
+            if _row_score(row) > 0:
+                findings.append(rid)
+        endpoint = _row_endpoint(row)
+        items.append({
+            "result_id": rid[:128],
+            "title": str(row.get("plugin_name") or "")[:200],
+            "port": f"{endpoint[0]}/{endpoint[1]}" if endpoint else str(row.get("port") or "general"),
+            "severity": sev,
+            "cvss": _row_score(row),
+            "nvt_oid": str(row.get("nvt_oid") or row.get("plugin_id") or "")[:100],
+        })
+    order = {s: i for i, s in enumerate(_SEVERITIES)}
+    items.sort(key=lambda x: (order.get(x["severity"], 9), -x["cvss"], x["title"]))
+    return {
+        "service_id": key,
+        "name": name,
+        "status": "finding" if findings else "observation" if rows else "none",
+        "severity_counts": counts,
+        "source_result_ids": sorted(set(ids)),
+        "finding_result_ids": sorted(set(findings)),
+        "results": items[:100],
+        "ports": sorted({i["port"] for i in items if i["port"] and i["port"][0].isdigit()}),
+    }
+
+
 def analyze_services(
     vulnerabilities: list[dict[str, Any]],
     *,
     host: str,
     coverage: dict[str, Any] | None = None,
+    scanned_port_range: str | None = None,
 ) -> dict[str, Any]:
-    """Describe actual native engine evidence; lack of a finding is never a per-rule pass."""
+    """Describe native engine evidence per service family.
+
+    Lack of a finding is never a per-rule pass. ``not-observed`` means the
+    network scan completed, the family's ports were inside the scanned range
+    and no listener or native result for the family was seen: the service is
+    absent from that scope, which is a scope statement, not a security pass.
+    """
     doc = service_catalog()
     import ipaddress
 
@@ -357,141 +692,177 @@ def analyze_services(
         except ValueError:
             return raw
 
+    cov = coverage or {}
     rows = [r for r in vulnerabilities if canonical(r.get("host")) == canonical(host)]
     endpoints: dict[tuple[int, str], dict[str, Any]] = {}
+
+    def endpoint_item(port: int, transport: str) -> dict[str, Any]:
+        return endpoints.setdefault((port, transport), {
+            "ip": host, "port": port, "transport": transport, "source_result_ids": [],
+            "service": None, "product": None, "cpe": None, "version": None,
+            "confidence": "port_hint_only",
+        })
+
     for row in rows:
-        port = row.get("port")
-        transport = str(row.get("protocol") or "").lower()
-        if (
-            isinstance(port, bool)
-            or not isinstance(port, int)
-            or not 1 <= port <= 65535
-            or transport not in {"tcp", "udp"}
-        ):
+        endpoint = _row_endpoint(row)
+        if not endpoint:
             continue
-        key = (port, transport)
-        item = endpoints.setdefault(
-            key,
-            {
-                "ip": host,
-                "port": port,
-                "transport": transport,
-                "source_result_ids": [],
-                "service": None,
-                "product": None,
-                "cpe": None,
-                "version": None,
-                "confidence": "port_hint_only",
-            },
-        )
+        item = endpoint_item(*endpoint)
         for field in ("service", "product", "cpe", "version"):
             if row.get(field):
                 item[field] = str(row[field])[:1000]
-        rid = row.get("source_result_id") or row.get("result_id")
-        if rid and str(rid) not in item["source_result_ids"]:
-            item["source_result_ids"].append(str(rid))
+        rid = _row_rid(row)
+        if rid and rid not in item["source_result_ids"]:
+            item["source_result_ids"].append(rid)
         if item["service"] or item["product"] or item["cpe"]:
             item["confidence"] = "native_engine_context"
+        elif item["confidence"] == "port_hint_only":
+            item["confidence"] = "native_result_on_port"
     for transport, keyname in (("tcp", "open_tcp_ports"), ("udp", "open_udp_ports")):
-        for raw in (coverage or {}).get(keyname) or []:
+        for raw in cov.get(keyname) or []:
             try:
                 port = int(raw)
             except (ValueError, TypeError):
                 continue
             if 1 <= port <= 65535:
-                endpoints.setdefault(
-                    (port, transport),
-                    {
-                        "ip": host,
-                        "port": port,
-                        "transport": transport,
-                        "source_result_ids": [],
-                        "service": None,
-                        "product": None,
-                        "cpe": None,
-                        "version": None,
-                        "confidence": "port_hint_only",
-                    },
-                )
+                endpoint_item(port, transport)
+
+    attributed: dict[str, list[dict[str, Any]]] = {}
+    methods: dict[str, set[str]] = {}
+    host_level: list[dict[str, Any]] = []
+    other_ports: list[dict[str, Any]] = []
+    for row in rows:
+        keys, method = attribute_row(row)
+        if keys:
+            for key in keys:
+                attributed.setdefault(key, []).append(row)
+                methods.setdefault(key, set()).add(method)
+        elif _row_endpoint(row):
+            other_ports.append(row)
+        else:
+            host_level.append(row)
+
+    network_done = cov.get("network_scan_complete") is True
+    scanned = _scanned_ports(scanned_port_range)
     services = []
     for svc in doc["services"]:
+        key = svc["key"]
         observed = [r for r in endpoints.values() if matches_service(svc, r)]
-        # An open port is a valuable discovery hint, not proof of the protocol
-        # or that its vulnerability NVTs ran. Keep it separate from observation.
         port_hints = [
             r for r in endpoints.values()
-            if (r['transport'] == 'tcp' and r['port'] in svc['tcp_hints'])
-            or (r['transport'] == 'udp' and r['port'] in svc['udp_hints'])
+            if (r["transport"] == "tcp" and r["port"] in svc["tcp_hints"])
+            or (r["transport"] == "udp" and r["port"] in svc["udp_hints"])
         ]
-        referenced = []
-        findings = []
-        for row in rows:
-            title = str(row.get("plugin_name") or "").lower()
-            if matches_service(svc, row) or any(
-                pattern in title for pattern in svc["product_patterns"]
-            ):
-                rid = str(
-                    row.get("source_result_id")
-                    or row.get("result_id")
-                    or row.get("plugin_id")
-                    or ""
-                )
-                if rid:
-                    referenced.append(rid)
-                try:
-                    score = float(row.get("cvss", row.get("score", 0)) or 0)
-                except (ValueError, TypeError):
-                    score = 0
-                if math.isfinite(score) and score > 0 and rid:
-                    findings.append(rid)
-        status = (
-            "finding"
-            if findings
-            else "observation"
-            if observed or referenced
-            else "not-tested"
-        )
-        reason = (
-            "Native report references; no independent per-check pass inferred"
-            if status != "not-tested"
-            else (
-                f"{len(port_hints)} catalog port hint(s) observed, but protocol and NVT execution unverified"
-                if port_hints else "No verified protocol/product or matching native check evidence in this report"
+        svc_rows = attributed.get(key, [])
+        referenced = [rid for rid in (_row_rid(r) for r in svc_rows) if rid]
+        findings = [rid for r in svc_rows if _row_score(r) > 0 for rid in [_row_rid(r)] if rid]
+        counts = {sev: 0 for sev in _SEVERITIES}
+        for r in svc_rows:
+            counts[_row_severity(r)] += 1
+        hints_in_scope = None
+        if scanned is not None:
+            hints_in_scope = (
+                [p for p in svc["tcp_hints"] if p in scanned[0]]
+                + [p for p in svc["udp_hints"] if p in scanned[1]]
             )
-        )
-        if svc["scope"] == "network" and not referenced and not observed:
+        if findings:
+            status = "finding"
+            reason = f"{len(findings)} scored native result(s); no independent per-check pass inferred"
+        elif referenced or observed:
+            status = "observation"
+            reason = "Native report references (informational); no independent per-check pass inferred"
+        elif svc["scope"] == "network":
             status = "unsupported"
+            reason = "No DHCP network-scoped collector is implemented by the per-IP agent"
+        elif port_hints:
+            status = "not-tested"
+            shared = sorted({f"{r['port']}/{r['transport']}" for r in port_hints})
             reason = (
-                "No DHCP network-scoped collector is implemented by the per-IP agent"
+                f"Port(s) {', '.join(shared)} open but no native result attributed to this family"
+                + (f"; {_CREDENTIAL_ONLY[key]}" if key in _CREDENTIAL_ONLY else "")
             )
-        services.append(
-            {
-                "service_id": svc["key"],
-                "name": svc["name"],
-                "engine_family": svc["engine_family"],
-                "status": status,
-                "reason": reason,
-                "endpoint_count": len(observed),
-                "port_hint_count": len(port_hints),
-                "port_hints": sorted({f"{row['port']}/{row['transport']}" for row in port_hints}),
-                "source_result_ids": sorted(set(referenced)),
-                "finding_result_ids": sorted(set(findings)),
-                "credentialed_checks": "not-tested; authentication/privilege evidence is required",
-            }
-        )
-    totals = {
-        state: sum(s["status"] == state for s in services)
-        for state in ("finding", "observation", "not-tested", "unsupported")
-    }
+        elif network_done and hints_in_scope is not None and (svc["tcp_hints"] or svc["udp_hints"]) and not hints_in_scope:
+            status = "not-in-scope"
+            reason = "None of this family's default ports were in the scanned port range"
+        elif network_done and hints_in_scope is not None:
+            status = "not-observed"
+            udp_only = not svc["tcp_hints"] and bool(svc["udp_hints"])
+            reason = (
+                "Network scan finished; default port(s) were in range and closed/filtered, and no open "
+                "port was identified as this service"
+                + ("; UDP silence can also mean filtered" if udp_only else "")
+                + ". Absence in scope, not a security pass"
+            )
+        else:
+            status = "not-tested"
+            reason = (
+                "No verified protocol/product or matching native check evidence in this report"
+                + ("" if network_done else "; network scan not confirmed complete")
+                + ("" if scanned is not None else "; scanned port range unknown")
+            )
+        services.append({
+            "service_id": key,
+            "name": svc["name"],
+            "engine_family": svc["engine_family"],
+            "status": status,
+            "reason": reason,
+            "endpoint_count": len(observed),
+            "port_hint_count": len(port_hints),
+            "port_hints": sorted({f"{row['port']}/{row['transport']}" for row in port_hints}),
+            "source_result_ids": sorted(set(referenced)),
+            "finding_result_ids": sorted(set(findings)),
+            "severity_counts": counts,
+            "attribution": sorted(m for m in methods.get(key, set()) if m),
+            "credentialed_checks": "not-tested; authentication/privilege evidence is required",
+        })
+    totals = {state: sum(s["status"] == state for s in services) for state in STATUSES}
     return {
         "policy_version": doc["policy_version"],
         "host": host,
         "services": services,
         "counts": totals,
-        "endpoints": sorted(
-            endpoints.values(), key=lambda x: (x["transport"], x["port"])
-        ),
+        "host_level": _bucket("Host / OS / network stack (general)", host_level, key="HOST-GENERAL"),
+        "other_ports": _bucket("Other open ports (outside the 52-family catalog)", other_ports, key="OTHER-PORTS"),
+        "unattributed_results": 0,
+        "endpoints": sorted(endpoints.values(), key=lambda x: (x["transport"], x["port"])),
         "ip_forwarding": evaluate_ip_forwarding(None),
+        "network_scan_complete": network_done,
+        "scanned_port_range_known": scanned is not None,
         "coverage_complete": False,
-        "limitation": "Per-service rule pass/credential/network coverage is not proven by an OpenVAS Done state",
+        "limitation": (
+            "Per-service rule pass/credential/network coverage is not proven by an OpenVAS Done state. "
+            "'not-observed' means absent from the scanned range, not secure"
+        ),
+    }
+
+
+def mark_cve_watchlist(vulnerabilities: list[dict[str, Any]], watchlist: Any) -> dict[str, Any] | None:
+    """Flag native results whose CVEs are on a threat template's watchlist."""
+    if not isinstance(watchlist, list) or not watchlist:
+        return None
+    wanted = {str(c).strip().upper() for c in watchlist if str(c).strip()}
+    hits = []
+    for row in vulnerabilities:
+        cves = {str(c).upper() for c in (row.get("cves") or []) if c}
+        if row.get("cve"):
+            cves.add(str(row["cve"]).upper())
+        matched = sorted(cves & wanted)
+        if matched:
+            row["watchlist_cves"] = matched
+            hits.append({
+                "result_id": _row_rid(row)[:128], "host": row.get("host"),
+                "port": row.get("port"), "protocol": row.get("protocol"),
+                "title": str(row.get("plugin_name") or "")[:200], "cves": matched,
+                "severity": _row_severity(row), "cvss": _row_score(row),
+            })
+    return {
+        "cves": sorted(wanted),
+        "hit_count": len(hits),
+        "hits": hits[:200],
+        "status": "hit" if hits else "no_hit_in_scanned_scope",
+        "note": (
+            "Watchlist CVE(s) reported by native NVTs" if hits else
+            "No native result referenced a watchlist CVE within the scanned ports and credentials; "
+            "this is not proof the host is unaffected"
+        ),
     }

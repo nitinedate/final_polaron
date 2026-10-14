@@ -27,6 +27,18 @@ def reconcile_host_observations(details: dict[str, Any], host: str, preprobe_por
         )
         coverage["service_checks_verified"] = False
         coverage["coverage_complete"] = False
+        coverage["network_scan_complete"] = False
+    elif preprobe and native and set(preprobe) - set(native):
+        missing = sorted(set(preprobe) - set(native))
+        coverage["preprobe_only_ports"] = missing
+        warnings = list(coverage.get("warnings") or [])
+        note = (
+            f"TCP connect pre-probe saw port(s) {missing} open, but Greenbone reported no port detail "
+            "or result for them; those listeners may be untested"
+        )
+        if note not in warnings:
+            warnings.append(note)
+        coverage["warnings"] = warnings
     elif not preprobe and not native and coverage.get("verdict") == "degraded_no_ports":
         coverage["reason"] = (
             "Neither the fast scanner-agent TCP connect probe nor Greenbone evidenced an open listener. "

@@ -327,6 +327,7 @@ def _merge_chunk_details(
     alive_test = ""
     report_read_errors: list[str] = []
     result_count = 0
+    plugin_error_total = 0
     complete_chunks = 0
     skipped = [dict(x) for x in (skipped_hosts or []) if isinstance(x, dict)]
     skipped_set: set[str] = set()
@@ -369,6 +370,7 @@ def _merge_chunk_details(
             assessed.add(str(h).strip())
         result_count += int(ev.get("report_result_count") or 0)
         plugin_errors.extend(ev.get("plugin_error_details") or [])
+        plugin_error_total += int(ev.get("plugin_error_count") or 0)
         for cov_host, cov in (ev.get("host_coverage") or {}).items():
             if isinstance(cov, dict):
                 host_coverage[str(cov_host)] = cov
@@ -478,13 +480,19 @@ def _merge_chunk_details(
             "skipped_hosts": skipped,
             "missing_ip_targets": missing,
             "report_result_count": result_count,
-            "plugin_error_count": len(plugin_errors),
+            # Declared GMP <errors><count> survives even when error rows were not readable.
+            "plugin_error_count": max(plugin_error_total, len(plugin_errors)),
             "plugin_error_details": plugin_errors[:50],
             "host_coverage": host_coverage,
             "service_coverage": service_coverage,
             "policy_snapshots": policy_snapshots,
             "degraded_hosts": sorted(
-                h for h, c in host_coverage.items() if str((c or {}).get("verdict") or "") != "full"
+                h for h, c in host_coverage.items()
+                if str((c or {}).get("verdict") or "") != "full"
+                and (c or {}).get("network_scan_complete") is not True
+            ),
+            "network_complete_hosts": sorted(
+                h for h, c in host_coverage.items() if (c or {}).get("network_scan_complete") is True
             ),
             "scan_start": min(scan_starts) if scan_starts else (now_iso if assessment_complete and skipped else None),
             "scan_end": max(scan_ends) if scan_ends else (now_iso if assessment_complete and skipped else None),

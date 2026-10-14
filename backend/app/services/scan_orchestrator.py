@@ -274,6 +274,8 @@ def scan_job_progress(db, job: dict[str, Any]) -> dict[str, Any]:
             degraded = orch_done.get("degraded_hosts") or []
             if degraded:
                 parts[0] = f"Complete - {len(degraded)} host(s) incomplete"
+            elif orch_done.get("completed_with_warnings") or orch_done.get("network_complete_hosts"):
+                parts[0] = "Complete with warnings"
             ver = orch_done.get("edge_agent_version")
             build = orch_done.get("edge_agent_build")
             if ver:
@@ -1580,7 +1582,8 @@ def scan_job_target_rows(db, job: dict[str, Any]) -> list[dict[str, Any]]:
         if job_done and status in {"scanning", "pending", "running"}:
             status = "completed" if job_status == "completed" else job_status
         activity = str(state.get("activity") or "")
-        if status == "completed":
+        if status == "completed" and not activity.startswith("Completed"):
+            # V1.6.5 keeps "Completed with warnings - ..." detail from the agent.
             activity = "Completed"
         elif status == "incomplete" and not activity:
             activity = "Incomplete — scan coverage degraded"
@@ -1607,6 +1610,9 @@ def scan_job_target_rows(db, job: dict[str, Any]) -> list[dict[str, Any]]:
                 "info": c.get("info", 0),
                 "engines": state.get("engines") if isinstance(state.get("engines"), dict) else {},
                 "excluded": excluded.get(ip, False),
+                "warnings": [str(w)[:240] for w in (state.get("warnings") or [])][:20]
+                if isinstance(state.get("warnings"), list) else [],
+                "coverage": state.get("coverage") if isinstance(state.get("coverage"), dict) else {},
             }
         )
     return out

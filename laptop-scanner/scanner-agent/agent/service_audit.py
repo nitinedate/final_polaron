@@ -98,6 +98,7 @@ def service_audit_rows(host: str, details: dict[str, Any]) -> list[dict[str, Any
         # not independently proven by the service catalog and an open port.
         max_severity = next((sev for sev in SEVERITIES if counts.get(sev)), "Not verified")
         item = {
+            "attribution": list(service.get("attribution") or []),
             "service_id": str(service.get("service_id") or ""),
             "service": str(service.get("name") or ""),
             "status": str(service.get("status") or "not-tested"),
@@ -115,6 +116,36 @@ def service_audit_rows(host: str, details: dict[str, Any]) -> list[dict[str, Any
             "_native_rows": native,
         }
         result.append(item)
+    # V1.6.5: results with no catalog family are still evidence. Host-level
+    # rows (general/tcp, ICMP, OS, CPE) and open ports outside the catalog get
+    # their own audit rows so no Medium/Low can disappear from the log again.
+    for key in ("host_level", "other_ports"):
+        bucket = coverage.get(key)
+        if not isinstance(bucket, dict):
+            continue
+        ids = [str(x) for x in (bucket.get("source_result_ids") or []) if x]
+        if not ids:
+            continue  # the 52 catalog rows stay the contract; buckets only when evidenced
+        native = [row for rid in ids for row in by_id.get(rid, [])]
+        counts = Counter(_severity(row) for row in native)
+        result.append({
+            "attribution": ["bucket"],
+            "service_id": str(bucket.get("service_id") or key.upper()),
+            "service": str(bucket.get("name") or key),
+            "status": "finding" if bucket.get("finding_result_ids") else ("observation" if ids else "none"),
+            "scan_status": scan_state,
+            "task_status": task_state,
+            "max_severity": next((sev for sev in SEVERITIES if counts.get(sev)), "None"),
+            "severity_counts": {sev: int(counts.get(sev, 0)) for sev in SEVERITIES},
+            "native_result_count": len(native),
+            "finding_count": sum(counts.get(s, 0) for s in ("Critical", "High", "Medium", "Low")),
+            "observed_endpoints": 0,
+            "port_hint_count": 0,
+            "observed_port_hints": list(bucket.get("ports") or [])[:64],
+            "source_result_ids": ids[:60],
+            "reason": "Results not tied to a catalog service family",
+            "_native_rows": native,
+        })
     return result
 
 
@@ -144,7 +175,11 @@ def emit_service_results(job_id: str, host: str, details: dict[str, Any], task_i
     log.info("SERVICE_AUDIT_BEGIN job=%s IP=%s task=%s families=%d", job_id, host, task_id, len(rows))
     for row in rows:
         native_rows = row.pop("_native_rows", [])
-        if not _enabled("SERVICE_AUDIT_INCLUDE_UNTESTED") and row["status"] in {"not-tested", "unsupported"}:
+        if row["status"] == "none":
+            continue
+        if not _enabled("SERVICE_AUDIT_INCLUDE_UNTESTED") and row["status"] in {
+            "not-tested", "unsupported", "not-observed", "not-in-scope",
+        }:
             continue
         counts = ",".join(f"{key}={row['severity_counts'][key]}" for key in SEVERITIES)
         log.info(

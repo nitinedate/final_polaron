@@ -106,6 +106,24 @@ class PolicyCreate(BaseModel):
     scanner_id: str | None = None
     settings_json: dict[str, Any] | None = None
     compliance_framework: str | None = None
+    # V1.6.5: Nessus-equivalent template key from GET /api/scan-policy-templates.
+    template_key: str | None = None
+
+
+def _validated_policy_settings(settings: dict[str, Any] | None, template_key: str | None = None) -> dict[str, Any]:
+    """Store only settings the scanner contract accepts (400 on anything else)."""
+    from app.services.scanner_service_policy import validate_request
+
+    raw = dict(settings or {})
+    if template_key:
+        raw["template"] = template_key
+    try:
+        validate_request(raw)  # expands the template and checks every key/value
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, detail={"error": {"code": "invalid_scan_policy", "message": str(exc)}})
+    # Persist the operator's intent (template key + overrides), not the expansion,
+    # so a template fix in a later release applies to existing policies.
+    return {k: v for k, v in raw.items() if v not in (None, "", [], {})}
 
 
 class PolicyUpdate(BaseModel):
@@ -193,6 +211,18 @@ class EvidenceCreate(BaseModel):
     period_end: str | None = None
 
 
+def _settings_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _policy_row(r: dict) -> dict:
     return {
         "id": str(r["id"]),
@@ -201,6 +231,7 @@ def _policy_row(r: dict) -> dict:
         "policy_type": r["policy_type"],
         "scanner_id": str(r["scanner_id"]) if r.get("scanner_id") else None,
         "settings_json": r.get("settings_json"),
+        "template_key": (_settings_dict(r.get("settings_json")) or {}).get("template"),
         "compliance_framework": r.get("compliance_framework"),
         "created_by": str(r["created_by"]) if r.get("created_by") else None,
         "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
@@ -1062,6 +1093,39 @@ def update_scanner(
 # ---------- Policies ----------
 
 
+@router.get("/api/scan-policy-templates")
+def list_policy_templates(
+    current: CurrentUser = Depends(require_firm_permission("scan:read")),
+):
+    """Nessus-equivalent templates with their effective scanner settings."""
+    _require_vuln_module()
+    from app.services.scanner_service_policy import effective_policy, scan_templates, validate_request
+
+    out = []
+    for template in scan_templates()["templates"]:
+        req = validate_request({"template": template["key"]})
+        try:
+            eff = effective_policy({"template": template["key"]})
+            tcp_count, udp_count = eff["tcp_port_count"], eff["udp_port_count"]
+        except ValueError:
+            tcp_count = udp_count = None
+        out.append({
+            "key": template["key"],
+            "name": template["name"],
+            "nessus_template": template["nessus_template"],
+            "category": template["category"],
+            "description": template["description"],
+            "compliance_framework": template.get("compliance_framework"),
+            "nessus_reference": template["nessus_reference"],
+            "deviations": template["deviations"],
+            "settings": req,
+            "tcp_port_count_floor": tcp_count,
+            "udp_port_count": udp_count,
+            "requires_credentials": req.get("require_credentials") or [],
+        })
+    return out
+
+
 @router.get("/api/scan-policies")
 def list_policies(
     case_id: str | None = None,
@@ -1087,6 +1151,16 @@ def create_policy(
     current: CurrentUser = Depends(require_firm_permission("scan:policy_manage")),
 ):
     _require_vuln_module()
+    settings = _validated_policy_settings(body.settings_json, body.template_key)
+    policy_type = body.policy_type
+    framework = body.compliance_framework
+    if body.template_key:
+        from app.services.scanner_service_policy import template_by_key
+
+        template = template_by_key(body.template_key)
+        if policy_type in {"", "basic", "basic_network"}:
+            policy_type = template["category"]
+        framework = framework or template.get("compliance_framework")
     row = fetchone(
         db,
         """INSERT INTO vuln_scan_policies
@@ -1096,10 +1170,10 @@ def create_policy(
         {
             "cid": body.case_id if is_uuid(body.case_id) else None,
             "name": body.name,
-            "ptype": body.policy_type,
+            "ptype": policy_type,
             "sid": body.scanner_id if is_uuid(body.scanner_id) else None,
-            "settings": json.dumps(body.settings_json or {}),
-            "fw": body.compliance_framework,
+            "settings": json.dumps(settings),
+            "fw": framework,
             "uid": current.user_id,
         },
     )
@@ -1133,7 +1207,7 @@ def update_policy(
         raise HTTPException(404, detail={"error": {"code": "not_found", "message": "Policy not found"}})
     data = body.model_dump(exclude_unset=True)
     if "settings_json" in data and data["settings_json"] is not None:
-        data["settings_json"] = json.dumps(data["settings_json"])
+        data["settings_json"] = json.dumps(_validated_policy_settings(data["settings_json"]))
         execute(
             db,
             "UPDATE vuln_scan_policies SET settings_json = CAST(:v AS jsonb), updated_at = NOW() WHERE id = CAST(:id AS uuid)",
@@ -1317,6 +1391,13 @@ def create_scan_job(
             policy_request = validate_request(policy_settings)
         except (ValueError, TypeError) as exc:
             raise HTTPException(400, detail={"error": {"code": "invalid_scan_policy", "message": str(exc)}})
+        from app.services.scanner_service_policy import credential_gap
+
+        gap = credential_gap(policy_request)
+        if gap:
+            # Refuse up front: a credentialed audit without credentials would
+            # finish "successfully" while testing nothing it promised.
+            raise HTTPException(400, detail={"error": {"code": "policy_credentials_missing", "message": gap}})
         orch_json = json.dumps(
             {
                 "enabled": False,
@@ -1325,6 +1406,7 @@ def create_scan_job(
                 "scanner_url": scanner_url[:200],
                 "scan_policy_request": policy_request,
                 "service_policy_version": "aetheris-services-2.1",
+                "scan_template": policy_request.get("template"),
             }
         )
         initial_status = "queued"
@@ -1531,8 +1613,15 @@ def get_scan_job_severity_summary(
         verified and skipped_count == 0 and plugin_error_count == 0
         and service_verified and (not is_edge or orch_obj.get("clean_eligible") is True)
     )
+    network_complete_hosts = [str(h) for h in (orch_obj.get("network_complete_hosts") or [])]
+    degraded_hosts = [str(h) for h in (orch_obj.get("degraded_hosts") or [])]
+    network_done = bool(is_edge and network_complete_hosts and not degraded_hosts)
     if verified and skipped_count > 0:
         assessment_label = "ENGINE COMPLETE - IP SCOPE EXCEPTION"
+    elif verified and network_done and plugin_error_count > 0:
+        assessment_label = f"NETWORK SCAN COMPLETE - {plugin_error_count} SCANNER WARNING(S)"
+    elif verified and network_done:
+        assessment_label = "NETWORK SCAN COMPLETE - SERVICE CHECKS UNVERIFIED"
     elif verified and plugin_error_count > 0:
         assessment_label = "ENGINE COMPLETE - SCANNER WARNINGS"
     elif verified and is_edge and not service_verified:
@@ -1623,7 +1712,20 @@ def get_scan_job_severity_summary(
             "label": assessment_label,
             "clean_eligible": clean_eligible,
             "plugin_error_count": plugin_error_count,
+            "network_scan_complete": network_done,
+            "network_complete_hosts": network_complete_hosts,
+            "degraded_hosts": degraded_hosts,
+            "clean_blockers": [
+                reason for reason, active in (
+                    ("Scanner reported plugin errors or timeouts", plugin_error_count > 0),
+                    ("Some targets were skipped", skipped_count > 0),
+                    ("Service checks are not verified per family (no authenticated evidence)", is_edge and not service_verified),
+                    ("At least one host's network scan did not finish", bool(degraded_hosts)),
+                ) if active
+            ],
         },
+        "cve_watchlist": (orch if isinstance(orch, dict) else {}).get("cve_watchlist"),
+        "scan_template": ((orch if isinstance(orch, dict) else {}).get("scan_template")),
     }
 
 

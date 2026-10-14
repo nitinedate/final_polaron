@@ -8,8 +8,13 @@ from agent.scan_coverage import coverage_from_report
 
 
 def test_env_yes_cannot_optimize_nexus_tests(monkeypatch):
+    """V1.6.5: Nessus parity. Nessus ships optimize_test=yes; OpenVAS yes still runs
+    every NVT whose required ports/services were detected. An explicit
+    GVM_OPTIMIZE_TEST=no restores the pre-1.6.5 forced behaviour."""
     monkeypatch.setenv("PORT_PROFILE", "nexus")
     monkeypatch.setenv("GVM_OPTIMIZE_TEST", "yes")
+    assert LocalOpenVAS().optimize_test == "yes"
+    monkeypatch.setenv("GVM_OPTIMIZE_TEST", "no")
     assert LocalOpenVAS().optimize_test == "no"
 
 
@@ -83,4 +88,4 @@ def test_diagnostic_reports_actual_local_listener():
 
 def test_build_stamp_identifies_new_fix():
     from agent import AGENT_BUILD
-    assert AGENT_BUILD == '1.6.4-v47.6'
+    assert AGENT_BUILD == '1.6.5-v47.7'

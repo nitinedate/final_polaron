@@ -1,0 +1,265 @@
+{
+  "catalog_version": "aetheris-templates-1.0",
+  "note": "Greenbone/OpenVAS equivalents of Nessus scan templates. Settings are a contract checked by service_policy.validate_request; only allow-listed keys reach the scanner.",
+  "templates": [
+    {
+      "key": "host_discovery",
+      "name": "Host Discovery",
+      "nessus_template": "Host Discovery",
+      "category": "discovery",
+      "description": "Find live hosts, open ports, and operating systems. No vulnerability checks run.",
+      "settings": {
+        "scan_config": "Discovery",
+        "port_profile": "catalog",
+        "udp_profile": "off",
+        "alive_test": "ICMP, TCP-ACK Service & ARP Ping",
+        "safe_checks": "yes",
+        "optimize_test": "yes"
+      },
+      "nessus_reference": "Nessus Host Discovery: ARP/ICMP/TCP ping, common-port scan, OS identification, no vulnerability plugins.",
+      "deviations": "Greenbone 'Discovery' config also runs service and product detection on the catalog ports, which is slightly more than Nessus host discovery."
+    },
+    {
+      "key": "basic_network",
+      "name": "Basic Network Scan",
+      "nessus_template": "Basic Network Scan",
+      "category": "vulnerability",
+      "description": "Full system scan for any host. Nessus default port range, service detection on every open port, safe checks only.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "nessus",
+        "udp_profile": "priority",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes"
+      },
+      "nessus_reference": "Nessus Basic Network Scan: port scan range 'default' (about 4,790 common TCP ports), SYN scanner, probe all open ports for services, UDP scanner off, safe checks on, optimize tests on.",
+      "deviations": "TCP scope is Greenbone's 'All IANA assigned TCP' list plus the 52-family catalog (falls back to TCP 1-1024 + catalog if that list is missing). 30 priority UDP ports are kept because OpenVAS only tests UDP services whose ports are in the target port list. Explicitly authorized targets are treated as alive."
+    },
+    {
+      "key": "advanced",
+      "name": "Advanced Scan",
+      "nessus_template": "Advanced Scan",
+      "category": "vulnerability",
+      "description": "All 65,535 TCP ports plus priority UDP, safe checks only. Use when hosts may run services on unusual ports.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "full",
+        "udp_profile": "priority",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes"
+      },
+      "nessus_reference": "Nessus Advanced Scan: every setting configurable; commonly run with port range 1-65535 and safe checks on.",
+      "deviations": "Plugin-family selection is available through nvt_families; when Greenbone rejects the family selection the full 'Full and fast' config is used and the task policy records it."
+    },
+    {
+      "key": "credentialed_patch_audit",
+      "name": "Credentialed Patch Audit",
+      "nessus_template": "Credentialed Patch Audit",
+      "category": "vulnerability",
+      "description": "Log in to hosts and find missing patches. Requires an SMB (Windows) or SSH (Linux/macOS) credential on the scanner.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "catalog",
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "require_credentials": [
+          "smb",
+          "ssh"
+        ],
+        "require_credentials_mode": "any"
+      },
+      "nessus_reference": "Nessus Credentialed Patch Audit: authenticates over SMB/WMI or SSH and enumerates missing updates; network port scanning is minimal.",
+      "deviations": "Uses the 52-family catalog ports so SMB, SSH, and WinRM are reachable. The job is refused before scanning if no matching credential reference is configured."
+    },
+    {
+      "key": "web_app_tests",
+      "name": "Web Application Tests",
+      "nessus_template": "Web Application Tests",
+      "category": "vulnerability",
+      "description": "Scan web servers and applications on common web ports, including TLS configuration.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "catalog",
+        "custom_tcp_ports": [
+          80,
+          81,
+          443,
+          591,
+          593,
+          3000,
+          4443,
+          5000,
+          7001,
+          7002,
+          8000,
+          8008,
+          8009,
+          8080,
+          8081,
+          8088,
+          8443,
+          8888,
+          9000,
+          9080,
+          9090,
+          9443,
+          10000,
+          10443
+        ],
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "nvt_families": [
+          "SSL and TLS",
+          "Web Servers",
+          "Web application abuses"
+        ]
+      },
+      "nessus_reference": "Nessus Web Application Tests: web-app plugin families, crawling of discovered web servers, safe checks.",
+      "deviations": "OpenVAS does not crawl like Nessus' web application scanner; it runs its web NVT families against detected web servers. Base families (port scanners, service/product detection, settings, general) are always kept."
+    },
+    {
+      "key": "internal_pci",
+      "name": "Internal PCI Network Scan",
+      "nessus_template": "Internal PCI Network Scan",
+      "category": "compliance",
+      "description": "Internal PCI DSS 11.3.1 vulnerability scan settings. Review results against the PCI threshold: findings with CVSS 4.0 or higher must be remediated.",
+      "compliance_framework": "PCI DSS",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "full",
+        "udp_profile": "priority",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes"
+      },
+      "nessus_reference": "Nessus Internal PCI Network Scan: full vulnerability scan whose results are reviewed against PCI DSS (CVSS 4.0 and above fails).",
+      "deviations": "Polaron tags findings with PCI requirements but does not compute an automatic pass/fail from CVSS; apply the 4.0 threshold during review. This is not an ASV-certified external scan."
+    },
+    {
+      "key": "threat_ms17_010",
+      "name": "WannaCry / EternalBlue (MS17-010)",
+      "nessus_template": "WannaCry Ransomware",
+      "category": "threat",
+      "description": "Check SMB for MS17-010 (EternalBlue) exposure on ports 139 and 445.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "focused",
+        "custom_tcp_ports": [
+          139,
+          445
+        ],
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "cve_watchlist": [
+          "CVE-2017-0143",
+          "CVE-2017-0144",
+          "CVE-2017-0145",
+          "CVE-2017-0146",
+          "CVE-2017-0147",
+          "CVE-2017-0148"
+        ]
+      },
+      "nessus_reference": "Nessus WannaCry Ransomware template: MS17-010 remote and credentialed checks.",
+      "deviations": "Only SMB ports are scanned; a 'no hit' result is not proof the host is patched."
+    },
+    {
+      "key": "threat_zerologon",
+      "name": "Zerologon (CVE-2020-1472)",
+      "nessus_template": "Zerologon Remote Scan",
+      "category": "threat",
+      "description": "Check domain controllers for Zerologon over RPC/SMB, including the dynamic RPC range. Scans all TCP ports so the dynamic RPC range is reachable.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "full",
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "cve_watchlist": [
+          "CVE-2020-1472"
+        ]
+      },
+      "nessus_reference": "Nessus Zerologon Remote Scan: Netlogon check against domain controllers.",
+      "deviations": "Target domain controllers explicitly; other hosts will simply show no hit. OpenVAS treats unscanned ports as closed, so the dynamic RPC range (49152-65535) requires an all-TCP scan."
+    },
+    {
+      "key": "threat_printnightmare",
+      "name": "PrintNightmare (CVE-2021-34527)",
+      "nessus_template": "PrintNightmare",
+      "category": "threat",
+      "description": "Look for Windows Print Spooler PrintNightmare exposure. Credentials give far better results. Scans all TCP ports so the dynamic RPC range is reachable.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "full",
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "cve_watchlist": [
+          "CVE-2021-1675",
+          "CVE-2021-34527"
+        ]
+      },
+      "nessus_reference": "Nessus PrintNightmare template: remote and local Print Spooler checks.",
+      "deviations": "Remote detection is limited without an SMB credential reference. OpenVAS treats unscanned ports as closed, so the dynamic RPC range (49152-65535) requires an all-TCP scan."
+    },
+    {
+      "key": "threat_log4shell",
+      "name": "Log4Shell (CVE-2021-44228)",
+      "nessus_template": "Log4Shell",
+      "category": "threat",
+      "description": "Look for Apache Log4j Log4Shell exposure across all TCP ports.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "full",
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "cve_watchlist": [
+          "CVE-2021-44228",
+          "CVE-2021-45046",
+          "CVE-2021-45105",
+          "CVE-2021-44832"
+        ]
+      },
+      "nessus_reference": "Nessus Log4Shell templates: remote and credentialed Log4j checks.",
+      "deviations": "Remote checks only find exposed Log4j services; credentials are needed to find vulnerable library files on disk."
+    },
+    {
+      "key": "threat_proxylogon",
+      "name": "ProxyLogon (Microsoft Exchange)",
+      "nessus_template": "ProxyLogon : MS Exchange",
+      "category": "threat",
+      "description": "Check Microsoft Exchange web endpoints for ProxyLogon.",
+      "settings": {
+        "scan_config": "Full and fast",
+        "port_profile": "focused",
+        "custom_tcp_ports": [
+          80,
+          443
+        ],
+        "udp_profile": "off",
+        "alive_test": "Consider Alive",
+        "safe_checks": "yes",
+        "optimize_test": "yes",
+        "cve_watchlist": [
+          "CVE-2021-26855",
+          "CVE-2021-26857",
+          "CVE-2021-26858",
+          "CVE-2021-27065"
+        ]
+      },
+      "nessus_reference": "Nessus ProxyLogon : MS Exchange template.",
+      "deviations": "Only Exchange web ports are scanned; target Exchange servers explicitly."
+    }
+  ]
+}

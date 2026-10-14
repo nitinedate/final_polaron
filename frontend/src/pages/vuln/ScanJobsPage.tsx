@@ -146,8 +146,29 @@ function downloadTextFile(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+const SERVICE_STATUS_ORDER = ["finding", "observation", "not-tested", "not-observed", "not-in-scope", "unsupported"];
+const SERVICE_STATUS_LABEL: Record<string, string> = {
+  finding: "Finding",
+  observation: "Observed",
+  "not-tested": "Not tested",
+  "not-observed": "Not observed",
+  "not-in-scope": "Not in scope",
+  unsupported: "Unsupported",
+};
+
 function jobCoverageIncomplete(job: ScanJob): boolean {
-  return job.status === "completed" && /[1-9]\d* host\(s\) incomplete|service coverage unverified|coverage incomplete/i.test(job.progress_label || "");
+  return job.status === "completed" && /[1-9]\d* host\(s\) incomplete|coverage incomplete/i.test(job.progress_label || "");
+}
+
+/** V1.6.5: network scans finished; warnings or unverified service checks remain. */
+function jobCompletedWithWarnings(job: ScanJob): boolean {
+  return job.status === "completed" && !jobCoverageIncomplete(job) && /complete with warnings|service coverage unverified/i.test(job.progress_label || "");
+}
+
+function jobStatusText(job: ScanJob): string {
+  if (jobCoverageIncomplete(job)) return "Completed · coverage incomplete";
+  if (jobCompletedWithWarnings(job)) return "Completed with warnings";
+  return job.status;
 }
 
 function scanJobProgressPct(job: ScanJob): number {
@@ -633,8 +654,8 @@ export function ScanJobsPage() {
                       </div>
                     </td>
                     <td className="px-5 py-3">
-                      <Badge tone={jobCoverageIncomplete(j) ? "amber" : (STATUS_TONE[j.status] ?? "neutral")}>
-                        {jobCoverageIncomplete(j) ? "Completed · coverage incomplete" : j.status}
+                      <Badge tone={jobCoverageIncomplete(j) || jobCompletedWithWarnings(j) ? "amber" : (STATUS_TONE[j.status] ?? "neutral")}>
+                        {jobStatusText(j)}
                       </Badge>
                       {j.status === "failed" && j.error ? (
                         <p className="mt-1 max-w-xs text-xs text-red-700" title={j.error}>
@@ -807,9 +828,19 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
   const showFindings = complete || (summary?.total ?? 0) > 0;
   const coverageIncomplete = jobStatus === "completed" && (
     targetRows.some((row) => ["incomplete", "failed", "skipped"].includes(String(row.status).toLowerCase())) ||
-    /service coverage unverified|host\(s\) incomplete|coverage incomplete/i.test(summary?.assessment?.label || summary?.progress_label || "")
+    /host\(s\) incomplete|coverage incomplete/i.test(summary?.progress_label || "")
   );
-  const shownStatus = coverageIncomplete ? "Completed · coverage incomplete" : (summary?.status || job.status);
+  // Every host finished its network scan, but the result is not clean-eligible
+  // (scanner warnings, no credentials, or unverified per-service checks).
+  const completedWithWarnings = jobStatus === "completed" && !coverageIncomplete && summary?.assessment
+    ? summary.assessment.clean_eligible === false
+    : false;
+  const shownStatus = coverageIncomplete
+    ? "Completed · coverage incomplete"
+    : completedWithWarnings
+      ? "Completed with warnings"
+      : (summary?.status || job.status);
+  const cleanBlockers = summary?.assessment?.clean_blockers || [];
 
   return (
     <Modal open onClose={onClose} title={`Scan details · ${job.id.slice(0, 8)}…`} size="lg">
@@ -818,9 +849,9 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
       ) : (
         <div className="space-y-5">
           <div className="flex flex-wrap items-center gap-4">
-            <ProgressCircle pct={pct} status={coverageIncomplete ? "coverage-incomplete" : (summary?.status || job.status)} size={56} title="Engine processing progress; not verified service coverage" />
+            <ProgressCircle pct={pct} status={coverageIncomplete || completedWithWarnings ? "coverage-incomplete" : (summary?.status || job.status)} size={56} title="Engine processing progress; not verified service coverage" />
             <div>
-              <Badge tone={coverageIncomplete ? "amber" : (STATUS_TONE[summary?.status || job.status] ?? "neutral")}>
+              <Badge tone={coverageIncomplete || completedWithWarnings ? "amber" : (STATUS_TONE[summary?.status || job.status] ?? "neutral")}>
                 {shownStatus}
               </Badge>
               {summary?.progress_label ? (
@@ -830,8 +861,20 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
               )}
               {coverageIncomplete ? (
                 <p className="mt-2 max-w-xl text-sm font-medium text-amber-800">
-                  Engine processing is finished (100%); vulnerability-test coverage is not verified. Retained findings are valid observations, not proof of a clean host.
+                  Engine processing is finished (100%), but at least one host's network scan did not finish. Retained findings are valid observations, not proof of a clean host.
                 </p>
+              ) : null}
+              {completedWithWarnings ? (
+                <div className="mt-2 max-w-xl text-sm text-amber-800">
+                  <p className="font-medium">
+                    The network scan finished for every host. Findings are valid; a clean result is not claimed because:
+                  </p>
+                  <ul className="mt-1 list-disc pl-5">
+                    {(cleanBlockers.length ? cleanBlockers : ["Service checks are not verified per family"]).map((reason) => (
+                      <li key={reason}>{reason}</li>
+                    ))}
+                  </ul>
+                </div>
               ) : null}
               {(summary?.error || job.error) && (summary?.status || job.status) === "failed" ? (
                 <p className="mt-2 max-w-xl text-sm text-red-700">{summary?.error || job.error}</p>
@@ -851,7 +894,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                 <p className="text-xs text-ink-500">
                   {targetRows.filter((t) => t.status === "scanning" || t.status === "running").length} scanning
                   {" · "}
-                  {targetRows.filter((t) => t.status === "completed").length} verified · {targetRows.filter((t) => t.status === "incomplete").length} incomplete
+                  {targetRows.filter((t) => t.status === "completed").length} finished · {targetRows.filter((t) => t.status === "incomplete").length} incomplete
                   {" · "}
                   {targetRows.length} total
                 </p>
@@ -883,7 +926,23 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                             <Badge tone={targetStatusTone(row.status)}>{({ pending: "Waiting", scanning: "In progress", running: "In progress", completed: "Completed", failed: "Fail", incomplete: "Incomplete", skipped: "Skipped", cancelled: "Cancelled" } as Record<string, string>)[row.status] || row.status}</Badge>
                           </td>
                           <td className="px-3 py-2 text-right tabular-nums text-ink-700" title="Engine progress, not service coverage">{typeof row.progress_pct === "number" ? `${Math.round(Math.min(100, Math.max(0, row.progress_pct)))}%` : "—"}</td>
-                          <td className="px-3 py-2 text-ink-600">{row.status === "completed" ? "Completed" : row.activity}</td>
+                          <td className="px-3 py-2 text-ink-600">
+                            {row.activity || (row.status === "completed" ? "Completed" : "")}
+                            {row.coverage?.open_tcp_port_list?.length ? (
+                              <span className="block text-xs text-ink-500">
+                                Open TCP: {row.coverage.open_tcp_port_list.join(", ")}
+                                {row.coverage.open_udp_port_list?.length ? ` · UDP: ${row.coverage.open_udp_port_list.join(", ")}` : ""}
+                              </span>
+                            ) : null}
+                            {row.warnings?.length ? (
+                              <details className="mt-1 text-xs">
+                                <summary className="cursor-pointer text-amber-800">{row.warnings.length} check warning(s)</summary>
+                                <ul className="mt-1 list-disc pl-4 text-ink-600">
+                                  {row.warnings.map((w) => <li key={w} className="break-words">{w}</li>)}
+                                </ul>
+                              </details>
+                            ) : null}
+                          </td>
                           <td className="px-2 py-2 text-right font-semibold text-red-700">{row.critical}</td>
                           <td className="px-2 py-2 text-right font-semibold text-orange-700">{row.high}</td>
                           <td className="px-2 py-2 text-right font-semibold text-amber-600">{row.medium}</td>
@@ -954,6 +1013,24 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                     </span>
                   </div>
                 ) : null}
+                {summary?.cve_watchlist ? (
+                  <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${summary.cve_watchlist.status === "hit" ? "border-red-200 bg-red-50/60" : "border-ink-200 bg-white"}`}>
+                    <p className="font-semibold text-ink-900">
+                      CVE watchlist: {summary.cve_watchlist.status === "hit" ? `${summary.cve_watchlist.hit_count} matching result(s)` : "no matching result"}
+                    </p>
+                    <p className="mt-1 text-xs text-ink-600">{summary.cve_watchlist.note}</p>
+                    <p className="mt-1 break-words text-xs text-ink-500">Watching: {summary.cve_watchlist.cves.join(", ")}</p>
+                    {summary.cve_watchlist.hits.length ? (
+                      <ul className="mt-2 list-disc pl-5 text-xs text-ink-700">
+                        {summary.cve_watchlist.hits.map((h) => (
+                          <li key={`${h.result_id}-${h.host}`}>
+                            {h.host}{h.port ? `:${h.port}` : ""} · {h.severity} {h.cvss.toFixed(1)} · {h.title} ({h.cves.join(", ")})
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                ) : null}
                 {Object.entries(summary?.service_coverage || {}).length > 0 ? (
                   <div className="mt-4 space-y-3">
                     <h4 className="font-semibold text-ink-900">Service coverage</h4>
@@ -961,16 +1038,29 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                     {Object.entries(summary?.service_coverage || {}).map(([host, coverage]) => (
                       <details key={host} className="rounded-xl border border-ink-200 bg-white p-3">
                         <summary className="cursor-pointer text-sm font-semibold text-ink-800">
-                          {host} · {coverage.counts.finding || 0} with findings · {coverage.counts.observation || 0} observed · {coverage.counts["not-tested"] || 0} not tested · {coverage.counts.unsupported || 0} unsupported
+                          {host} · {coverage.counts.finding || 0} with findings · {coverage.counts.observation || 0} observed · {coverage.counts["not-tested"] || 0} not tested
+                          {coverage.counts["not-observed"] ? ` · ${coverage.counts["not-observed"]} not observed` : ""}
+                          {coverage.counts["not-in-scope"] ? ` · ${coverage.counts["not-in-scope"]} not in scope` : ""}
+                          {` · ${coverage.counts.unsupported || 0} unsupported`}
                         </summary>
                         <p className="my-2 text-xs text-amber-800">{coverage.limitation}</p>
+                        <p className="mb-2 text-xs text-ink-500">
+                          Not tested: the port was open but no check result was found. Not observed: the port was scanned and closed, and no open port was identified as this service. Not in scope: the port was not in the scanned range.
+                        </p>
                         <div className="max-h-80 overflow-auto">
                           <table className="w-full text-left text-xs">
                             <thead><tr><th className="p-2">Service</th><th className="p-2">Evidence state</th><th className="p-2">Explanation / source</th></tr></thead>
-                            <tbody>{coverage.services.map(service => (
+                            <tbody>{[...coverage.services].sort((a, b) => SERVICE_STATUS_ORDER.indexOf(a.status) - SERVICE_STATUS_ORDER.indexOf(b.status)).map(service => (
                               <tr key={service.service_id} className="border-t border-ink-100">
                                 <td className="p-2">{service.service_id} {service.name}</td>
-                                <td className="p-2">{service.status}</td>
+                                <td className="p-2">
+                                  {SERVICE_STATUS_LABEL[service.status] || service.status}
+                                  {service.severity_counts && (service.severity_counts.Critical || service.severity_counts.High || service.severity_counts.Medium || service.severity_counts.Low) ? (
+                                    <span className="block text-[11px] text-ink-500">
+                                      {(["Critical", "High", "Medium", "Low"] as const).filter((k) => service.severity_counts?.[k]).map((k) => `${service.severity_counts?.[k]} ${k}`).join(", ")}
+                                    </span>
+                                  ) : null}
+                                </td>
                                 <td className="p-2">{service.reason}{service.port_hints?.length ? <span className="block text-sky-700">Port hint(s): {service.port_hints.join(", ")} — NOT proof of testing</span> : null}<br />{service.credentialed_checks}
                                   {service.source_result_ids.length ? <div className="break-all font-mono">{service.source_result_ids.join(", ")}</div> : null}
                                 </td>
@@ -978,12 +1068,38 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                             ))}</tbody>
                           </table>
                         </div>
+                        {[coverage.host_level, coverage.other_ports].map((bucket) =>
+                          bucket && bucket.source_result_ids?.length ? (
+                            <div key={bucket.service_id} className="mt-3 rounded-lg border border-ink-100 p-2">
+                              <p className="text-xs font-semibold text-ink-800">
+                                {bucket.name}
+                                {bucket.ports?.length ? ` · ${bucket.ports.join(", ")}` : ""}
+                              </p>
+                              <table className="mt-1 w-full text-left text-xs">
+                                <tbody>
+                                  {bucket.results.map((r) => (
+                                    <tr key={r.result_id || r.title} className="border-t border-ink-100">
+                                      <td className="p-1.5 font-semibold">{r.severity}</td>
+                                      <td className="p-1.5 tabular-nums">{r.cvss.toFixed(1)}</td>
+                                      <td className="p-1.5">{r.port}</td>
+                                      <td className="p-1.5">{r.title}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : null
+                        )}
                         <p className="mt-2 text-xs">IP forwarding: {coverage.ip_forwarding.status} · {coverage.ip_forwarding.reason}</p>
                       </details>
                     ))}
                     {Object.entries(summary?.policy_snapshots || {}).map(([task, policy]) => (
                       <details key={task} className="rounded-xl border border-ink-200 bg-white p-3 text-xs">
                         <summary className="cursor-pointer font-semibold">Task policy · {task} · {policy.snapshot_status}</summary>
+                        {policy.template_name ? <p className="mt-2">Template: {policy.template_name}{policy.scan_config_name ? ` · Greenbone config: ${policy.scan_config_name}` : ""}</p> : null}
+                        {policy.port_list_status ? <p>Port list: {policy.port_list_status}</p> : null}
+                        {policy.family_scope_status ? <p>Check families: {policy.family_scope_status}</p> : null}
+                        {typeof policy.tcp_port_count === "number" ? <p>Scanned: {policy.tcp_port_count} TCP / {policy.udp_port_count ?? 0} UDP ports</p> : null}
                         <p className="mt-2 break-all">Ports: {policy.port_range || "Original scope not captured"}</p>
                         <p className="break-all font-mono">SHA-256: {policy.configuration_sha256 || "Unavailable"}</p>
                         <p>Feed: {JSON.stringify(policy.feed_versions || {})}</p>

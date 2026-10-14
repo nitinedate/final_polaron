@@ -19,7 +19,8 @@ Signals (all from the report XML, no network calls):
   plus result ports of the form ``N/tcp``.
 
 Verdict:
-  ``full``                      scanner ran, ports were enumerated
+  ``full``                      reserved; never emitted by this agent
+  ``observed_unverified``       listeners enumerated; see ``network_scan_complete``
   ``degraded_port_scan_failed`` scanner NVT error/timeout (retry-able)
   ``degraded_no_ports``         zero ports and very few NVTs on an alive host
 """
@@ -70,6 +71,13 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
         "other_errors": 0,
         "service_checks_verified": False,
         "coverage_complete": False,
+        # V1.6.5: True only after the GMP task is Done, no port-scanner NVT
+        # failed and at least one listener was enumerated. Never a clean claim.
+        "network_scan_complete": False,
+        "nvts_evidenced": 0,
+        "results_evidenced": 0,
+        "plugin_error_count": 0,
+        "warnings": [],
         "verdict": "unverified",
         "reason": "",
     }
@@ -109,10 +117,12 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
     oids: set[str] = set()
     tcp: set[int] = set()
     udp: set[int] = set()
+    result_rows = 0
     try:
         for r in report.xpath(".//results/result"):
             if not _host_matches(_text(r, "host"), host):
                 continue
+            result_rows += 1
             nvt = r.find("nvt")
             if nvt is not None and nvt.get("oid"):
                 oids.add(nvt.get("oid"))
@@ -148,6 +158,8 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
     out["nvts_evidenced"] = len(oids)
     out["open_tcp_ports"] = sorted(tcp)[:512]
     out["open_udp_ports"] = sorted(udp)[:128]
+    out["results_evidenced"] = result_rows
+    out["plugin_error_count"] = len(out["port_scanner_errors"]) + out["other_errors"]
 
     # ---- verdict -----------------------------------------------------------
     if out["port_scanner_errors"]:
