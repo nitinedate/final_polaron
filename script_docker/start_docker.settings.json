@@ -12,6 +12,6 @@
     "prod":  {
                  "publicIp":  "122.179.141.248",
                  "domain":  "",
-                 "acmeEmail":  ""
+                 "acmeEmail":  "ndate1976@gmail.com"
              }
 }

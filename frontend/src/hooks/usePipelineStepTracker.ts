@@ -5,6 +5,7 @@ import {
   formatElapsed,
   PIPELINE_STEP_DEFS,
   pipelineStepDefsForJob,
+  sanitizeRegisterError,
   type PipelineStepContext,
 } from "../lib/pipelineStepModal";
 import { getPipelineStages } from "../lib/pipelineStages";

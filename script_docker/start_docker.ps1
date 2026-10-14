@@ -581,19 +581,29 @@ function Get-LocalGatewayArgs {
         '-f', 'deployment/windows-ip-https/docker-compose.gateway-local.yml')
 }
 
-function Get-CertificateState {
-    param([string[]]$ComposeArgs, [string]$Identity, [string]$CertName)
-    try {
-        return Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @('inspect', '--name', $CertName, '--identity', $Identity)
-    } catch {
-        return [pscustomobject]@{ managed = $false; valid = $false; reason = $_.Exception.Message }
-    }
-}
-
 function Start-AcmeBootstrap {
     param([string[]]$ComposeArgs)
     Invoke-Docker -Title 'Start temporary HTTP-01 certificate bootstrap on TCP 80' -DockerArgs (
         $ComposeArgs + @('--profile', 'acme-bootstrap', 'up', '-d', '--no-build', '--pull', 'missing', 'acme-bootstrap'))
+}
+
+function Wait-AcmeChallengeRoute {
+    param([string[]]$ComposeArgs)
+    # Confirm this host answers the challenge before Certbot contacts Let's Encrypt.
+    $bytes = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    $token = ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    try {
+        Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @('challenge', '--token', $token) | Out-Null
+        foreach ($attempt in 1..15) {
+            if (Test-AcmeRoute -Token $token) { return }
+            Start-Sleep -Seconds 1
+        }
+        throw "HTTP-01 challenge file was not served on http://127.0.0.1/.well-known/acme-challenge/. TCP 80 must answer on this host, and the router must forward public TCP 80, before Let's Encrypt can renew the certificate."
+    } finally {
+        try { Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @('challenge', '--token', $token, '--remove') | Out-Null } catch { }
+    }
 }
 
 function Stop-AcmeBootstrap {
@@ -611,27 +621,22 @@ function Ensure-PublicHttpsEdge {
     Assert-PublicPortOwners
     Enable-PublicFirewall
 
-    # A running Aetheris gateway can serve renewal challenges itself. If the required
-    # lineage is missing, use the temporary HTTP-only bootstrap before starting TLS.
+    # Stop-PolaronStacks has already stopped the HTTPS gateway. A short-lived IP
+    # certificate that is due for renewal still needs something answering TCP 80;
+    # otherwise Certbot reports "Some challenges have failed" and startup aborts.
     $ipName = "aetheris-ip-$IP"
-    $ipState = Get-CertificateState -ComposeArgs $composeArgs -Identity $IP -CertName $ipName
     $domainName = if ($DNS) { "aetheris-domain-$DNS" } else { '' }
-    $domainState = if ($DNS) { Get-CertificateState -ComposeArgs $composeArgs -Identity $DNS -CertName $domainName } else { $null }
-    $needBootstrap = (-not $ipState.managed) -or ($DNS -and -not $domainState.managed)
 
-    if ($needBootstrap) {
-        # If an older owned gateway is running, remove it so bootstrap can bind TCP 80.
-        try { Invoke-Docker -Title 'Pause owned HTTPS gateway for first certificate acquisition' -DockerArgs ($composeArgs + @('rm', '-sf', 'gateway', 'certbot-renewer')) } catch { }
-        Start-AcmeBootstrap -ComposeArgs $composeArgs
-    }
-
+    try { Invoke-Docker -Title 'Pause owned HTTPS gateway so the certificate challenge can bind TCP 80' -DockerArgs ($composeArgs + @('rm', '-sf', 'gateway', 'certbot-renewer')) } catch { }
+    Start-AcmeBootstrap -ComposeArgs $composeArgs
     try {
+        Wait-AcmeChallengeRoute -ComposeArgs $composeArgs
         Ensure-PublicCertificate -ComposeArgs $composeArgs -Identity $IP -CertName $ipName -Email $Email -IsIP
         if ($DNS) {
             Ensure-PublicCertificate -ComposeArgs $composeArgs -Identity $DNS -CertName $domainName -Email $Email
         }
     } finally {
-        if ($needBootstrap) { Stop-AcmeBootstrap -ComposeArgs $composeArgs }
+        Stop-AcmeBootstrap -ComposeArgs $composeArgs
     }
 
     $nginxPath = Join-Path $root 'deployment/windows-ip-https/nginx.gateway.https.conf'

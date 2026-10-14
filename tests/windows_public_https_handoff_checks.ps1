@@ -60,7 +60,13 @@ foreach ($failure in @('remove','up','tls')) {
     if ($failure -eq 'up') { Assert-Https (@($script:events | Where-Object Kind -eq 'probe').Count -eq 0) 'Failed gateway startup never reports trusted TLS' }
 }
 $entry=[IO.File]::ReadAllText((Join-Path $ProjectRoot 'script_docker/start_docker.ps1'))
-Assert-Https ($entry.IndexOf('Start-PublicHttpsGateway -ComposeArgs') -lt $entry.IndexOf('"Start all product stacks')) 'Public edge starts before optional product readiness can fail'
+Assert-Https ($entry.IndexOf('Start-PublicHttpsGateway -ComposeArgs') -lt $entry.IndexOf('Start product stacks')) 'Public edge starts before optional product readiness can fail'
+$edgeStart = $entry.IndexOf('function Ensure-PublicHttpsEdge')
+$edgeEnd = $entry.IndexOf('if ($env:AETHERIS_START_DOCKER_FUNCTIONS_ONLY', $edgeStart)
+$edge = $entry.Substring($edgeStart, $edgeEnd - $edgeStart)
+Assert-Https ($edge.IndexOf('Start-AcmeBootstrap') -lt $edge.IndexOf('Ensure-PublicCertificate')) 'HTTP-01 listener starts before certificate renewal'
+Assert-Https ($edge.IndexOf('Wait-AcmeChallengeRoute') -lt $edge.IndexOf('Ensure-PublicCertificate')) 'Local challenge route is checked before contacting Let''s Encrypt'
+Assert-Https ($edge -notmatch '\$needBootstrap') 'Existing short-lived certificates still get a challenge listener'
 Assert-Https ($entry -match 'if \(-not \$isPublic\).*?') 'Local gateway path remains separate'
 Assert-Https ($entry -match 'HTTPS gateway and certificate renewal remain running') 'Product failure explains partial readiness'
 foreach ($file in @('script_docker/start_docker.ps1','script_docker/start_docker.lib.ps1','tests/windows_public_https_handoff_checks.ps1')) {
