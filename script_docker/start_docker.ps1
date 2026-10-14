@@ -629,21 +629,35 @@ function Ensure-PublicHttpsEdge {
 
     try { Invoke-Docker -Title 'Pause owned HTTPS gateway so the certificate challenge can bind TCP 80' -DockerArgs ($composeArgs + @('rm', '-sf', 'gateway', 'certbot-renewer')) } catch { }
     Start-AcmeBootstrap -ComposeArgs $composeArgs
+    $storedCertificateOnly = $false
     try {
         Wait-AcmeChallengeRoute -ComposeArgs $composeArgs
         Ensure-PublicCertificate -ComposeArgs $composeArgs -Identity $IP -CertName $ipName -Email $Email -IsIP
         if ($DNS) {
             Ensure-PublicCertificate -ComposeArgs $composeArgs -Identity $DNS -CertName $domainName -Email $Email
         }
+    } catch {
+        # Let's Encrypt often cannot fetch the HTTP-01 file on this link (no public
+        # route to TCP 80). Aborting here prevents every product stack from starting.
+        $storedCertificateOnly = $true
+        Write-Warn $_.Exception.Message
     } finally {
         Stop-AcmeBootstrap -ComposeArgs $composeArgs
+    }
+
+    if ($storedCertificateOnly) {
+        $ipCheck = Invoke-CertificateTool -ComposeArgs $composeArgs -ToolArgs @('inspect', '--name', $ipName, '--identity', $IP)
+        if (-not $ipCheck.managed) {
+            throw "Certificate renewal for $IP failed and no certificate is stored. Public TCP 80 must reach this host before the first certificate can be issued."
+        }
+        Write-Warn "Let's Encrypt could not reach ${IP}:80 from the internet. Startup will continue with the stored certificate (expires $($ipCheck.expires_utc)). Forward public TCP 80 and 443 to this PC, then start again to renew it."
     }
 
     $nginxPath = Join-Path $root 'deployment/windows-ip-https/nginx.gateway.https.conf'
     $nginxText = Get-PublicNginxConfig -PublicIP $IP -Domain $DNS
     [System.IO.File]::WriteAllText($nginxPath, $nginxText, [System.Text.UTF8Encoding]::new($false))
 
-    Start-PublicHttpsGateway -ComposeArgs $composeArgs -PublicIP $IP -Domain $DNS
+    Start-PublicHttpsGateway -ComposeArgs $composeArgs -PublicIP $IP -Domain $DNS -AllowStoredCertificate:$storedCertificateOnly
     return $composeArgs
 }
 
