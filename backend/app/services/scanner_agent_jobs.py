@@ -851,12 +851,15 @@ def classify_host_coverage(
                 f"scanner laptop scanned through loopback ({self_scan.get('scanned_via')}), "
                 if self_scan else "network scan finished, "
             )
+            port_list = ", ".join(str(p) for p in sorted(tcp_ports)[:16])
+            udp_list = ", ".join(str(p) for p in sorted(udp_ports)[:8])
             entry["activity"] = (
                 prefix
                 + scope
                 + f"{len(tcp_ports)} open TCP"
-                + (f" / {len(udp_ports)} UDP" if udp_ports else "")
-                + " port(s)"
+                + (f" ({port_list})" if port_list else "")
+                + (f" / {len(udp_ports)} UDP ({udp_list})" if udp_ports else "")
+                + " port(s) scanned"
                 + (f"; {len(warnings)} check warning(s)" if warnings else "")
                 + "; unauthenticated checks"
             )[:200]

@@ -21,10 +21,12 @@ exit /b 1
 
 :run
 cd /d "%ROOT%"
+if /I "%~1"=="stop" goto :stop
 echo Starting Aetheris laptop scanner stack...
 echo  (Docker Desktop, Local OpenVAS, Scanner Agent)
 echo.
 echo Root: %CD%
+echo To stop these containers later, run: Start-Laptop.cmd stop
 echo.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\start-laptop.ps1"
 set "RC=%ERRORLEVEL%"
@@ -37,6 +39,25 @@ if not "%RC%"=="0" (
 )
 echo.
 echo Startup completed successfully.
+echo.
+pause
+exit /b 0
+
+:stop
+echo Stopping Aetheris laptop scanner containers...
+echo Root: %CD%
+echo.
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\start-laptop.ps1" -Stop
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" (
+  echo.
+  echo Stop failed with exit code %RC%.
+  echo.
+  pause
+  exit /b %RC%
+)
+echo.
+echo Laptop scanner containers are stopped.
 echo.
 pause
 exit /b 0

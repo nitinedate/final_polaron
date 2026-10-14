@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$Stop
+)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -29,6 +31,24 @@ function Run-Docker([string[]]$A,[switch]$AllowFailure) {
 . (Join-Path $PSScriptRoot 'sync-agent-token.ps1')
 
 $root=(Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if ($Stop) {
+    $compose = $null
+    foreach ($n in @('docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml')) {
+        $candidate = Join-Path $root $n
+        if (Test-Path -LiteralPath $candidate) { $compose = $candidate; break }
+    }
+    if (-not $compose) { throw 'Docker Compose file not found.' }
+    Write-Host ''
+    Write-Host 'Stopping Aetheris laptop scanner containers (volumes are kept).'
+    Write-Host "Root: $root"
+    $stopped = Run-Docker @('compose','-f',$compose,'stop') -AllowFailure
+    if ($stopped.Text) { Write-Host $stopped.Text }
+    if ($stopped.ExitCode -ne 0) { throw "docker compose stop failed with exit code $($stopped.ExitCode)" }
+    $st = Run-Docker @('ps','-a','--filter','name=aetheris-laptop-','--format','table {{.Names}}\t{{.Status}}') -AllowFailure
+    if ($st.Text) { Write-Host $st.Text }
+    Write-Host '[OK] Laptop scanner containers are stopped.' -ForegroundColor Green
+    exit 0
+}
 $envPath=Join-Path $root '.env'
 if(-not(Test-Path -LiteralPath $envPath -PathType Leaf)){
     $example=Join-Path $root '.env.example'

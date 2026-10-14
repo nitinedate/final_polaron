@@ -42,10 +42,7 @@ def _health_is_ready(data: dict[str, Any] | None) -> bool:
 
 
 def _unusable_health_error(base: str, data: dict[str, Any] | None, text: str) -> str:
-    host = (urlparse(base).hostname or "").lower()
     hint = ""
-    if host == "122.179.141.248":
-        hint = " Set CENTRAL_API_URL=https://future-softtech.co.in."
     snippet = (text or "").strip().replace("\n", " ")
     if len(snippet) > 160:
         snippet = snippet[:160]

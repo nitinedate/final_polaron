@@ -572,7 +572,8 @@ function Get-ClientAccessTokenPrompt {
     }
     Write-Host ''
     Write-Host 'The emailed access token is required before this laptop can link to the server.'
-    Write-Host "On any Aetheris login page, request a token for organization $Tenant, then paste it here."
+    Write-Host "Open $(($script:AetherisCentralUrl).TrimEnd('/'))/login?tenant=$Tenant"
+    Write-Host "Request a token for organization $Tenant, then paste it here."
     Write-Host 'The same token signs into Forensic, Mobile extract, and this laptop scanner.'
     Write-Host 'Stored AGENT_TOKEN in .env is not enough to skip this prompt.'
     Write-Host ''
@@ -596,6 +597,12 @@ function Get-AccessTokenTenant([string]$Token) {
     $parts = ([string]$Token).Split('.')
     if ($parts.Length -lt 2) { return '' }
     return ([string]$parts[1]).Trim().ToLower()
+}
+
+function Get-AccessTokenEmail([string]$Token) {
+    $parts = ([string]$Token).Split('.')
+    if ($parts.Length -lt 4) { return '' }
+    return (([string]::Join('.', $parts[2..($parts.Length - 2)])).Trim().ToLower())
 }
 
 function Get-ClientSessionToken {
@@ -817,15 +824,6 @@ function Sync-LaptopAgentToken {
         [hashtable]$EnvMap
     )
     $central = ([string]$EnvMap['CENTRAL_API_URL']).Trim().TrimEnd('/')
-    $retiredCentral = 'https://122.179.141.248'
-    $liveCentral = 'https://future-softtech.co.in'
-    try { $centralHost = ([Uri]$central).Host } catch { $centralHost = '' }
-    if ($centralHost -eq '122.179.141.248') {
-        Write-Host ("[INFO] {0} is no longer the Aetheris server. That address answers HTTP 200 with status 501 and does not return an access token. Using {1}." -f $retiredCentral, $liveCentral) -ForegroundColor Yellow
-        $central = $liveCentral
-        Set-DotEnvValue -Path $EnvPath -Key 'CENTRAL_API_URL' -Value $central
-        $EnvMap['CENTRAL_API_URL'] = $central
-    }
     $tenant = ([string]$EnvMap['TENANT_SLUG']).Trim()
     if ([string]::IsNullOrWhiteSpace($tenant)) { $tenant = 'aetheris' }
     $verifyTls = Get-VerifyTls $EnvMap
@@ -834,25 +832,35 @@ function Sync-LaptopAgentToken {
     $pre = Invoke-DockerBootstrapJson -Root $Root -Mode 'preflight' -Base $central -Tenant $tenant -VerifyTls $verifyTls
     if (-not [bool]$pre.ok) {
         $detail = Format-BootstrapFailure $pre
-        throw "Central HTTPS preflight failed inside Linux Docker.`n$detail`nKeep VERIFY_TLS=true. If the certificate SAN shows a DNS name, set CENTRAL_API_URL to that HTTPS DNS name."
+        throw "Central HTTPS preflight failed inside Linux Docker.`n$detail`nKeep VERIFY_TLS=true and keep CENTRAL_API_URL on the server IP address."
     }
     $canonical = ([string]$pre.canonical_url).Trim().TrimEnd('/')
     if ([string]::IsNullOrWhiteSpace($canonical)) { throw 'Docker bootstrap did not return canonical_url.' }
     if ($canonical -ne $central) {
-        Write-Host ("[OK] Central redirect resolved: {0} -> {1}" -f $central, $canonical) -ForegroundColor Green
-        Set-DotEnvValue -Path $EnvPath -Key 'CENTRAL_API_URL' -Value $canonical
-        $EnvMap['CENTRAL_API_URL'] = $canonical
-        $central = $canonical
+        $configuredHost = ''
+        $canonicalHost = ''
+        try { $configuredHost = ([Uri]$central).Host } catch { $configuredHost = '' }
+        try { $canonicalHost = ([Uri]$canonical).Host } catch { $canonicalHost = '' }
+        $configuredIsIp = $configuredHost -match '^\d{1,3}(\.\d{1,3}){3}$'
+        $canonicalIsIp = $canonicalHost -match '^\d{1,3}(\.\d{1,3}){3}$'
+        if ($configuredIsIp -and -not $canonicalIsIp) {
+            Write-Host ("[INFO] The server suggested {0}. This laptop stays on {1}." -f $canonical, $central) -ForegroundColor Yellow
+        } else {
+            Write-Host ("[OK] Central redirect resolved: {0} -> {1}" -f $central, $canonical) -ForegroundColor Green
+            Set-DotEnvValue -Path $EnvPath -Key 'CENTRAL_API_URL' -Value $canonical
+            $EnvMap['CENTRAL_API_URL'] = $canonical
+            $central = $canonical
+        }
     }
     Write-Host ("[INFO] Central reachable at {0} (HTTP {1}, transport={2}). Asking for the emailed access token." -f $central, [string]$pre.status, [string]$pre.transport)
+    $script:AetherisCentralUrl = $central
 
     $clientToken = Get-ClientAccessTokenPrompt -Tenant $tenant
     $tokenTenant = Get-AccessTokenTenant $clientToken
+    $tokenEmail = Get-AccessTokenEmail $clientToken
     if ($tokenTenant -and $tokenTenant -ne $tenant.ToLowerInvariant()) {
-        Write-Host ("[INFO] This access token is for organization {0}. This laptop was set to {1}, so login was rejected. Using {0}." -f $tokenTenant, $tenant) -ForegroundColor Yellow
-        $tenant = $tokenTenant
-        Set-DotEnvValue -Path $EnvPath -Key 'TENANT_SLUG' -Value $tenant
-        $EnvMap['TENANT_SLUG'] = $tenant
+        $clientToken = $null
+        throw ("This access token is for organization {0}. {1} rejected it with HTTP 401. Open {2}/login?tenant={3} and request a new token for organization {3}." -f $tokenTenant, $central, $central, $tenant)
     }
     $computer = $env:COMPUTERNAME
     if ([string]::IsNullOrWhiteSpace($computer)) { $computer = 'CLIENT' }
@@ -867,6 +875,9 @@ function Sync-LaptopAgentToken {
     $clientToken = $null
     if (-not [bool]$bound.ok) {
         $detail = Format-BootstrapFailure $bound
+        if ([string]$bound.stage -eq 'token_login' -and [string]$bound.status -eq '401') {
+            $detail = $detail + [Environment]::NewLine + ("The server checked organization {0} and email {1}, then rejected the account. Open {2}/login?tenant={0} and request a new access token for an active user in that organization." -f $tenant, $tokenEmail, $central)
+        }
         throw "Scanner token login/binding failed inside Linux Docker.`n$detail"
     }
     $token = ([string]$bound.agent_token).Trim()

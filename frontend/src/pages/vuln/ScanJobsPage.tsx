@@ -286,11 +286,13 @@ function SeverityDonut({
   selected,
   onSelect,
   totalFindings,
+  informationalCount = 0,
 }: {
   buckets: ScanJobSeverityBucket[];
   selected: string | null;
   onSelect: (severity: string) => void;
   totalFindings: number;
+  informationalCount?: number;
 }) {
   const size = 200;
   const cx = size / 2;
@@ -310,27 +312,32 @@ function SeverityDonut({
       return { ...b, start, end };
     });
 
-  // Clean / zero-finding scan: full green ring
+  // Zero scored findings. Informational results mean the open ports were checked.
   if (slices.length === 0) {
+    const portsChecked = informationalCount > 0;
     return (
       <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-center">
-        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-label="No findings">
+        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-label={portsChecked ? "Ports checked, no scored vulnerabilities" : "No findings"}>
           <circle
             cx={cx}
             cy={cy}
             r={(outerR + innerR) / 2}
             fill="none"
-            stroke="rgb(var(--chart-success))"
+            stroke={portsChecked ? "rgb(var(--chart-info))" : "rgb(var(--chart-success))"}
             strokeWidth={outerR - innerR}
           />
           <text x={cx} y={cy - 2} textAnchor="middle" className="fill-ink-800 text-lg font-bold">
             0
           </text>
-          <text x={cx} y={cy + 16} textAnchor="middle" className="fill-emerald-600 text-[10px] font-semibold uppercase">
-            clean
+          <text x={cx} y={cy + 16} textAnchor="middle" className={`text-[10px] font-semibold uppercase ${portsChecked ? "fill-sky-700" : "fill-emerald-600"}`}>
+            {portsChecked ? "checked" : "clean"}
           </text>
         </svg>
-        <p className="text-sm text-ink-500">No vulnerabilities found — scan completed clean.</p>
+        <p className="text-sm text-ink-500">
+          {portsChecked
+            ? `No scored vulnerabilities. ${informationalCount} informational result(s) were recorded on the ports that answered. Show informational to see those ports.`
+            : "No vulnerabilities found — scan completed clean."}
+        </p>
       </div>
     );
   }
@@ -1049,6 +1056,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                   selected={selectedSeverity}
                   onSelect={setSelectedSeverity}
                   totalFindings={donutTotal}
+                  informationalCount={showInfo ? 0 : infoCount}
                 />
               </div>
               <div>
