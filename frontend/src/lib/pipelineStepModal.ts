@@ -231,23 +231,21 @@ export function derivePipelineStepIndex(
   return 0;
 }
 
-const UPLOAD_FOLDER_ERROR =
-  "Still waiting for segment registration. If you attached a new drive, wait for it to mount, choose that folder, then Try again.";
+const LEGACY_FOLDER_HELP =
+  /paste the full windows path|click go & register|click register & start|^select disk folder\b/i;
 
-/** Rewrite leftover D: example / paste-path copy so the UI never asks for a mount. */
+/** Drop leftover instructional copy. A real path or mount failure stays visible. */
 export function sanitizeRegisterError(message: string | null | undefined): string | null {
   if (!message) return null;
-  if (/not found inside Docker|not mounted|missing \/host/i.test(message)) {
-    return message;
+  const text = message.trim();
+  if (!text) return null;
+  if (/not found inside Docker|not mounted|missing \/host|docker cannot read|mount recovery failed/i.test(text)) {
+    return text;
   }
-  if (
-    /paste the full windows path|fotrensics_data|segerEx-1|d:\\all\\|d:\\path\\to\\your|go & register|register & start|select disk folder/i.test(
-      message
-    )
-  ) {
-    return UPLOAD_FOLDER_ERROR;
+  if (LEGACY_FOLDER_HELP.test(text) && !/[A-Za-z]:[\\/]/.test(text)) {
+    return "Choose the evidence folder again. The previous hint was an example path, not this job's directory.";
   }
-  return message;
+  return text;
 }
 
 export function derivePipelineStepContext(

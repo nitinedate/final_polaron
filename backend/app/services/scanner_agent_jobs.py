@@ -126,6 +126,25 @@ def _owner_conflict(job: dict[str, Any], agent_instance_id: str | None) -> bool:
     return not incoming or incoming != owner
 
 
+def _abandoned_running_edge_job(db, scanner_id: str) -> dict[str, Any] | None:
+    """A running edge job whose owner stopped updating it."""
+    return fetchone(
+        db,
+        """SELECT *
+             FROM vuln_scan_jobs
+            WHERE scanner_id = CAST(:sid AS uuid)
+              AND status = 'running'
+              AND completed_at IS NULL
+              AND COALESCE((orchestration_json->>'edge_agent')::boolean, false) = true
+              AND NULLIF(BTRIM(COALESCE(external_scan_id, '')), '') IS NOT NULL
+              AND updated_at <= NOW() - (:lease_sec * INTERVAL '1 second')
+            ORDER BY updated_at DESC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1""",
+        {"sid": scanner_id, "lease_sec": EDGE_OWNER_LEASE_SEC},
+    )
+
+
 def _fresh_running_edge_job(db, scanner_id: str) -> dict[str, Any] | None:
     """Find a job whose current owner is actively updating this scanner slot."""
     return fetchone(
@@ -470,6 +489,25 @@ def claim_next_job(
             # A newly claimed worker gets a short window to create/persist its
             # Greenbone task id. Never let a second process take another job here.
             return None
+        # The 90s lease lapsed, so the worker that owned this scan is gone.
+        # Hand the same OpenVAS tasks back to this scanner instead of leaving
+        # them running with nobody attached.
+        abandoned = _abandoned_running_edge_job(db, scanner_id)
+        if abandoned and _agent_supports_resume(db, scanner_id):
+            owner = _job_owner_instance(abandoned)
+            if agent_instance and owner != agent_instance:
+                abandoned = _assign_job_owner(db, abandoned, agent_instance)
+            task_id = str(abandoned.get("external_scan_id") or "").strip()
+            timeline(
+                db,
+                case_id=str(abandoned["case_id"]),
+                source_type="scan_job",
+                source_id=str(abandoned["id"]),
+                event_type="scan.edge_resumed",
+                actor="scanner-agent",
+                summary=f"Edge scanner resumed abandoned OpenVAS task {task_id}",
+            )
+            return _job_payload(db, abandoned, resumed=True)
 
     # Self-heal a legacy/racy edge job that was marked completed before the
     # durable vuln_scan_results row was committed.  A completed UI state alone

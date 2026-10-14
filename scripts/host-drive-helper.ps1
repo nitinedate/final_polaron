@@ -1,4 +1,4 @@
-﻿# Localhost helper for the Forensic UI - regenerates drive bind mounts and recreates api/worker.
+# Localhost helper for the Forensic UI - regenerates drive bind mounts and recreates api/worker.
 # Run on the Windows examiner workstation (not inside Docker):
 #   powershell -ExecutionPolicy Bypass -File scripts/host-drive-helper.ps1
 #
@@ -1050,7 +1050,7 @@ function Invoke-ResolveFolder {
         }
     }
 
-    throw "Could not find a workstation folder containing $($names.Count) selected segment file(s). Paste the full path (e.g. G:\folder) and click Register & start."
+    throw "Could not find a workstation folder containing $($names.Count) selected segment file(s). Choose that folder again from the drive list."
 }
 
 function Get-WorkstationDriveLetters {

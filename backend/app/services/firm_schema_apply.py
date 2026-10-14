@@ -123,6 +123,10 @@ def apply_firm_extension_functions(db: Session, schema_name: str, *, strict: boo
         name = call.split("(")[0].replace("SELECT public.", "").strip()
         try:
             with db.begin_nested():
+                # ALTER TABLE needs an exclusive lock. Waiting here queues every
+                # later jobs query behind that lock, so a busy scan freezes
+                # Create job. Skip this pass and retry on the next startup.
+                db.execute(text("SET LOCAL lock_timeout = '5s'"))
                 db.execute(text(call), params)
         except Exception as exc:
             if strict:

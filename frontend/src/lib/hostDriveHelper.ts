@@ -1116,7 +1116,13 @@ export async function startHostDriveAgentFromBrowser(
   return ensureHostDriveHelper(maxWaitMs, 1_500, { force: true });
 }
 
-export async function ensureOfficePathMounted(
+function mountCallRestarted(message: string): boolean {
+  return /bad gateway|still starting|502|504|unable to reach|timed out while contacting|network_error/i.test(
+    message
+  );
+}
+
+async function ensureOfficePathMountedOnce(
   requiredPath: string
 ): Promise<RefreshDriveMountsResult & { path_ready?: boolean; mounted?: string[] }> {
   try {
@@ -1157,6 +1163,22 @@ export async function ensureOfficePathMounted(
       error: e instanceof Error ? e.message : "Could not remount the selected office path",
     };
   }
+}
+
+export async function ensureOfficePathMounted(
+  requiredPath: string
+): Promise<RefreshDriveMountsResult & { path_ready?: boolean; mounted?: string[] }> {
+  // Mounting a newly selected letter recreates the forensic API so Docker can
+  // see the drive. That in-flight call returns 502. Wait until the API is back
+  // and ask again; the second call finds the path already mounted.
+  let result = await ensureOfficePathMountedOnce(requiredPath);
+  for (let attempt = 0; attempt < 2 && !result.ok && mountCallRestarted(result.error || ""); attempt += 1) {
+    const { waitForApiReady } = await import("./api");
+    const ready = await waitForApiReady(90_000, "forensic");
+    if (!ready) break;
+    result = await ensureOfficePathMountedOnce(requiredPath);
+  }
+  return result;
 }
 
 /**

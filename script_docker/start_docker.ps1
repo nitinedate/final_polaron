@@ -1,4 +1,4 @@
-﻿# Aetheris / Polaron Windows Docker launcher.
+# Aetheris / Polaron Windows Docker launcher.
 # Windows PowerShell 5.1 compatible.
 # Public profiles validate certificates and start the HTTPS edge before product stacks.
 

@@ -29,6 +29,12 @@ services:
         read_only: true
         volume:
           nocopy: true
+      - type: volume
+        source: aetheris_hostdrive_g_d315c908c353
+        target: '/host/g'
+        read_only: true
+        volume:
+          nocopy: true
   worker-disk:
     volumes:
       - type: volume
@@ -52,6 +58,12 @@ services:
       - type: volume
         source: aetheris_hostdrive_f_a21974c125b4
         target: '/host/f'
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: aetheris_hostdrive_g_d315c908c353
+        target: '/host/g'
         read_only: true
         volume:
           nocopy: true
@@ -81,6 +93,12 @@ services:
         read_only: true
         volume:
           nocopy: true
+      - type: volume
+        source: aetheris_hostdrive_g_d315c908c353
+        target: '/host/g'
+        read_only: true
+        volume:
+          nocopy: true
   worker-report:
     volumes:
       - type: volume
@@ -104,6 +122,12 @@ services:
       - type: volume
         source: aetheris_hostdrive_f_a21974c125b4
         target: '/host/f'
+        read_only: true
+        volume:
+          nocopy: true
+      - type: volume
+        source: aetheris_hostdrive_g_d315c908c353
+        target: '/host/g'
         read_only: true
         volume:
           nocopy: true
@@ -133,6 +157,12 @@ services:
         read_only: true
         volume:
           nocopy: true
+      - type: volume
+        source: aetheris_hostdrive_g_d315c908c353
+        target: '/host/g'
+        read_only: true
+        volume:
+          nocopy: true
 
 volumes:
   aetheris_hostdrive_c_8635bfe8086f:
@@ -147,3 +177,6 @@ volumes:
   aetheris_hostdrive_f_a21974c125b4:
     external: true
     name: aetheris_hostdrive_f_a21974c125b4
+  aetheris_hostdrive_g_d315c908c353:
+    external: true
+    name: aetheris_hostdrive_g_d315c908c353
