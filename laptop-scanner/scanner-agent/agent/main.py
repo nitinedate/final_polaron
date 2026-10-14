@@ -855,6 +855,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     degraded_retries: dict[int, int] = {}
     preprobe_by_host: dict[str, list[int]] = {}
     preprobe_states_by_host: dict[str, dict[str, list[int]]] = {}
+    # V1.8.0: targets that are the scanner laptop itself (see agent/self_target.py).
+    self_scan_by_host: dict[str, dict[str, Any]] = {}
     degraded_retry_budget = max(0, int(os.environ.get("SCAN_DEGRADED_RETRY") or 0))
     # Historical .env files frequently retain SCAN_IP_BUDGET_SEC=600.  It is
     # now a deprecated, diagnostic-only setting.  Never stop a Greenbone task,
@@ -948,6 +950,24 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             )
         emit_ip_event(job_id, host, "start_attempt", chunk_index=idx)
 
+        # V1.8.0: is this authorized target the scanner laptop itself?
+        scan_addresses: dict[str, str] = {}
+        try:
+            from agent.self_target import plan_self_targets
+
+            self_plan = plan_self_targets(chunk)
+            scan_addresses = dict(self_plan.get("aliases") or {})
+            if scan_addresses or self_plan.get("host_ips"):
+                emit_ip_event(
+                    job_id, host, "self_target_check",
+                    is_self=host in scan_addresses, scan_address=scan_addresses.get(host),
+                    host_ips=self_plan.get("host_ips"), source=self_plan.get("source"),
+                    reason=self_plan.get("reason"), chunk_index=idx,
+                )
+        except Exception:
+            log.warning("Self-target check failed for %s; scanning the network path", host, exc_info=True)
+            scan_addresses = {}
+
         discovered_range: str | None = None
         if getattr(openvas, "port_profile", "full") != "full":
             try:
@@ -995,6 +1015,52 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 # Do not pass the narrowed discovery range. A partial answer
                 # (SMB only) used to delete SSH and TLS from the assessment.
                 discovered_range = None
+                if host in scan_addresses:
+                    from agent.port_discovery import candidate_range, probe_tcp_port_states
+                    from agent.self_target import looks_like_accept_all
+
+                    alias = scan_addresses[host]
+                    local_states = probe_tcp_port_states([alias], port_range=candidate_range()).get(alias) or {}
+                    network_states = dict(host_states) if isinstance(host_states, dict) else {}
+                    if looks_like_accept_all(local_states):
+                        # A proxy that accepts every port would make every service look
+                        # open. Keep the honest network path instead.
+                        scan_addresses.pop(host, None)
+                        emit_ip_event(
+                            job_id, host, "self_target_unreliable", scan_address=alias,
+                            local_open_count=len(local_states.get("open") or []), chunk_index=idx,
+                        )
+                        log.warning(
+                            "IP %s is this scanner, but %s accepted almost every port; scanning the network path",
+                            host, alias,
+                        )
+                    else:
+                        local_open = list(local_states.get("open") or [])
+                        preprobe_by_host[host] = local_open
+                        preprobe_states_by_host[host] = local_states
+                        self_scan_by_host[host] = {
+                            "scanned_via": alias,
+                            "network_exposure": {
+                                "address": host,
+                                "open": list(network_states.get("open") or []),
+                                "closed_count": len(network_states.get("closed") or []),
+                                "filtered_count": len(network_states.get("filtered") or []),
+                            },
+                            "local_open_ports": local_open,
+                        }
+                        emit_ip_event(
+                            job_id, host, "self_target", scan_address=alias,
+                            local_open_ports=local_open,
+                            network_open_ports=list(network_states.get("open") or []),
+                            network_filtered_count=len(network_states.get("filtered") or []),
+                            chunk_index=idx,
+                        )
+                        log.info(
+                            "IP %s is this scanner laptop: network path shows %d open / %d no answer; "
+                            "scanning the local view through %s (%d listening policy port(s))",
+                            host, len(network_states.get("open") or []),
+                            len(network_states.get("filtered") or []), alias, len(local_open),
+                        )
             except Exception as exc:
                 # Discovery is an optimization only. Never drop an authorized target
                 # because a quick pre-probe or local socket operation failed.
@@ -1004,6 +1070,10 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 )
                 log.warning("Port discovery failed for %s; continuing with configured OpenVAS profile", host, exc_info=True)
 
+        if scan_addresses.get(host) and host not in self_scan_by_host:
+            # Port discovery was off or failed: still label the local-view scan.
+            self_scan_by_host[host] = {"scanned_via": scan_addresses[host], "network_exposure": None,
+                                       "local_open_ports": None}
         policy = job.get("scan_policy_request")
         planned = ""
         resolver = getattr(openvas, "resolve_port_range", None)
@@ -1047,16 +1117,20 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             start_args["port_range"] = planned
         if policy:
             start_args["scan_policy"] = policy
+        if scan_addresses.get(host):
+            start_args["scan_addresses"] = {host: scan_addresses[host]}
         # Older injectable scanner adapters may not expose the optional
         # per-task max_checks keyword. The native LocalOpenVAS implementation
         # does and retains the quality settings; omit only for a legacy adapter.
         import inspect
         try:
             params = inspect.signature(openvas.start_scan).parameters
-            if "max_checks" not in params and not any(
-                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-            ):
+            accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            if "max_checks" not in params and not accepts_kwargs:
                 start_args.pop("max_checks", None)
+            if "scan_addresses" not in params and not accepts_kwargs and start_args.pop("scan_addresses", None):
+                log.warning("Scanner adapter cannot reroute self-targets; %s is scanned on the network path", host)
+                self_scan_by_host.pop(host, None)
         except (TypeError, ValueError):
             pass
         tid = openvas.start_scan(**start_args)
@@ -1438,6 +1512,10 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         details = reconcile_host_observations(
                             details, host, preprobe_by_host.get(host), preprobe_states_by_host.get(host),
                         )
+                        if host in self_scan_by_host:
+                            from agent.self_target import annotate_self_scan
+
+                            details = annotate_self_scan(details, host, self_scan_by_host[host])
                         _refresh_service_coverage(details, host)
                     if st in {"completed", "failed", "stopped"}:
                         # V1.6.6: learn which NVTs hit their timeout so fast mode can

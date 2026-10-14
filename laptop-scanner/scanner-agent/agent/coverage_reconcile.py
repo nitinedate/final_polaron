@@ -61,9 +61,14 @@ def reconcile_host_observations(
                 f"No policy service answered: all {total} policy TCP ports were dropped "
                 "(a firewall is blocking them, or the host is offline)"
             )
-            warnings = list(coverage.get("warnings") or [])
-            warnings.append("No TCP port answered at all; this cannot tell a firewall from an offline host")
-            coverage["warnings"] = warnings[-20:]
+            # V1.8.0: an observation, not a scan failure. It no longer turns the
+            # job amber; the UI shows it as a note next to the verdict.
+            notes = list(coverage.get("notes") or [])
+            notes.append(
+                "No TCP port answered at all: a firewall dropped every probe or the host is offline. "
+                "To assess it, allow the scanner through the host firewall or add credentials"
+            )
+            coverage["notes"] = notes[-20:]
         return details
     if preprobe and not native and coverage.get("time_limited"):
         # V1.6.7: the per-IP time limit stopped the scan before Greenbone reported

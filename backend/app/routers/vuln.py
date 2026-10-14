@@ -144,6 +144,9 @@ class ScanTargetIn(BaseModel):
 
 class ScanJobCreate(BaseModel):
     policy_id: str | None = None
+    # V1.8.0: launch straight from a built-in template (Nexpose/Nessus) when no
+    # policy row is selected; resolved to the seeded built-in policy when present.
+    template_key: str | None = None
     scheduled_at: str | None = None
     authorization_ref: str | None = None
     scan_window_start: str | None = None
@@ -223,7 +226,23 @@ def _settings_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _template_meta(key: str | None) -> dict[str, Any]:
+    if not key:
+        return {}
+    try:
+        from app.services.scanner_service_policy import template_by_key
+
+        return template_by_key(str(key))
+    except (ValueError, KeyError):
+        return {}
+
+
 def _policy_row(r: dict) -> dict:
+    template_key = (_settings_dict(r.get("settings_json")) or {}).get("template")
+    template = _template_meta(template_key)
+    settings = _settings_dict(r.get("settings_json"))
+    required = list((template.get("settings") or {}).get("require_credentials") or [])
+    have = set((settings.get("gmp_credential_refs") or {}).keys()) if isinstance(settings.get("gmp_credential_refs"), dict) else set()
     return {
         "id": str(r["id"]),
         "case_id": str(r["case_id"]) if r.get("case_id") else None,
@@ -231,11 +250,38 @@ def _policy_row(r: dict) -> dict:
         "policy_type": r["policy_type"],
         "scanner_id": str(r["scanner_id"]) if r.get("scanner_id") else None,
         "settings_json": r.get("settings_json"),
-        "template_key": (_settings_dict(r.get("settings_json")) or {}).get("template"),
+        "template_key": template_key,
+        "template_name": template.get("name"),
+        "vendor": template.get("vendor") or ("custom" if not template_key else None),
+        "category": template.get("category") or r.get("policy_type"),
+        "requires_credentials": required,
+        "credentials_missing": bool(required) and not (have & set(required)),
+        "is_builtin": bool(r.get("is_builtin")),
+        "lifecycle_state": r.get("lifecycle_state") or "draft",
         "compliance_framework": r.get("compliance_framework"),
         "created_by": str(r["created_by"]) if r.get("created_by") else None,
         "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
     }
+
+
+def _assessment_notes(orch_obj: dict, *, is_edge: bool, service_verified: bool) -> list[str]:
+    """Neutral, per-scope explanations shown under a finished job (V1.8.0)."""
+    notes: list[str] = []
+    if is_edge and not service_verified:
+        notes.append(
+            "Unauthenticated scan: findings show what the scanner could reach over the network. "
+            "Add an SMB (Windows) or SSH (Linux) credential to the policy for missing-patch "
+            "(High/Critical) checks, as in a Nexpose Full audit with credentials."
+        )
+    host_cov = orch_obj.get("host_coverage") if isinstance(orch_obj.get("host_coverage"), dict) else {}
+    for host, cov in sorted(host_cov.items()):
+        if not isinstance(cov, dict):
+            continue
+        for note in (cov.get("notes") or [])[:4]:
+            text = f"{host}: {str(note)[:300]}"
+            if text not in notes:
+                notes.append(text)
+    return notes[:20]
 
 
 def _job_row(db: Session, r: dict) -> dict:
@@ -1112,12 +1158,16 @@ def list_policy_templates(
         out.append({
             "key": template["key"],
             "name": template["name"],
-            "nessus_template": template["nessus_template"],
+            "vendor": template.get("vendor") or ("aetheris" if template["category"] == "threat" else "nessus"),
+            "nessus_template": template.get("nessus_template"),
+            "nexpose_template": template.get("nexpose_template"),
             "category": template["category"],
             "description": template["description"],
             "compliance_framework": template.get("compliance_framework"),
-            "nessus_reference": template["nessus_reference"],
+            "nessus_reference": template.get("nessus_reference"),
+            "reference": template.get("reference") or template.get("nessus_reference"),
             "deviations": template["deviations"],
+            "seed_as_builtin": bool(template.get("seed_as_builtin")),
             "settings": req,
             "tcp_port_count_floor": tcp_count,
             "udp_port_count": udp_count,
@@ -1153,6 +1203,10 @@ def list_policies(
     current: CurrentUser = Depends(require_firm_permission("scan:read")),
 ):
     _require_vuln_module()
+    # V1.8.0: built-in Nexpose/Nessus policies always exist (idempotent, never raises).
+    from app.services.builtin_scan_policies import ensure_builtin_policies
+
+    ensure_builtin_policies(db)
     if case_id:
         rows = fetchall(
             db,
@@ -1161,7 +1215,12 @@ def list_policies(
         )
     else:
         rows = fetchall(db, "SELECT * FROM vuln_scan_policies ORDER BY name")
-    return [_policy_row(r) for r in rows]
+    rows = [r for r in rows if str(r.get("lifecycle_state") or "") != "retired"]
+    # Custom policies first, then built-ins grouped by vendor; names stay alphabetical.
+    vendor_rank = {"nexpose": 1, "nessus": 2, "aetheris": 3}
+    out = [_policy_row(r) for r in rows]
+    out.sort(key=lambda p: (1 if p["is_builtin"] else 0, vendor_rank.get(str(p.get("vendor") or ""), 0), p["name"].casefold()))
+    return out
 
 
 @router.post("/api/scan-policies")
@@ -1183,9 +1242,11 @@ def create_policy(
         framework = framework or template.get("compliance_framework")
     row = fetchone(
         db,
+        # V1.8.0: a created policy is usable immediately. 'draft' made central
+        # (premise) scans fail preflight with "policy is not active".
         """INSERT INTO vuln_scan_policies
-           (case_id, name, policy_type, scanner_id, settings_json, compliance_framework, created_by)
-           VALUES (CAST(:cid AS uuid), :name, :ptype, CAST(:sid AS uuid), CAST(:settings AS jsonb), :fw, CAST(:uid AS uuid))
+           (case_id, name, policy_type, scanner_id, settings_json, compliance_framework, created_by, lifecycle_state)
+           VALUES (CAST(:cid AS uuid), :name, :ptype, CAST(:sid AS uuid), CAST(:settings AS jsonb), :fw, CAST(:uid AS uuid), 'active')
            RETURNING *""",
         {
             "cid": body.case_id if is_uuid(body.case_id) else None,
@@ -1225,6 +1286,9 @@ def update_policy(
     row = fetchone(db, "SELECT * FROM vuln_scan_policies WHERE id = CAST(:id AS uuid)", {"id": policy_id})
     if not row:
         raise HTTPException(404, detail={"error": {"code": "not_found", "message": "Policy not found"}})
+    if row.get("is_builtin"):
+        raise HTTPException(409, detail={"error": {"code": "builtin_policy_read_only",
+            "message": "Built-in policies cannot be changed. Create a new policy from the same template instead."}})
     data = body.model_dump(exclude_unset=True)
     if "settings_json" in data and data["settings_json"] is not None:
         data["settings_json"] = json.dumps(_validated_policy_settings(data["settings_json"]))
@@ -1340,6 +1404,18 @@ def create_scan_job(
 
     scanner_id = body.scanner_id if is_uuid(body.scanner_id) else None
     policy_settings = {}
+    if not is_uuid(body.policy_id) and body.template_key:
+        # V1.8.0: launched from a template; use its seeded built-in policy row.
+        from app.services.builtin_scan_policies import builtin_policy_id
+        from app.services.scanner_service_policy import template_by_key
+
+        try:
+            template = template_by_key(str(body.template_key).strip())
+        except ValueError as exc:
+            raise HTTPException(400, detail={"error": {"code": "invalid_scan_policy", "message": str(exc)}})
+        body.policy_id = builtin_policy_id(db, template["key"])
+        if not body.policy_id:
+            policy_settings = {"template": template["key"]}
     if is_uuid(body.policy_id):
         pol = fetchone(
             db,
@@ -1646,7 +1722,10 @@ def get_scan_job_severity_summary(
     elif verified and network_done and plugin_error_count > 0:
         assessment_label = f"NETWORK SCAN COMPLETE - {plugin_error_count} SCANNER WARNING(S)"
     elif verified and network_done:
-        assessment_label = "NETWORK SCAN COMPLETE - SERVICE CHECKS UNVERIFIED"
+        # V1.8.0: say what limits the result instead of implying a failure.
+        assessment_label = (
+            "NETWORK SCAN COMPLETE - UNAUTHENTICATED" if not service_verified else "NETWORK SCAN COMPLETE"
+        )
     elif verified and plugin_error_count > 0:
         assessment_label = "ENGINE COMPLETE - SCANNER WARNINGS"
     elif verified and is_edge and not service_verified:
@@ -1748,6 +1827,18 @@ def get_scan_job_severity_summary(
                     ("At least one host's network scan did not finish", bool(degraded_hosts)),
                 ) if active
             ],
+            # V1.8.0: real problems (amber) vs. scope notes (neutral). An
+            # unauthenticated scan that finished is "Completed", with a note.
+            "warnings": [
+                reason for reason, active in (
+                    ("Scanner reported plugin errors or timeouts", plugin_error_count > 0),
+                    ("Some targets were skipped", skipped_count > 0),
+                    ("At least one host's network scan did not finish", bool(degraded_hosts)),
+                    ("Some checks reported warnings", bool(orch_obj.get("completed_with_warnings"))
+                     and plugin_error_count == 0 and skipped_count == 0 and not degraded_hosts),
+                ) if active
+            ],
+            "notes": _assessment_notes(orch_obj, is_edge=is_edge, service_verified=service_verified),
         },
         "cve_watchlist": (orch if isinstance(orch, dict) else {}).get("cve_watchlist"),
         "scan_template": ((orch if isinstance(orch, dict) else {}).get("scan_template")),

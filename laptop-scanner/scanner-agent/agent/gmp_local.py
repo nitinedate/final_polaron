@@ -1998,6 +1998,10 @@ class LocalOpenVAS:
         self.password = os.environ.get("GVM_PASSWORD") or "admin"
         self.port_profile = (os.environ.get("PORT_PROFILE") or "nexus").strip().lower()
         self.udp_profile = (os.environ.get("UDP_PROFILE") or "priority").strip().lower()
+        # V1.8.0: task_id -> {scan address: authorized target} for self-scans.
+        from agent.self_target import AliasStore
+
+        self.self_scan_aliases = AliasStore()
         plugins_raw = int(os.environ.get("PLUGINS_TIMEOUT_SEC") or 0)
         scanner_raw = int(os.environ.get("SCANNER_PLUGINS_TIMEOUT_SEC") or 0)
         # V45 (Nessus parity). The previous 60 s / 90 s floors were added to stop
@@ -2174,10 +2178,20 @@ class LocalOpenVAS:
     def start_scan(self, *, name: str, targets: list[str], port_range: str | None = None,
                    scan_policy: dict[str, Any] | None = None,
                    max_checks: int | None = None,
-                   apply_udp: bool = True) -> str:
+                   apply_udp: bool = True,
+                   scan_addresses: dict[str, str] | None = None) -> str:
         host_list = [t.strip() for t in targets if t and t.strip()]
         if not host_list:
             raise ValueError("At least one target is required")
+        # V1.8.0: an authorized target that is this scanner's own address is
+        # scanned through the Docker loopback alias (see agent/self_target.py).
+        # Everything reported back stays keyed by the authorized target.
+        aliases = {
+            h: str(scan_addresses[h]).strip()
+            for h in host_list
+            if scan_addresses and str((scan_addresses or {}).get(h) or "").strip()
+        }
+        scan_hosts = [aliases.get(h, h) for h in host_list]
         snapshot = _effective_scan_policy(scan_policy, self.port_profile, self.udp_profile)
         gap = credential_gap(snapshot)
         if gap:
@@ -2269,7 +2283,7 @@ class LocalOpenVAS:
                     credential_status[kind] = "bound; authentication success requires native report evidence"
                 except Exception:
                     credential_status[kind] = "not-tested; local credential reference lookup failed"
-            target_args = {"name": f"{name}-tgt-{int(time.time())}", "hosts": host_list,
+            target_args = {"name": f"{name}-tgt-{int(time.time())}", "hosts": scan_hosts,
                            "port_range": port_range, "alive_test": alive_test}
             try:
                 target = gmp.create_target(**target_args, **bindings)
@@ -2373,6 +2387,11 @@ class LocalOpenVAS:
             task_id = task.get("id")
             if not task_id:
                 raise RuntimeError("Failed to create Greenbone task")
+            if aliases:
+                # Persist before start so a restart mid-scan still maps results back.
+                self._self_scan_store().put(str(task_id), {alias: target for target, alias in aliases.items()})
+                snapshot["scan_addresses"] = dict(aliases)
+                snapshot["self_scan"] = True
             start_response = gmp.start_task(str(task_id))
             snapshot.update({"port_range": port_range, "targets": host_list, "task_id": str(task_id),
                              "config_id": config_id, "scanner_id": scanner_id,
@@ -2432,11 +2451,34 @@ class LocalOpenVAS:
 
         None means the task is missing or GMP did not return a host list. Callers
         must not guess by chunk index — that is how one network's IPs get
-        attached to another job.
+        attached to another job. Self-scan loopback aliases are translated back
+        to the authorized target (V1.8.0).
         """
         tid = str(task_id or "").strip()
         if not tid:
             return None
+        hosts = self._get_task_hosts_raw(tid)
+        mapping = self._self_scan_mapping(tid)
+        if hosts and mapping:
+            return [mapping.get(h, h) for h in hosts]
+        return hosts
+
+    def _self_scan_store(self):
+        store = getattr(self, "self_scan_aliases", None)
+        if store is None:
+            from agent.self_target import AliasStore
+
+            store = self.self_scan_aliases = AliasStore()
+        return store
+
+    def _self_scan_mapping(self, task_id: str) -> dict[str, str]:
+        try:
+            return self._self_scan_store().get(str(task_id or ""))
+        except Exception:
+            log.debug("Self-scan alias lookup failed for %s", task_id, exc_info=True)
+            return {}
+
+    def _get_task_hosts_raw(self, tid: str) -> list[str] | None:
         try:
             with _session(
                 socket_path=self.socket_path,
@@ -2503,6 +2545,10 @@ class LocalOpenVAS:
         include_running_report: bool = False,
     ) -> dict[str, Any]:
         targets = [str(t).strip() for t in (expected_targets or []) if str(t).strip()]
+        # V1.8.0: alias -> authorized target for a self-scan task.
+        alias_to_target = self._self_scan_mapping(task_id)
+        target_to_alias = {target: alias for alias, target in alias_to_target.items()}
+        report_targets = [target_to_alias.get(t, t) for t in targets]
         with _session(**self._session_kwargs()) as gmp:
             status, progress, _ = _task_status(gmp, task_id)
         mapped = "running"
@@ -2553,7 +2599,7 @@ class LocalOpenVAS:
                         vulns, evidence = _report_payload(
                             gmp,
                             task_id,
-                            expected_targets=targets,
+                            expected_targets=report_targets,
                             alive_test=self.alive_test,
                             task_status=status,
                             progress=progress,
@@ -2592,6 +2638,27 @@ class LocalOpenVAS:
         # subsequent coverage retry/cleanup call from another worker thread.
         if mapped in {"completed", "stopped", "failed"}:
             self._terminal_task_ids.add(task_id)
+        if alias_to_target:
+            from agent.self_target import remap
+
+            vulns = remap(vulns, alias_to_target)
+            evidence = remap(evidence, alias_to_target)
+            evidence["self_scan"] = {
+                target: {
+                    "scanned_via": alias,
+                    "view": "local",
+                    "note": (
+                        "This target is the scanner laptop itself. It was scanned through the Docker "
+                        f"loopback address {alias}, which the laptop's own firewall does not filter, so the "
+                        "results show every listening service (local view), not only what other machines can reach."
+                    ),
+                }
+                for alias, target in alias_to_target.items()
+            }
+            for target, info in evidence["self_scan"].items():
+                cov = (evidence.get("host_coverage") or {}).get(target)
+                if isinstance(cov, dict):
+                    cov["self_scan"] = info
         evidence["policy_snapshots"] = {task_id: self.policy_snapshots.get(task_id) or {
             "task_id": task_id, "targets": targets, "snapshot_status": "unknown-resumed-task",
             "reason": "Original task policy was not captured by this build"}}

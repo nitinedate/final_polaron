@@ -401,7 +401,7 @@ function Assert-PublicGatewayBindings {
 }
 
 function Start-PublicHttpsGateway {
-    param([string[]]$ComposeArgs, [string]$PublicIP, [string]$Domain)
+    param([string[]]$ComposeArgs, [string]$PublicIP, [string]$Domain, [switch]$AllowStoredCertificate)
     # This also removes an owned bootstrap left by an earlier interrupted launch.
     # Compose scopes the removal to aetheris-gateway; other projects are untouched.
     Invoke-Docker -Title "Release owned HTTP certificate bootstrap" -DockerArgs (
@@ -410,7 +410,16 @@ function Start-PublicHttpsGateway {
         $ComposeArgs + @("up", "-d", "--no-build", "--pull", "missing", "--force-recreate", "--wait", "--wait-timeout", "180", "gateway", "certbot-renewer"))
     Assert-PublicGatewayBindings -ComposeArgs $ComposeArgs
     Invoke-Docker -Title "Verify running HTTPS nginx" -DockerArgs ($ComposeArgs + @("exec", "-T", "gateway", "nginx", "-t"))
-    Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @("probe", "--identity", $PublicIP) | Out-Null
-    if ($Domain) { Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @("probe", "--identity", $Domain) | Out-Null }
-    Write-Host "HTTPS edge is listening with verified certificates on TCP 443. Product API readiness is checked next." -ForegroundColor Green
+    $trusted = $true
+    try {
+        Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @("probe", "--identity", $PublicIP) | Out-Null
+        if ($Domain) { Invoke-CertificateTool -ComposeArgs $ComposeArgs -ToolArgs @("probe", "--identity", $Domain) | Out-Null }
+    } catch {
+        if (-not $AllowStoredCertificate) { throw }
+        $trusted = $false
+        Write-Host "HTTPS gateway is listening on TCP 443 with the stored certificate. Renewal did not succeed, so browsers may warn until public TCP 80 to $PublicIP reaches this host." -ForegroundColor Yellow
+    }
+    if ($trusted) {
+        Write-Host "HTTPS edge is listening with verified certificates on TCP 443. Product API readiness is checked next." -ForegroundColor Green
+    }
 }

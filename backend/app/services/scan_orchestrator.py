@@ -274,7 +274,8 @@ def scan_job_progress(db, job: dict[str, Any]) -> dict[str, Any]:
             degraded = orch_done.get("degraded_hosts") or []
             if degraded:
                 parts[0] = f"Complete - {len(degraded)} host(s) incomplete"
-            elif orch_done.get("completed_with_warnings") or orch_done.get("network_complete_hosts"):
+            elif orch_done.get("completed_with_warnings"):
+                # V1.8.0: finished network scans alone are not warnings.
                 parts[0] = "Complete with warnings"
             ver = orch_done.get("edge_agent_version")
             build = orch_done.get("edge_agent_build")
@@ -1613,6 +1614,10 @@ def scan_job_target_rows(db, job: dict[str, Any]) -> list[dict[str, Any]]:
                 "warnings": [str(w)[:240] for w in (state.get("warnings") or [])][:20]
                 if isinstance(state.get("warnings"), list) else [],
                 "coverage": state.get("coverage") if isinstance(state.get("coverage"), dict) else {},
+                # V1.8.0: neutral observations and the scanner-laptop self-scan label.
+                "notes": [str(n)[:300] for n in (state.get("notes") or [])][:20]
+                if isinstance(state.get("notes"), list) else [],
+                "self_scan": state.get("self_scan") if isinstance(state.get("self_scan"), dict) else None,
             }
         )
     return out

@@ -797,6 +797,10 @@ def classify_host_coverage(
         verdict = str(cov.get("verdict") or "unknown")
         entry = dict(tp.get(cov_host) or {})
         warnings = [str(w)[:240] for w in (cov.get("warnings") or []) if str(w).strip()]
+        # V1.8.0: observations (firewall dropped every probe, self-scan through
+        # loopback) are notes. They never make a job amber.
+        notes = [str(n)[:300] for n in (cov.get("notes") or []) if str(n).strip()]
+        self_scan = cov.get("self_scan") if isinstance(cov.get("self_scan"), dict) else None
         tcp_ports = [int(p) for p in (cov.get("open_tcp_ports") or []) if str(p).isdigit()]
         udp_ports = [int(p) for p in (cov.get("open_udp_ports") or []) if str(p).isdigit()]
         # V1.6.5: a host whose GMP task is Done, whose port scanner did not
@@ -843,19 +847,31 @@ def classify_host_coverage(
                 prefix = "Compliance audit finished - " + (f"{auth_text}; " if auth_text else "")
             else:
                 prefix = "Completed with warnings - " if warnings else "Completed - "
+            scope = (
+                f"scanner laptop scanned through loopback ({self_scan.get('scanned_via')}), "
+                if self_scan else "network scan finished, "
+            )
             entry["activity"] = (
                 prefix
-                + f"network scan finished, {len(tcp_ports)} open TCP"
+                + scope
+                + f"{len(tcp_ports)} open TCP"
                 + (f" / {len(udp_ports)} UDP" if udp_ports else "")
                 + " port(s)"
                 + (f"; {len(warnings)} check warning(s)" if warnings else "")
-                + "; service checks unverified"
+                + "; unauthenticated checks"
             )[:200]
         else:
             degraded_now.append(str(cov_host))
             entry["status"] = "incomplete"
             entry["activity"] = f"Incomplete — {str(cov.get('reason') or verdict)[:160]}"
         entry["warnings"] = warnings[:20]
+        entry["notes"] = notes[:20]
+        if self_scan:
+            entry["self_scan"] = {
+                "scanned_via": self_scan.get("scanned_via"),
+                "view": self_scan.get("view") or "local",
+                "network_exposure": self_scan.get("network_exposure"),
+            }
         entry["coverage"] = {
             "verdict": verdict,
             "network_scan_complete": bool(network_ok),
@@ -1795,10 +1811,14 @@ def ingest_agent_results(
         orch["degraded_hosts"] = degraded_now
         orch["network_complete_hosts"] = network_complete
         if network_complete:
-            # Network scans finished, but service checks/credentials are not
-            # proven: amber "completed with warnings", never a clean result.
-            orch["completed_with_warnings"] = True
+            # V1.8.0: every host finished its network scan. Without credentials the
+            # result is never "clean", but that is the policy's scope, not a
+            # failure: only real warnings (check warnings, plugin errors, skipped
+            # or degraded hosts) make the job "Completed with warnings".
             orch["clean_eligible"] = False
+            orch["unauthenticated_scan"] = not bool(orch.get("service_scope_verified"))
+            if any((tp.get(h) or {}).get("warnings") for h in network_complete):
+                orch["completed_with_warnings"] = True
         if degraded_now:
             orch["completed_with_warnings"] = True
             orch["clean_eligible"] = False

@@ -80,6 +80,46 @@ def execute(db: Session, sql: str, params: tuple | dict | None = None) -> None:
     db.execute(text(sql), params or {})
 
 
+def _artifact_id_list(ids: list[Any]) -> list[str]:
+    return sorted({str(item) for item in ids if item})
+
+
+def lock_job_artifacts_in_id_order(db: Session, ids: list[Any]) -> None:
+    """Lock artifact rows from lowest id to highest.
+
+    Two pipeline writers that update the same artifacts in different orders
+    deadlock. An ordered lock makes every later UPDATE wait in the same sequence.
+    """
+    clean = _artifact_id_list(ids)
+    if not clean:
+        return
+    db.execute(
+        text(
+            """SELECT id FROM job_artifacts
+               WHERE id = ANY(CAST(:ids AS uuid[]))
+               ORDER BY id
+               FOR UPDATE"""
+        ),
+        {"ids": clean},
+    )
+
+
+def lock_job_artifacts_for_paths(db: Session, job_id: Any, paths: list[Any]) -> None:
+    """Lock one job's artifacts by id, matched from file paths."""
+    clean = [str(path) for path in paths if path]
+    if not clean:
+        return
+    db.execute(
+        text(
+            """SELECT id FROM job_artifacts
+               WHERE job_id = :jid AND file_path = ANY(:paths)
+               ORDER BY id
+               FOR UPDATE"""
+        ),
+        {"jid": job_id, "paths": clean},
+    )
+
+
 def retry_on_deadlock(db: Session, fn: Callable[[], T], *, attempts: int = 5) -> T:
     """Run fn, rolling back and retrying on deadlock / dropped connections.
 

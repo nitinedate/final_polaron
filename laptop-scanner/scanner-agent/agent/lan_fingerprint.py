@@ -40,12 +40,23 @@ def _ip(value: str) -> ipaddress.IPv4Address | None:
     return parsed if isinstance(parsed, ipaddress.IPv4Address) else None
 
 
+# Docker Desktop's own VM network. A gateway reported by the Windows host can
+# only look like this when the "host" is itself inside Docker Desktop.
+_DOCKER_DESKTOP_NETS = (ipaddress.ip_network("192.168.65.0/24"),)
+
+
 def is_docker_nat_fingerprint(fp: dict[str, Any] | None) -> bool:
     if not fp:
         return False
     gw = _ip(str(fp.get("gateway") or ""))
     if gw is None:
         return True
+    if str(fp.get("source") or "").strip().lower() == "host":
+        # V1.8.0: the host-side writer reports the Windows default gateway, which
+        # is never a Docker bridge. Real LANs inside 172.16.0.0/12 (for example an
+        # iPhone hotspot, 172.20.10.1) were wrongly treated as Docker NAT, which
+        # switched off roam detection on those networks.
+        return any(gw in net for net in _DOCKER_DESKTOP_NETS)
     return any(gw in net for net in _DOCKER_NETS)
 
 
@@ -56,11 +67,12 @@ def _normalize(fp: dict[str, Any]) -> dict[str, str]:
         ip = _ip(gateway)
         if ip is not None:
             subnet = str(ipaddress.ip_network(f"{ip}/24", strict=False))
-    return {
+    out = {
         "gateway": gateway,
         "subnet": subnet,
         "source": str(fp.get("source") or "").strip(),
     }
+    return out
 
 
 def _from_file() -> dict[str, str] | None:

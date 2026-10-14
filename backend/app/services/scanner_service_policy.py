@@ -92,6 +92,8 @@ SNAPSHOT_FIELDS = {
     "require_families",
     "disabled_services",
     "service_port_policy_version",
+    "scan_addresses",
+    "self_scan",
 }
 SCAN_PURPOSES = {"vulnerability", "ping_discovery", "credential_validation", "compliance"}
 _NAME_FILTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/()+-]{0,59}$")

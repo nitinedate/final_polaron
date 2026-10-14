@@ -49,6 +49,14 @@ export interface ScanPolicy {
   scanner_id: string | null;
   settings_json: Record<string, unknown> | null;
   template_key?: string | null;
+  /** V1.8.0 */
+  template_name?: string | null;
+  vendor?: "nexpose" | "nessus" | "aetheris" | "custom" | string | null;
+  category?: string | null;
+  requires_credentials?: string[];
+  credentials_missing?: boolean;
+  is_builtin?: boolean;
+  lifecycle_state?: string;
   compliance_framework: string | null;
   created_by: string | null;
   created_at: string;
@@ -64,16 +72,23 @@ export interface ScanPolicyCreate {
   template_key?: string | null;
 }
 
-/** Nessus-equivalent scan template (GET /api/scan-policy-templates). */
+/** Nexpose/Nessus-equivalent scan template (GET /api/scan-policy-templates). */
 export interface ScanPolicyTemplate {
   key: string;
   name: string;
+  /** V1.8.0: which scanner's built-in template this mirrors */
+  vendor?: "nexpose" | "nessus" | "aetheris" | string;
   /** null for Aetheris threat checks that have no current Nessus template */
   nessus_template: string | null;
+  /** Rapid7 InsightVM / Nexpose built-in template name, when vendor is nexpose */
+  nexpose_template?: string | null;
+  /** created automatically as a ready-to-use policy */
+  seed_as_builtin?: boolean;
+  reference?: string | null;
   category: "discovery" | "vulnerability" | "compliance" | "threat" | string;
   description: string;
   compliance_framework?: string | null;
-  nessus_reference: string;
+  nessus_reference: string | null;
   deviations: string;
   settings: {
     port_profile?: string;
@@ -174,6 +189,8 @@ export interface ScanJob {
 
 export interface ScanJobCreate {
   policy_id?: string | null;
+  /** V1.8.0: launch straight from a built-in template */
+  template_key?: string | null;
   scanner_id?: string | null;
   scheduled_at?: string | null;
   authorization_ref?: string | null;
@@ -233,6 +250,14 @@ export interface ScanJobTargetProgress {
   engines?: Record<string, string>;
   excluded?: boolean;
   warnings?: string[];
+  /** V1.8.0: neutral observations (not warnings) */
+  notes?: string[];
+  /** V1.8.0: this IP is the scanner laptop, scanned through the Docker loopback */
+  self_scan?: {
+    scanned_via?: string;
+    view?: string;
+    network_exposure?: { open?: number[]; filtered_count?: number; closed_count?: number } | null;
+  } | null;
   coverage?: {
     verdict?: string;
     network_scan_complete?: boolean;
@@ -306,6 +331,10 @@ export interface ScanJobSeveritySummary {
     network_complete_hosts?: string[];
     degraded_hosts?: string[];
     clean_blockers?: string[];
+    /** V1.8.0: real problems that make the job amber */
+    warnings?: string[];
+    /** V1.8.0: scope explanations (unauthenticated scan, self-scan, firewall) */
+    notes?: string[];
   };
 }
 

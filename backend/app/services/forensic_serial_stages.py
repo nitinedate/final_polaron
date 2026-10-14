@@ -8,7 +8,14 @@ import os
 RAG_CHUNK_DB_BATCH = int(os.environ.get("RAG_CHUNK_DB_BATCH", "6000") or 6000)
 from contextlib import ExitStack
 
-from app.db.sql_helpers import execute, fetchall, fetchone
+from app.db.sql_helpers import (
+    execute,
+    fetchall,
+    fetchone,
+    lock_job_artifacts_for_paths,
+    lock_job_artifacts_in_id_order,
+    retry_on_deadlock,
+)
 from app.services.forensic_serial_pipeline import StageWaiting
 from app.services.forensic_serial_policy import (
     CHUNK_POLICY,
@@ -111,6 +118,7 @@ def _materialize_full(db, job_id):
     result = materialize_index_entries(
         db, job_id, entries, update_status=True, phase1_filter=False
     )
+    db.commit()
     for start in range(0, len(entries), 1000):
         values = [
             (
@@ -128,15 +136,19 @@ def _materialize_full(db, job_id):
             )
             for entry in entries[start : start + 1000]
         ]
-        with db.connection().connection.cursor() as cur:
-            execute_values(
-                cur,
-                """UPDATE job_artifacts AS ja SET metadata=COALESCE(ja.metadata,'{}'::jsonb) || v.meta::jsonb
-                FROM (VALUES %s) AS v(job_id,path,meta) WHERE ja.job_id=v.job_id::uuid AND ja.file_path=v.path""",
-                values,
-                page_size=500,
-            )
-        db.commit()
+        def _write_part_metadata() -> None:
+            lock_job_artifacts_for_paths(db, job_id, [item[1] for item in values])
+            with db.connection().connection.cursor() as cur:
+                execute_values(
+                    cur,
+                    """UPDATE job_artifacts AS ja SET metadata=COALESCE(ja.metadata,'{}'::jsonb) || v.meta::jsonb
+                    FROM (VALUES %s) AS v(job_id,path,meta) WHERE ja.job_id=v.job_id::uuid AND ja.file_path=v.path""",
+                    values,
+                    page_size=500,
+                )
+            db.commit()
+
+        retry_on_deadlock(db, _write_part_metadata)
     report_progress(
         db,
         job_id,
@@ -349,16 +361,23 @@ def _recovery(db, job_id):
             if hint:
                 updates.append((str(row["id"]), json.dumps(hint)))
         if updates:
-            with db.connection().connection.cursor() as cur:
-                execute_values(
-                    cur,
-                    """UPDATE job_artifacts AS ja
-                       SET metadata=v.hint::jsonb || COALESCE(ja.metadata,'{}'::jsonb), updated_at=NOW()
-                       FROM (VALUES %s) AS v(id,hint)
-                       WHERE ja.id=v.id::uuid""",
-                    updates,
-                    page_size=1000,
-                )
+            ordered_updates = sorted(updates, key=lambda item: item[0])
+
+            def _write_recovery_hints() -> None:
+                lock_job_artifacts_in_id_order(db, [item[0] for item in ordered_updates])
+                with db.connection().connection.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """UPDATE job_artifacts AS ja
+                           SET metadata=v.hint::jsonb || COALESCE(ja.metadata,'{}'::jsonb), updated_at=NOW()
+                           FROM (VALUES %s) AS v(id,hint)
+                           WHERE ja.id=v.id::uuid""",
+                        ordered_updates,
+                        page_size=1000,
+                    )
+                db.commit()
+
+            retry_on_deadlock(db, _write_recovery_hints)
             tagged += len(updates)
         total += len(rows)
         last = str(rows[-1]["id"])
@@ -656,13 +675,8 @@ def _chunk(db, job_id, *, mobile=False):
         if not rows:
             break
         rows = [dict(row) for row in rows]
+        db.commit()
         paths = [r["file_path"] for r in rows]
-        execute(
-            db,
-            """DELETE FROM rag_chunks WHERE job_id=:jid AND file_path=ANY(:paths)
-            AND chunk_type IN ('evidence','evidence_skip')""",
-            {"jid": job_id, "paths": paths},
-        )
         # Pure text chunk generation is CPU-only and carries no DB/CUDA handles.
         # Run it in independent processes while keeping persistence in this one
         # authoritative stage writer so parallel workers cannot interleave DB writes.
@@ -671,40 +685,52 @@ def _chunk(db, job_id, *, mobile=False):
         chunks = []
         for out in bounded_process_map(_full_text_chunks, (rows[i::partitions] for i in range(partitions))):
             chunks.extend(out)
-        if chunks:
-            values = [
-                (
-                    job_id,
-                    path,
-                    idx,
-                    content,
-                    aid,
-                    json.dumps(
-                        {"job_artifact_id": artifact_id, "serial_pipeline": True, "chunk_policy":CHUNK_POLICY}
-                    ),
-                )
-                for artifact_id, path, idx, content, aid in chunks
-            ]
-            with db.connection().connection.cursor() as cur:
-                execute_values(
-                    cur,
-                    """INSERT INTO rag_chunks(job_id,file_path,chunk_index,content,artifact_id,chunk_type,metadata)
-                    VALUES %s""",
-                    values,
-                    template="(%s,%s,%s,%s,%s,'evidence',%s::jsonb)",
-                    page_size=500,
-                )
         ids = [str(row["id"]) for row in rows]
         with_text = {chunk[0] for chunk in chunks}
         no_text = [artifact_id for artifact_id in ids if artifact_id not in with_text]
-        execute(
-            db,
-            """UPDATE job_artifacts SET metadata=COALESCE(metadata,'{}'::jsonb) ||
-            jsonb_build_object('serial_chunked',true,'serial_chunk_policy',CAST(:policy AS text),'serial_chunk_status',
-                CASE WHEN id=ANY(CAST(:no_text AS uuid[])) THEN 'no_text' ELSE 'text' END)
-            WHERE id=ANY(CAST(:ids AS uuid[]))""",
-            {"ids": ids, "no_text": no_text,"policy":CHUNK_POLICY},
-        )
+        chunk_values = [
+            (
+                job_id,
+                path,
+                idx,
+                content,
+                aid,
+                json.dumps(
+                    {"job_artifact_id": artifact_id, "serial_pipeline": True, "chunk_policy": CHUNK_POLICY}
+                ),
+            )
+            for artifact_id, path, idx, content, aid in chunks
+        ]
+
+        def _persist_chunks() -> None:
+            execute(
+                db,
+                """DELETE FROM rag_chunks WHERE job_id=:jid AND file_path=ANY(:paths)
+                AND chunk_type IN ('evidence','evidence_skip')""",
+                {"jid": job_id, "paths": paths},
+            )
+            if chunk_values:
+                with db.connection().connection.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """INSERT INTO rag_chunks(job_id,file_path,chunk_index,content,artifact_id,chunk_type,metadata)
+                        VALUES %s""",
+                        chunk_values,
+                        template="(%s,%s,%s,%s,%s,'evidence',%s::jsonb)",
+                        page_size=500,
+                    )
+            lock_job_artifacts_in_id_order(db, ids)
+            execute(
+                db,
+                """UPDATE job_artifacts SET metadata=COALESCE(metadata,'{}'::jsonb) ||
+                jsonb_build_object('serial_chunked',true,'serial_chunk_policy',CAST(:policy AS text),'serial_chunk_status',
+                    CASE WHEN id=ANY(CAST(:no_text AS uuid[])) THEN 'no_text' ELSE 'text' END)
+                WHERE id=ANY(CAST(:ids AS uuid[]))""",
+                {"ids": ids, "no_text": no_text, "policy": CHUNK_POLICY},
+            )
+            db.commit()
+
+        retry_on_deadlock(db, _persist_chunks)
         done += len(rows)
         last = str(rows[-1]["id"])
         report_progress(
