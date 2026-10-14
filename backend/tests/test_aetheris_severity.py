@@ -6,11 +6,16 @@ from app.services.aetheris_severity import (
 
 
 def test_aetheris_cvss_bands():
+    assert severity_from_cvss(10.0) == "critical"
     assert severity_from_cvss(9.0) == "critical"
-    assert severity_from_cvss(8.9) == "high"
-    assert severity_from_cvss(7.0) == "high"
-    assert severity_from_cvss(6.9) == "medium"
+    assert severity_from_cvss(8.0) == "critical"
+    assert severity_from_cvss(7.99) == "high"
+    assert severity_from_cvss(7.9) == "high"
+    assert severity_from_cvss(6.0) == "high"
+    assert severity_from_cvss(5.99) == "medium"
+    assert severity_from_cvss(5.9) == "medium"
     assert severity_from_cvss(4.0) == "medium"
+    assert severity_from_cvss(3.99) == "low"
     assert severity_from_cvss(3.9) == "low"
     assert severity_from_cvss(0.1) == "low"
     assert severity_from_cvss(0.0) == "info"

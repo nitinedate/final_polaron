@@ -7,6 +7,8 @@ VULN_ALLOW_STUB_FINDINGS=true is explicitly set.
 
 from __future__ import annotations
 
+from app.services.aetheris_severity import severity_from_cvss
+
 import ipaddress
 import json
 import logging
@@ -24,15 +26,7 @@ log = logging.getLogger("multi_scanner")
 
 
 def _severity_label(score: float) -> str:
-    if score >= 9.0:
-        return "critical"
-    if score >= 7.0:
-        return "high"
-    if score >= 4.0:
-        return "medium"
-    if score > 0:
-        return "low"
-    return "info"
+    return severity_from_cvss(score)
 
 
 def _web_candidates(target: str) -> list[str]:

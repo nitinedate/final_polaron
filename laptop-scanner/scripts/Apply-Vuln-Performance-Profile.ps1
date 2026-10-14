@@ -14,29 +14,30 @@ if (-not (Test-Path $EnvFile)) {
 
 $settings = [ordered]@{
     'AGENT_VERSION' = '1.2.20'
-    'PORT_PROFILE' = 'fast'
+    'PORT_PROFILE' = 'full'
     'MAX_CONCURRENT_SCAN_JOBS' = '1'
     'SCAN_IP_PARALLELISM' = 'auto'
     'SCAN_IP_MAX_PARALLELISM' = '10'
     'GVM_GLOBAL_MAX_HOSTS' = '10'
     'GVM_MAX_HOSTS' = '1'
     'GVM_MAX_CHECKS' = '6'
-    'SKIP_UNREACHABLE_TARGETS' = 'true'
+    'SKIP_UNREACHABLE_TARGETS' = 'false'
     'REACHABILITY_TIMEOUT_SEC' = '0.35'
     'PORT_DISCOVERY_TIMEOUT_SEC' = '0.35'
     'PORT_DISCOVERY_WORKERS_PER_HOST' = '12'
     'REACHABILITY_UNKNOWN_POLICY' = 'scan'
     'PLUGINS_TIMEOUT_SEC' = '900'
     'SCANNER_PLUGINS_TIMEOUT_SEC' = '1800'
-    'GVM_OPTIMIZE_TEST' = 'yes'
+    'GVM_OPTIMIZE_TEST' = 'no'
     'GVM_SAFE_CHECKS' = 'yes'
     'GVM_EXPAND_VHOSTS' = 'no'
     'GVM_TEST_EMPTY_VHOST' = 'no'
     'GVM_CHECKS_READ_TIMEOUT' = '8'
     'GVM_TIMEOUT_RETRY' = '1'
     'GVM_OPEN_SOCK_MAX_ATTEMPTS' = '2'
-    'MAX_IP_SCAN_RUNTIME_SEC' = '3600'
-    'MAX_SCAN_RUNTIME_SEC' = '7200'
+    'MAX_IP_SCAN_RUNTIME_SEC' = '0'
+    'MAX_SCAN_RUNTIME_SEC' = '0'
+    'SCAN_IP_BUDGET_SEC' = '0'
     'HIGH_PROGRESS_WARN_SEC' = '300'
 }
 
@@ -55,4 +56,4 @@ foreach ($key in $settings.Keys) {
     if (-not $matched) { [void]$lines.Add("$key=$value") }
 }
 Set-Content -LiteralPath $EnvFile -Value $lines -Encoding UTF8
-Write-Host "Applied vulnerability Fast profile to $EnvFile without changing credentials." -ForegroundColor Green
+Write-Host "Applied vulnerability full-coverage profile to $EnvFile without changing credentials." -ForegroundColor Green

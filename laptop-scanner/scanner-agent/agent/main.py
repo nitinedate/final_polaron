@@ -21,6 +21,7 @@ from agent.api_client import CentralApi
 from agent.capacity import IP_WORKERS_MIN, probe_laptop_capacity
 from agent.gmp_local import LocalOpenVAS
 from agent.ip_audit import emit_ip_event
+from agent.service_audit import emit_service_plan, emit_service_results
 from agent.ip_semaphore import AdaptiveIPSemaphore
 from agent.job_identity import (
     host_set,
@@ -754,19 +755,16 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     degraded_retries: dict[int, int] = {}
     preprobe_by_host: dict[str, list[int]] = {}
     degraded_retry_budget = max(0, int(os.environ.get("SCAN_DEGRADED_RETRY") or 0))
-    # A 10-minute forced stop was ending full/Nexus scans prematurely while
-    # preserving partial findings as "100% done". Disabled by default; an
-    # operator can explicitly set a positive budget for bounded partial scans.
-    try:
-        configured_ip_budget = int(os.environ.get("SCAN_IP_BUDGET_SEC") or "0")
-    except ValueError:
-        configured_ip_budget = 0
-    ip_budget_sec = max(120, configured_ip_budget) if configured_ip_budget > 0 else 0
-    if ip_budget_sec:
+    # Historical .env files frequently retain SCAN_IP_BUDGET_SEC=600.  It is
+    # now a deprecated, diagnostic-only setting.  Never stop a Greenbone task,
+    # harvest its report or assert 100% because of this legacy budget.
+    old_ip_budget = (os.environ.get("SCAN_IP_BUDGET_SEC") or "").strip()
+    if old_ip_budget not in {"", "0"}:
         log.warning(
-            "SCAN_IP_BUDGET_SEC=%ds: a running host will be interrupted at this limit; "
-            "findings will be partial and coverage unverified. Set to 0 for a full assessment.",
-            ip_budget_sec,
+            "LEGACY_IP_BUDGET_IGNORED: SCAN_IP_BUDGET_SEC=%s is obsolete; "
+            "no per-IP Nexus time cutoff will be applied. Remove it from "
+            ".env or set it to 0. Engine completion requires a terminal task state.",
+            old_ip_budget[:30],
         )
     in_flight: dict[int, str] = {}
     lane_task_ids: dict[int, list[str]] = {}
@@ -906,7 +904,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             checks,
             len(catalog.get("services") or []),
         )
-        _log_service_lane(host, idx, 0, catalog)
+        # SERVICE_PLAN events are emitted only after Greenbone accepts the task.
         start_args = {
             "name": f"edge-{job_id[:8]}-c{idx}",
             "targets": chunk,
@@ -944,6 +942,10 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             job_id, host, "started", task_id=",".join(lane_task_ids.get(idx) or [tid]),
             service_lanes=len(lane_task_ids.get(idx) or [tid]), chunk_index=idx,
         )
+        try:
+            emit_service_plan(job_id, host, str(tid))
+        except Exception:
+            log.warning("Could not emit service plan for %s", host, exc_info=True)
         return tid
 
     def _log_service_lane(host: str, chunk_index: int, lane_index: int, lane: dict[str, Any]) -> None:
@@ -1124,63 +1126,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         finished_idxs.append(idx)
                         continue
 
-                    elapsed = time.monotonic() - ip_started_mono.get(idx, time.monotonic())
-                    if st == "running" and ip_budget_sec > 0 and elapsed >= ip_budget_sec:
-                        log.warning(
-                            "IP %s reached the %d minute Nexus budget; stopping its service lanes",
-                            host,
-                            max(1, ip_budget_sec // 60),
-                        )
-                        lane_ids = list(_ids_for(idx))
-                        harvested = None
-                        try:
-                            from agent.service_lanes import merge_service_lane_polls
-
-                            parts = [
-                                openvas.poll(
-                                    one,
-                                    expected_targets=chunks[idx],
-                                    include_running_report=True,
-                                )
-                                for one in lane_ids
-                            ]
-                            harvested = merge_service_lane_polls(parts) if parts else None
-                        except Exception:
-                            log.warning("Could not read the Nexus budget report for %s", host, exc_info=True)
-                        for one in lane_ids:
-                            try:
-                                openvas.stop(one)
-                            except Exception:
-                                log.warning("Failed to stop service lane %s at the Nexus budget", one, exc_info=True)
-                        if not isinstance(harvested, dict):
-                            harvested = dict(details)
-                        # Engine cancellation under an explicitly configured
-                        # deadline is not a successful, full-coverage completion.
-                        harvested["status"] = "completed"
-                        harvested["progress"] = 100
-                        evidence = dict(harvested.get("evidence") or {})
-                        evidence["time_budget_sec"] = ip_budget_sec
-                        evidence["assessment_complete"] = False
-                        evidence["assessment_verdict"] = "degraded_time_budget"
-                        host_cov = (evidence.get("host_coverage") or {}).get(host)
-                        if not isinstance(host_cov, dict):
-                            host_cov = {}
-                            evidence.setdefault("host_coverage", {})[host] = host_cov
-                        host_cov.update({
-                            "verdict": "degraded_time_budget",
-                            "coverage_complete": False,
-                            "service_checks_verified": False,
-                            "reason": f"Scanner stopped at configured per-IP time budget ({ip_budget_sec}s); "
-                                      "partial findings retained, service coverage unverified",
-                        })
-                        harvested["evidence"] = evidence
-                        harvested["_nexus_budget_complete"] = True
-                        details = harvested
-                        st = "completed"
-                        emit_ip_event(
-                            job_id, host, "nexus_budget", task_id=tid, status="completed",
-                            progress=progress_i, duration_sec=round(elapsed, 3), chunk_index=idx,
-                        )
+                    # Do not convert running tasks to completed because elapsed
+                    # time reached a per-IP budget.  The old 600-second Nexus
+                    # branch stopped service lanes and uploaded partial reports.
+                    # Poll until GMP reports Done/Stopped/Failed, unless the
+                    # separately configured job-wide safety ceiling is reached.
 
                     if st == "running" and high_progress_stall_sec > 0:
                         pct_i = int(float(details.get("progress") or 0))
@@ -1276,6 +1226,10 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             error=err, vulnerabilities=len(details.get("vulnerabilities") or []),
                             duration_sec=round(time.monotonic() - ip_started_mono.get(idx, time.monotonic()), 3),
                         )
+                        try:
+                            emit_service_results(job_id, host, details, str(tid or ""))
+                        except Exception:
+                            log.warning("Service audit failed for %s; original scan result retained", host, exc_info=True)
                         preserved = list(details.get("vulnerabilities") or [])
                         normalized = _skipped_ip_details(host, f"scan_{st}", error=err, task_id=tid)
                         normalized["vulnerabilities"] = preserved
@@ -1289,7 +1243,6 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             cov_verdict = str(cov.get("verdict") or "unverified")
                             if (
                                 cov_verdict.startswith("degraded")
-                                and not details.get("_nexus_budget_complete")
                                 and degraded_retries.get(idx, 0) < degraded_retry_budget
                             ):
                                 degraded_retries[idx] = degraded_retries.get(idx, 0) + 1
@@ -1327,6 +1280,10 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                 )
                             done_details[idx] = details
                             finished_idxs.append(idx)
+                            try:
+                                emit_service_results(job_id, host, details, str(tid or ""))
+                            except Exception:
+                                log.warning("Service audit failed for %s; original scan result retained", host, exc_info=True)
                             emit_ip_event(
                                 job_id, host, "completed", task_id=tid, progress=100,
                                 coverage=cov_verdict, agent_build=_agent_build(),

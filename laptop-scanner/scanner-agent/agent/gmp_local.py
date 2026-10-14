@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
+from agent.severity_policy import cvss_severity
 from agent.service_policy import analyze_services, effective_policy, port_numbers
 
 log = logging.getLogger("scanner_agent.gmp")
@@ -161,15 +162,7 @@ _SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 def _severity_from_cvss(cvss: float) -> str:
-    if cvss >= 9.0:
-        return "critical"
-    if cvss >= 7.0:
-        return "high"
-    if cvss >= 4.0:
-        return "medium"
-    if cvss > 0:
-        return "low"
-    return "info"
+    return cvss_severity(cvss).lower().replace("none", "info")
 
 
 def _canonical_severity(threat: str | None, cvss: float) -> str:

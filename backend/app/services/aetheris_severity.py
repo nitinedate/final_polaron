@@ -56,15 +56,38 @@ def choose_cvss_score(row: dict[str, Any], basis: str | None = None) -> tuple[fl
     return 0.0, "unavailable", candidates
 
 
+# Customer-defined assessment bands (not the standard CVSS qualitative bands).
+# The numeric CVSS vector and its version remain unchanged for traceability.
+DEFAULT_SEVERITY_THRESHOLDS = {"critical": 8.0, "high": 6.0, "medium": 4.0, "low": 0.1}
+
+
+def severity_thresholds() -> dict[str, float]:
+    result: dict[str, float] = {}
+    for label, default in DEFAULT_SEVERITY_THRESHOLDS.items():
+        raw = os.environ.get(f"VULN_SEVERITY_{label.upper()}_MIN", str(default))
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid severity threshold for {label}: {raw!r}") from exc
+        if not math.isfinite(number) or not 0 <= number <= 10:
+            raise ValueError(f"Invalid severity threshold for {label}: {raw!r}")
+        result[label] = number
+    if not (result["critical"] > result["high"] > result["medium"] > result["low"] > 0):
+        raise ValueError("Vulnerability severity thresholds must be strictly descending and positive")
+    return result
+
+
 def severity_from_cvss(cvss: float, basis: str | None = None) -> str:
+    """Apply the configured organization bands, uniformly for CVSS v2/v3/v4.
+
+    ``basis`` selects score provenance upstream; it does not change the
+    organization-specific severity thresholds.
+    """
     score = valid_score(cvss) or 0.0
-    if score >= (10.0 if severity_basis(basis) == "cvss_v2" else 9.0):
-        return "critical"
-    if score >= 7.0:
-        return "high"
-    if score >= 4.0:
-        return "medium"
-    return "low" if score > 0 else "info"
+    for label, minimum in severity_thresholds().items():
+        if score >= minimum:
+            return label
+    return "info"
 
 
 def apply_policy_floors(synopsis: str, severity: str) -> tuple[str, None]:
@@ -78,13 +101,14 @@ def classify_severity(*, cvss: float = 0.0, synopsis: str = "", raw_severity: An
 
 
 def aetheris_severity_sql(alias: str = "f") -> str:
+    """Exactly mirror Python thresholds when filtering/counting stored findings."""
     prefix = f"{alias}." if alias else ""
-    basis = severity_basis()
-    source = f"COALESCE({prefix}risk_factors_json->>'severity_basis', '{basis}')"
+    bounds = severity_thresholds()
+    # All values are validated floats, not untrusted SQL fragments.
     return f"""CASE
-  WHEN COALESCE({prefix}cvss, 0) >= CASE WHEN {source}='cvss_v2' THEN 10 ELSE 9 END THEN 'critical'
-  WHEN COALESCE({prefix}cvss, 0) >= 7 THEN 'high'
-  WHEN COALESCE({prefix}cvss, 0) >= 4 THEN 'medium'
-  WHEN COALESCE({prefix}cvss, 0) > 0 THEN 'low'
+  WHEN COALESCE({prefix}cvss, 0) >= {bounds['critical']:g} THEN 'critical'
+  WHEN COALESCE({prefix}cvss, 0) >= {bounds['high']:g} THEN 'high'
+  WHEN COALESCE({prefix}cvss, 0) >= {bounds['medium']:g} THEN 'medium'
+  WHEN COALESCE({prefix}cvss, 0) >= {bounds['low']:g} THEN 'low'
   ELSE 'info'
 END"""

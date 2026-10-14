@@ -7,6 +7,8 @@ Critical/High coverage is the primary gate, while all severities are reported.
 
 from __future__ import annotations
 
+from app.services.aetheris_severity import severity_from_cvss
+
 import csv
 import io
 import re
@@ -38,15 +40,7 @@ def _float(value: Any) -> float:
 
 
 def _severity_from_cvss(score: float) -> str:
-    if score >= 9.0:
-        return "critical"
-    if score >= 7.0:
-        return "high"
-    if score >= 4.0:
-        return "medium"
-    if score > 0:
-        return "low"
-    return "info"
+    return severity_from_cvss(score)
 
 
 def _severity(raw: Any, cvss: float) -> str:

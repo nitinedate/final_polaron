@@ -13,7 +13,10 @@ class EnvCatalogTests(unittest.TestCase):
         self.assertEqual(len(vuln_ports.service_registry()), 52)
 
     def test_cvss_boundaries(self):
-        self.assertEqual([cvss_severity(x) for x in (0,0.1,4,7,9)], ["None","Low","Medium","High","Critical"])
+        self.assertEqual(
+            [cvss_severity(x) for x in (0, 0.1, 3.9, 4, 5.9, 6, 7.9, 8, 10)],
+            ["None", "Low", "Low", "Medium", "Medium", "High", "High", "Critical", "Critical"],
+        )
 
     def test_extra_tcp_and_udp_config(self):
         with patch.dict(os.environ, {"SERVICE_EXTRA_TCP_PORTS":"12345", "SERVICE_EXTRA_UDP_PORTS":"12346"}):

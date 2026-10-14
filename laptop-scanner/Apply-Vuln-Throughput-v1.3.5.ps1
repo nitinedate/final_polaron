@@ -17,16 +17,17 @@ $updates = [ordered]@{
     'SCAN_SLO_MIN_HOSTS_PER_HOUR' = '15'
     'SCAN_SLO_HOSTS_PER_HOUR' = '18'
     'SCAN_EXPECTED_HOST_MINUTES' = '20'
-    'PORT_PROFILE' = 'fast'
+    'PORT_PROFILE' = 'full'
     'PORT_DISCOVERY_ENABLED' = 'true'
     'PORT_DISCOVERY_TIMEOUT_SEC' = '0.25'
     'PORT_DISCOVERY_WORKERS' = '32'
     'GVM_MAX_HOSTS' = '1'
     'GVM_MAX_CHECKS' = '8'
-    'GVM_OPTIMIZE_TEST' = 'yes'
+    'GVM_OPTIMIZE_TEST' = 'no'
     'GVM_SAFE_CHECKS' = 'yes'
     'SKIP_UNREACHABLE_TARGETS' = 'false'
     'MAX_SCAN_RUNTIME_SEC' = '0'
+    'SCAN_IP_BUDGET_SEC' = '0'
 }
 
 $text = Get-Content -LiteralPath $envFile -Raw
@@ -47,7 +48,7 @@ try {
     docker compose build --no-cache scanner-agent
     docker compose up -d --force-recreate scanner-agent
     Write-Host ''
-    Write-Host 'v1.3.5 15-18 IP/hour profile applied.' -ForegroundColor Green
+    Write-Host 'Full-coverage profile applied. Throughput depends on live services/NVTs.' -ForegroundColor Green
     Write-Host 'Watch: docker compose logs -f scanner-agent'
 } finally {
     Pop-Location

@@ -2,10 +2,12 @@ from app.services.aetheris_severity import choose_cvss_score, severity_from_cvss
 from app.services.nessus_report import parse_nessus_csv_findings
 
 
-def test_nessus_cvss_v2_and_v3_critical_bands_differ():
-    assert severity_from_cvss(9.0, "cvss_v3") == "critical"
-    assert severity_from_cvss(9.0, "cvss_v2") == "high"
-    assert severity_from_cvss(10.0, "cvss_v2") == "critical"
+def test_custom_bands_same_for_cvss_versions():
+    # CVSS version still controls score provenance, not our custom bands.
+    for basis in ("cvss_v2", "cvss_v3", "cvss_v4"):
+        assert severity_from_cvss(7.9, basis) == "high"
+        assert severity_from_cvss(8.0, basis) == "critical"
+        assert severity_from_cvss(10.0, basis) == "critical"
 
 
 def test_configured_basis_is_not_max_across_cvss_versions():
