@@ -1099,6 +1099,20 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                         {policy.template_name ? <p className="mt-2">Template: {policy.template_name}{policy.scan_config_name ? ` · Greenbone config: ${policy.scan_config_name}` : ""}</p> : null}
                         {policy.port_list_status ? <p>Port list: {policy.port_list_status}</p> : null}
                         {policy.family_scope_status ? <p>Check families: {policy.family_scope_status}</p> : null}
+                        {policy.performance ? (
+                          <p>
+                            Speed: {policy.performance === "fast" ? "Fast" : "Standard"}
+                            {policy.performance_status?.checks_read_timeout ? ` · ${policy.performance_status.checks_read_timeout} s socket timeout` : ""}
+                            {policy.performance_status?.max_checks ? ` · ${policy.performance_status.max_checks} checks per host` : ""}
+                            {policy.performance_status?.nmap_timing && policy.performance_status.nmap_timing !== "unchanged" ? ` · Nmap timing: ${policy.performance_status.nmap_timing}` : ""}
+                          </p>
+                        ) : null}
+                        {policy.nvt_timeout_caps?.applied ? (
+                          <p>
+                            {policy.nvt_timeout_caps.applied} check(s) that timed out on earlier scans were limited to {policy.nvt_timeout_caps.cap_sec} s:{" "}
+                            <span className="break-all font-mono">{policy.nvt_timeout_caps.oids.join(", ")}</span>
+                          </p>
+                        ) : null}
                         {typeof policy.tcp_port_count === "number" ? <p>Scanned: {policy.tcp_port_count} TCP / {policy.udp_port_count ?? 0} UDP ports</p> : null}
                         <p className="mt-2 break-all">Ports: {policy.port_range || "Original scope not captured"}</p>
                         <p className="break-all font-mono">SHA-256: {policy.configuration_sha256 || "Unavailable"}</p>

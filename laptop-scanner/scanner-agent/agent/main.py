@@ -779,6 +779,12 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     ip_started_mono: dict[int, float] = {}
     ip_last_state: dict[int, tuple[str, int]] = {}
     ip_progress_since: dict[int, tuple[int, float]] = {}
+    # V1.6.6 stalled-task watchdog: (gmp_status, progress) and when it last changed.
+    ip_change_since: dict[int, tuple[tuple[str, int], float]] = {}
+    ip_stalled: dict[int, dict[str, Any]] = {}
+    from agent.scan_performance import classify_stall, hang_registry, stall_limits
+
+    stall_cfg = stall_limits()
     slot_sem = AdaptiveIPSemaphore(max_permits=int(capacity.get("configured_ceiling") or 10))
 
     for idx, tid in resume_map.items():
@@ -1126,6 +1132,36 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             progress=progress_i, chunk_index=idx,
                         )
 
+                    # --- V1.6.6 stalled-task watchdog --------------------------------
+                    # NVT hangs are bounded by plugins_timeout inside OpenVAS. This
+                    # only acts when a task makes no progress for many multiples
+                    # of that limit (scanner/process stuck, task never started).
+                    gmp_state = str(details.get("gmp_status") or st).strip().lower()
+                    change_key = (gmp_state, progress_i)
+                    now_w = time.monotonic()
+                    seen = ip_change_since.get(idx)
+                    if seen is None or seen[0] != change_key:
+                        ip_change_since[idx] = (change_key, now_w)
+                    elif st == "running":
+                        unchanged_w = now_w - seen[1]
+                        stall_reason = classify_stall(gmp_state, progress_i, unchanged_w, stall_cfg)
+                        prior = ip_stalled.get(idx)
+                        if stall_reason and (prior is None or now_w - prior["stop_at"] >= 300):
+                            ip_stalled[idx] = {"reason": stall_reason, "stop_at": now_w,
+                                               "progress": progress_i, "gmp_status": gmp_state}
+                            log.error(
+                                "Job %s IP %s STALLED: %s. Stopping task %s; partial findings are kept "
+                                "and the host is reported incomplete (stalled), not completed",
+                                job_id, host, stall_reason, tid,
+                            )
+                            emit_ip_event(job_id, host, "stalled", task_id=tid, reason=stall_reason,
+                                          progress=progress_i, gmp_status=gmp_state, chunk_index=idx)
+                            for one in _ids_for(idx):
+                                try:
+                                    openvas.stop(one)
+                                except Exception:
+                                    log.warning("stop_task for stalled task %s failed", one, exc_info=True)
+
                     skip_reason = str(details.get("_agent_skip_reason") or "").strip()
                     if skip_reason:
                         _append_skipped(host, skip_reason, str(details.get("_agent_skip_error") or "") or None)
@@ -1222,12 +1258,29 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         details = reconcile_host_observations(
                             details, host, preprobe_by_host.get(host),
                         )
+                    if st in {"completed", "failed", "stopped"}:
+                        # V1.6.6: learn which NVTs hit their timeout so fast mode can
+                        # cap repeat offenders instead of waiting 320 s on every host.
+                        try:
+                            hang_registry().record(
+                                (details.get("evidence") or {}).get("plugin_error_details"),
+                                host=host, job_id=job_id,
+                            )
+                        except Exception:
+                            log.debug("NVT hang statistics not recorded for %s", host, exc_info=True)
                     if st in {"failed", "stopped"}:
                         # Do not let one bad IP fail 49 healthy peers. Preserve any
                         # partial findings in the per-IP log, mark the host skipped,
                         # then release the permit for the next queued IP.
                         ev = details.get("evidence") or {}
                         err = str(ev.get("report_read_error") or details.get("error") or f"OpenVAS {st}")
+                        stall = ip_stalled.get(idx)
+                        if stall:
+                            err = (
+                                f"Stalled: {stall['reason']}. The agent stopped the task; partial findings "
+                                f"are kept and this host is not counted as assessed. ({err})"
+                            )[:900]
+                            st = "stalled"
                         _append_skipped(host, f"scan_{st}", err)
                         emit_ip_event(
                             job_id, host, "scan_failed", task_id=tid, status=st,

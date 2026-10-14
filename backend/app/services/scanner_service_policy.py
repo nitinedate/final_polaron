@@ -78,7 +78,11 @@ SNAPSHOT_FIELDS = {
     "cve_watchlist",
     "port_list_name",
     "port_list_status",
+    "performance",
+    "performance_status",
+    "nvt_timeout_caps",
 }
+PERFORMANCE_PROFILES = {"standard", "fast"}
 PREFERENCE_FIELDS = {
     "max_checks",
     "max_hosts",
@@ -242,6 +246,11 @@ def _validate_fields(raw: dict[str, Any]) -> dict[str, Any]:
         if value not in ALIVE_TESTS:
             raise ValueError("Unsupported alive_test")
         out["alive_test"] = value
+    if raw.get("performance") not in (None, ""):
+        value = str(raw["performance"]).strip().lower()
+        if value not in PERFORMANCE_PROFILES:
+            raise ValueError("performance must be fast or standard")
+        out["performance"] = value
     for key in ("safe_checks", "optimize_test"):
         if raw.get(key) is not None:
             value = _YES_NO.get(str(raw[key]).strip().lower())
@@ -427,7 +436,7 @@ def effective_policy(
         "rule_engine": "OpenVAS native feed; per-rule success requires report evidence",
     }
     for key in (
-        "template", "template_name", "scan_config", "alive_test", "safe_checks", "optimize_test",
+        "template", "template_name", "scan_config", "alive_test", "safe_checks", "optimize_test", "performance",
         "require_credentials", "require_credentials_mode", "nvt_families", "cve_watchlist",
     ):
         if key in req:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -585,6 +586,109 @@ def _ensure_family_config(gmp: Any, config_id: str, families: list[str]) -> tupl
     except Exception as exc:
         log.warning("Family scoping rejected by Greenbone (%s); using the unscoped config", exc)
         return config_id, f"not applied ({str(exc)[:120]}); full config used"
+
+
+def _nmap_timing_pref_name(gmp: Any, config_id: str) -> str | None:
+    """Full ``oid:id:type:name`` of the Nmap "Timing policy" preference, read from gvmd.
+
+    The id is looked up rather than hard-coded: a wrong id is stored without
+    effect and OpenVAS silently keeps its default timing.
+    """
+    resp = gmp.get_scan_config(config_id)
+    for pref in resp.xpath(".//preferences/preference"):
+        nvt = pref.find("nvt")
+        if nvt is None or (nvt.get("oid") or "").strip() != NMAP_NVT_OID:
+            continue
+        name = pref.findtext("name") or ""
+        if name.strip().lower().startswith("timing policy"):
+            pid = (pref.findtext("id") or "").strip()
+            ptype = (pref.findtext("type") or "radio").strip() or "radio"
+            if pid:
+                return f"{NMAP_NVT_OID}:{pid}:{ptype}:{name}"
+    return None
+
+
+def _ensure_fast_config(
+    gmp: Any, base_config_id: str, caps: dict[str, int], nmap_timing: str | None
+) -> tuple[str, dict[str, Any]]:
+    """Clone ``base_config_id`` with per-NVT timeout caps and Nmap timing (V1.6.6).
+
+    Per-NVT timeouts are stored by gvmd as the preference
+    ``<oid>:0:entry:timeout`` and forwarded to the scanner as that VT's
+    timeout. A new clone is made per distinct cap set because gvmd refuses to
+    edit a config that running tasks use. Any rejection falls back to the base
+    config, which is slower but never narrower.
+    """
+    from agent.scan_performance import caps_digest
+
+    status: dict[str, Any] = {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "config": "base"}
+    if not caps and not nmap_timing:
+        return base_config_id, status
+    digest = caps_digest(caps, f"{base_config_id}|{nmap_timing or ''}")
+    name = f"Aetheris fast {digest}"
+    try:
+        resp = gmp.get_scan_configs(filter_string=f'name="{name}" rows=5')
+        for node in resp.xpath("config"):
+            if (node.findtext("name") or "").strip() == name and node.get("id"):
+                try:
+                    saved = json.loads(node.findtext("comment") or "{}")
+                except ValueError:
+                    saved = {}
+                saved.update({"config": f"reused {name}"})
+                return str(node.get("id")), saved
+        cloned = gmp.clone_scan_config(base_config_id)
+        new_id = str(cloned.get("id") or "").strip()
+        if not new_id:
+            raise RuntimeError("clone returned no id")
+        gmp.modify_scan_config_set_name(new_id, name)
+        if nmap_timing:
+            pref = _nmap_timing_pref_name(gmp, new_id)
+            if pref:
+                gmp.modify_scan_config_set_nvt_preference(new_id, name=pref, nvt_oid=NMAP_NVT_OID, value=nmap_timing)
+                status["nmap_timing"] = nmap_timing
+            else:
+                status["nmap_timing"] = "Timing policy preference not found; Nmap default kept"
+        applied = 0
+        for oid, seconds in caps.items():
+            try:
+                gmp.modify_scan_config_set_nvt_preference(
+                    new_id, name=f"{oid}:0:entry:timeout", nvt_oid=oid, value=str(int(seconds)),
+                )
+                applied += 1
+            except Exception as exc:
+                log.warning("Could not cap NVT %s timeout (%s)", oid, exc)
+        status["nvt_timeout_caps"] = applied
+        status["config"] = f"created {name}"
+        try:
+            gmp.modify_scan_config_set_comment(new_id, json.dumps(
+                {"nvt_timeout_caps": applied, "nmap_timing": status["nmap_timing"]}))
+        except Exception:
+            pass
+        _cleanup_fast_configs(gmp, keep_id=new_id)
+        log.info("Fast scan config %s (%s): %d NVT timeout cap(s), Nmap timing %s",
+                 name, new_id, applied, status["nmap_timing"])
+        return new_id, status
+    except Exception as exc:
+        log.warning("Fast scan config not applied (%s); using the standard config", exc)
+        return base_config_id, {"nvt_timeout_caps": 0, "nmap_timing": "unchanged",
+                                "config": f"not applied ({str(exc)[:120]}); standard config used"}
+
+
+def _cleanup_fast_configs(gmp: Any, keep_id: str, keep: int = 3) -> None:
+    """Best effort: delete superseded, unused "Aetheris fast" clones."""
+    try:
+        resp = gmp.get_scan_configs(filter_string='name~"Aetheris fast" rows=100 sort-reverse=creation_time')
+        nodes = [n for n in resp.xpath("config") if (n.findtext("name") or "").startswith("Aetheris fast ")]
+        for node in nodes[keep:]:
+            cid = str(node.get("id") or "")
+            if not cid or cid == keep_id or (node.findtext("in_use") or "0").strip() not in {"0", ""}:
+                continue
+            try:
+                gmp.delete_scan_config(cid, ultimate=True)
+            except Exception:
+                pass
+    except Exception:
+        log.debug("Fast config cleanup skipped", exc_info=True)
 
 
 def _named_port_list_tcp(gmp: Any, name: str) -> set[int]:
@@ -1806,7 +1910,21 @@ class LocalOpenVAS:
         safe_checks = str(snapshot.get("safe_checks") or self.safe_checks)
         optimize_test = str(snapshot.get("optimize_test") or self.optimize_test)
         families = list(snapshot.get("nvt_families") or [])
+        from agent.scan_performance import hang_registry, profile_settings, resolve_profile
+
+        performance = resolve_profile(snapshot)
+        perf_cfg = profile_settings(performance)
+        read_timeout = int(perf_cfg["checks_read_timeout"] or self.checks_read_timeout)
+        try:
+            hang_caps = hang_registry().caps() if perf_cfg["hang_caps"] else {}
+        except Exception:
+            log.warning("NVT hang statistics unavailable; no timeout caps applied", exc_info=True)
+            hang_caps = {}
         lane_checks = self.max_checks if max_checks is None else max(1, min(16, int(max_checks)))
+        if perf_cfg["max_checks"]:
+            # Nessus default is 5 simultaneous checks per host; capacity.py still
+            # limits how many IPs run at once under thermal/memory pressure.
+            lane_checks = max(lane_checks, min(16, int(perf_cfg["max_checks"])))
         snapshot["requested_port_range"] = snapshot["port_range"]
         for transport, key in (("T", "tcp_port_count"), ("U", "udp_port_count")):
             snapshot[key] = len({p for token in port_range.split(",") if token.startswith(transport + ":")
@@ -1826,6 +1944,9 @@ class LocalOpenVAS:
             full_config = base_config.casefold() == "full and fast"
             if families:
                 config_id, snapshot["family_scope_status"] = _ensure_family_config(gmp, config_id, families)
+            perf_status: dict[str, Any] = {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "config": "base"}
+            if performance == "fast" and (hang_caps or perf_cfg["nmap_timing"]):
+                config_id, perf_status = _ensure_fast_config(gmp, config_id, hang_caps, perf_cfg["nmap_timing"])
             # The 10k-NVT config floor only applies to an unscoped Full-and-fast
             # config; Discovery or family-scoped configs are smaller by design.
             # The feed-wide NVT floor is always enforced.
@@ -1866,7 +1987,7 @@ class LocalOpenVAS:
             prefs = {
                 "max_checks": str(lane_checks),
                 "max_hosts": str(self.max_hosts),
-                "checks_read_timeout": str(self.checks_read_timeout),
+                "checks_read_timeout": str(read_timeout),
                 "timeout_retry": str(self.timeout_retry),
                 "open_sock_max_attempts": str(self.open_sock_max_attempts),
                 "optimize_test": optimize_test,
@@ -1884,7 +2005,7 @@ class LocalOpenVAS:
                 "safe_checks=%s expand_vhosts=%s test_empty_vhost=%s",
                 lane_checks,
                 self.max_hosts,
-                self.checks_read_timeout,
+                read_timeout,
                 self.timeout_retry,
                 self.open_sock_max_attempts,
                 self.plugins_timeout,
@@ -1954,6 +2075,18 @@ class LocalOpenVAS:
             snapshot.update({"port_range": port_range, "targets": host_list, "task_id": str(task_id),
                              "config_id": config_id, "scanner_id": scanner_id,
                              "scan_config_name": base_config, "alive_test": alive_test,
+                             "performance": performance,
+                             "performance_status": {
+                                 **perf_status,
+                                 "checks_read_timeout": read_timeout,
+                                 "max_checks": lane_checks,
+                             },
+                             "nvt_timeout_caps": {
+                                 "count": len(hang_caps),
+                                 "applied": int(perf_status.get("nvt_timeout_caps") or 0),
+                                 "cap_sec": max(hang_caps.values()) if hang_caps else None,
+                                 "oids": sorted(hang_caps)[:20],
+                             },
                              "preferences": applied_prefs,
                              "preference_status": preference_status, "credential_status": credential_status,
                              "nvt_count": (health or {}).get("nvt_count"),

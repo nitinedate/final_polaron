@@ -238,7 +238,11 @@ export interface ScanJobSeveritySummary {
     configuration_sha256?: string; feed_versions?: Record<string, string>;
     credential_status?: Record<string, string>; template?: string; template_name?: string;
     scan_config_name?: string; port_list_status?: string; family_scope_status?: string;
-    tcp_port_count?: number; udp_port_count?: number }>;
+    tcp_port_count?: number; udp_port_count?: number;
+    performance?: "fast" | "standard" | string;
+    performance_status?: { config?: string; nmap_timing?: string; nvt_timeout_caps?: number;
+      checks_read_timeout?: number; max_checks?: number };
+    nvt_timeout_caps?: { count: number; applied: number; cap_sec: number | null; oids: string[] } }>;
   cve_watchlist?: {
     cves: string[];
     hit_count: number;

@@ -140,6 +140,7 @@ export function ScanPoliciesPage() {
                         {portScope(effective)}
                         <span className="block text-xs text-ink-500">
                           {UDP_LABEL[String(effective.udp_profile ?? "")] || "Scanner default UDP"}
+                          {effective.performance ? ` · ${String(effective.performance) === "fast" ? "Fast" : "Standard"} speed` : ""}
                         </span>
                       </td>
                       <td className="px-5 py-3 text-ink-600">
@@ -200,6 +201,7 @@ function PolicyModal({
   const [scannerId, setScannerId] = useState("");
   const [portProfile, setPortProfile] = useState("");
   const [udpProfile, setUdpProfile] = useState("");
+  const [performance, setPerformance] = useState("");
   const [extraPorts, setExtraPorts] = useState("");
   const [smbRef, setSmbRef] = useState("");
   const [sshRef, setSshRef] = useState("");
@@ -229,6 +231,7 @@ function PolicyModal({
     const settings: Record<string, unknown> = {};
     if (portProfile) settings.port_profile = portProfile;
     if (udpProfile) settings.udp_profile = udpProfile;
+    if (performance) settings.performance = performance;
     const extra = parsePorts(extraPorts);
     if (extra.length) {
       const base = (template.settings.custom_tcp_ports || []).map(String);
@@ -376,6 +379,21 @@ function PolicyModal({
             </Field>
           </div>
         ) : null}
+
+        <Field
+          label="Speed"
+          hint={
+            performance === "standard"
+              ? "Pre-1.6.6 timing: 10 s socket timeout, 4 checks per host, every check gets its full 320 s."
+              : "Fast keeps every check and port. It uses the Nessus/OpenVAS default 5 s socket timeout, 5 checks per host, Nmap Aggressive timing, and shorter time limits only for checks that already timed out repeatedly."
+          }
+        >
+          <Select value={performance} onChange={(e) => setPerformance(e.target.value)}>
+            <option value="">Scanner default</option>
+            <option value="fast">Fast</option>
+            <option value="standard">Standard</option>
+          </Select>
+        </Field>
 
         <Field
           label={focused ? "Extra TCP ports" : "Additional TCP ports"}
