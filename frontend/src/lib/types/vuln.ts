@@ -241,8 +241,12 @@ export interface ScanJobSeveritySummary {
     tcp_port_count?: number; udp_port_count?: number;
     performance?: "fast" | "standard" | string;
     performance_status?: { config?: string; nmap_timing?: string; nvt_timeout_caps?: number;
-      checks_read_timeout?: number; max_checks?: number };
-    nvt_timeout_caps?: { count: number; applied: number; cap_sec: number | null; oids: string[] } }>;
+      checks_read_timeout?: number; max_checks?: number; plugins_timeout?: number;
+      scanner_preferences?: Record<string, string> };
+    nvt_timeout_caps?: { count: number; applied: number; cap_sec: number | null; oids: string[] };
+    check_scope?: "vulnerability" | "all" | string;
+    check_scope_status?: { config?: string; nvt_count?: number | null; base_nvt_count?: number | null;
+      filtered_families?: number; severity_checks_selected?: number; excluded_families?: string[] } }>;
   cve_watchlist?: {
     cves: string[];
     hit_count: number;

@@ -10,7 +10,7 @@
       "description": "Find live hosts, open ports, and operating systems. No vulnerability checks run.",
       "settings": {
         "scan_config": "Discovery",
-        "port_profile": "catalog",
+        "port_profile": "nexus",
         "udp_profile": "off",
         "alive_test": "ICMP, TCP-ACK Service & ARP Ping",
         "safe_checks": "yes",
@@ -24,17 +24,17 @@
       "name": "Basic Network Scan",
       "nessus_template": "Basic Network Scan",
       "category": "vulnerability",
-      "description": "Full system scan for any host. Nessus default port range, service detection on every open port, safe checks only.",
+      "description": "Full system scan on the Nexus service ports (52 service families), service detection on every open port, safe checks only.",
       "settings": {
         "scan_config": "Full and fast",
-        "port_profile": "nessus",
+        "port_profile": "nexus",
         "udp_profile": "priority",
         "alive_test": "Consider Alive",
         "safe_checks": "yes",
         "optimize_test": "yes"
       },
       "nessus_reference": "Nessus Basic Network Scan: port scan range 'default' (about 4,790 common TCP ports), SYN scanner, probe all open ports for services, UDP scanner off, safe checks on, optimize tests on.",
-      "deviations": "TCP scope is Greenbone's 'All IANA assigned TCP' list plus the 52-family catalog (falls back to TCP 1-1024 + catalog if that list is missing). 30 priority UDP ports are kept because OpenVAS only tests UDP services whose ports are in the target port list. Explicitly authorized targets are treated as alive."
+      "deviations": "Scans the Nexus service-port catalog (about 88 TCP ports plus 30 priority UDP ports) instead of Nessus' ~4,790-port default, so services on unusual ports are not found. Choose 'IANA TCP list' or 'All TCP ports' in the policy for wider discovery. Explicitly authorized targets are treated as alive."
     },
     {
       "key": "advanced",
@@ -61,7 +61,7 @@
       "description": "Log in to hosts and find missing patches. Requires an SMB (Windows) or SSH (Linux/macOS) credential on the scanner.",
       "settings": {
         "scan_config": "Full and fast",
-        "port_profile": "catalog",
+        "port_profile": "nexus",
         "udp_profile": "off",
         "alive_test": "Consider Alive",
         "safe_checks": "yes",
@@ -83,7 +83,7 @@
       "description": "Scan web servers and applications on common web ports, including TLS configuration.",
       "settings": {
         "scan_config": "Full and fast",
-        "port_profile": "catalog",
+        "port_profile": "nexus",
         "custom_tcp_ports": [
           80,
           81,

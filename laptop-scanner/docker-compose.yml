@@ -159,6 +159,8 @@ services:
       GVM_OPEN_SOCK_MAX_ATTEMPTS: ${GVM_OPEN_SOCK_MAX_ATTEMPTS:-5}
       PLUGINS_TIMEOUT_SEC: ${PLUGINS_TIMEOUT_SEC:-320}
       SCANNER_PLUGINS_TIMEOUT_SEC: ${SCANNER_PLUGINS_TIMEOUT_SEC:-36000}
+      # V1.6.8: log each check launch/finish so the agent can name what an IP is waiting on.
+      OPENVAS_LOG_WHOLE_ATTACK: ${OPENVAS_LOG_WHOLE_ATTACK:-yes}
     volumes:
       - gvm_openvas_data:/mnt
       - gvm_openvas_log:/var/log/openvas
@@ -168,7 +170,7 @@ services:
       - |
         # V45: Nessus-parity scanner defaults. plugins_timeout/scanner_plugins_timeout
         # were 60/90 s, which killed the full-port Nmap NVT before it finished.
-        printf "table_driven_lsc = yes\nopenvasd_server = http://openvasd:80\nmax_hosts = %s\nmax_checks = %s\noptimize_test = %s\nplugins_timeout = %s\nscanner_plugins_timeout = %s\nchecks_read_timeout = %s\ntimeout_retry = %s\nopen_sock_max_attempts = %s\nsafe_checks = yes\nreport_host_details = yes\nexpand_vhosts = yes\ntest_empty_vhost = yes\n" "$${GVM_MAX_HOSTS}" "$${GVM_MAX_CHECKS}" "$${GVM_OPTIMIZE_TEST}" "$${PLUGINS_TIMEOUT_SEC}" "$${SCANNER_PLUGINS_TIMEOUT_SEC}" "$${GVM_CHECKS_READ_TIMEOUT}" "$${GVM_TIMEOUT_RETRY}" "$${GVM_OPEN_SOCK_MAX_ATTEMPTS}" > /mnt/openvas.conf
+        printf "table_driven_lsc = yes\nopenvasd_server = http://openvasd:80\nmax_hosts = %s\nmax_checks = %s\noptimize_test = %s\nplugins_timeout = %s\nscanner_plugins_timeout = %s\nchecks_read_timeout = %s\ntimeout_retry = %s\nopen_sock_max_attempts = %s\nsafe_checks = yes\nreport_host_details = yes\nexpand_vhosts = yes\ntest_empty_vhost = yes\nlog_whole_attack = %s\n" "$${GVM_MAX_HOSTS}" "$${GVM_MAX_CHECKS}" "$${GVM_OPTIMIZE_TEST}" "$${PLUGINS_TIMEOUT_SEC}" "$${SCANNER_PLUGINS_TIMEOUT_SEC}" "$${GVM_CHECKS_READ_TIMEOUT}" "$${GVM_TIMEOUT_RETRY}" "$${GVM_OPEN_SOCK_MAX_ATTEMPTS}" "$${OPENVAS_LOG_WHOLE_ATTACK}" > /mnt/openvas.conf
         sed "s/127/128/" /etc/openvas/openvas_log.conf | sed 's/gvm/openvas/' > /mnt/openvas_log.conf
         chmod 644 /mnt/openvas.conf /mnt/openvas_log.conf
         touch /var/log/openvas/openvas.log
@@ -329,7 +331,7 @@ services:
       MAX_SCAN_RUNTIME_SEC: ${MAX_SCAN_RUNTIME_SEC:-0}
       # Backward compatibility only; the agent logs and ignores stale 600s values.
       SCAN_IP_BUDGET_SEC: ${SCAN_IP_BUDGET_SEC:-0}
-      PORT_PROFILE: ${PORT_PROFILE:-full}
+      PORT_PROFILE: ${PORT_PROFILE:-nexus}
       UDP_PROFILE: ${UDP_PROFILE:-priority}
       SCAN_TCP_CUSTOM_PORTS: ${SCAN_TCP_CUSTOM_PORTS:-}
       SCAN_UDP_CUSTOM_PORTS: ${SCAN_UDP_CUSTOM_PORTS:-}
@@ -351,20 +353,30 @@ services:
       CENTRAL_API_CONNECT_TIMEOUT_SEC: ${CENTRAL_API_CONNECT_TIMEOUT_SEC:-4}
       CENTRAL_RESULT_TIMEOUT_SEC: ${CENTRAL_RESULT_TIMEOUT_SEC:-120}
       PROGRESS_REPORT_INTERVAL_SEC: ${PROGRESS_REPORT_INTERVAL_SEC:-45}
-      AGENT_VERSION: ${AGENT_VERSION:-1.6.6}
+      AGENT_VERSION: ${AGENT_VERSION:-1.6.8}
       # V1.6.6 speed and hang handling (see RELEASE_V1_6_6_FAST_SCAN_AND_HANG_HANDLING.md)
       SCAN_PERFORMANCE: ${SCAN_PERFORMANCE:-fast}
       FAST_CHECKS_READ_TIMEOUT: ${FAST_CHECKS_READ_TIMEOUT:-5}
       FAST_MAX_CHECKS: ${FAST_MAX_CHECKS:-5}
       FAST_NMAP_TIMING: ${FAST_NMAP_TIMING:-Aggressive}
       NVT_HANG_CAPS: ${NVT_HANG_CAPS:-true}
-      NVT_HANG_CAP_SEC: ${NVT_HANG_CAP_SEC:-120}
+      NVT_HANG_CAP_SEC: ${NVT_HANG_CAP_SEC:-60}
       NVT_HANG_MIN_EVENTS: ${NVT_HANG_MIN_EVENTS:-2}
       NVT_HANG_WINDOW_DAYS: ${NVT_HANG_WINDOW_DAYS:-30}
       NVT_HANG_STATS_FILE: ${NVT_HANG_STATS_FILE:-/app/logs/nvt_hang_stats.json}
       SCAN_IP_STALL_SEC: ${SCAN_IP_STALL_SEC:-1800}
       SCAN_PORTSCAN_STALL_SEC: ${SCAN_PORTSCAN_STALL_SEC:-3600}
       SCAN_TASK_START_STALL_SEC: ${SCAN_TASK_START_STALL_SEC:-900}
+      # Per-check limit written onto the scan config; optional per-IP limit
+      # (empty/0 = no limit); fixed pool of 4 IPs.
+      FAST_PLUGINS_TIMEOUT: ${FAST_PLUGINS_TIMEOUT:-320}
+      # V1.6.8: only checks that can report Critical/High/Medium/Low (+ their detection).
+      SCAN_CHECK_SCOPE: ${SCAN_CHECK_SCOPE:-vulnerability}
+      # V1.6.8: no time limits; stop only when OpenVAS shows nothing running (auto).
+      SCAN_STALL_ACTION: ${SCAN_STALL_ACTION:-auto}
+      SCAN_IP_DEADLINE_SEC: ${SCAN_IP_DEADLINE_SEC:-}
+      SCAN_IP_WORKERS_FIXED: ${SCAN_IP_WORKERS_FIXED:-4}
+      OPENVAS_LOG_FILE: /var/log/openvas/openvas.log
       SCANNER_ROLE: ${SCANNER_ROLE:-portable}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -385,6 +397,8 @@ services:
         bind:
           create_host_path: false
       - ./logs:/app/logs
+      # Read-only: lets the agent log which NVT an IP is stuck on (V1.6.7).
+      - gvm_openvas_log:/var/log/openvas:ro
     depends_on:
       gvmd:
         condition: service_healthy

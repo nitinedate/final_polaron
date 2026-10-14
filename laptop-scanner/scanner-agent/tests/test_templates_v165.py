@@ -91,7 +91,7 @@ def _scanner(monkeypatch, fake):
 def test_nessus_profile_widens_with_greenbone_iana_list(monkeypatch):
     monkeypatch.setattr(mod, "_named_port_list_tcp", lambda gmp, name: {5040, 5357, 7680, 80})
     scanner = _scanner(monkeypatch, object())
-    rng = scanner.resolve_port_range(["192.0.2.1"], None, {"template": "basic_network"})
+    rng = scanner.resolve_port_range(["192.0.2.1"], None, {"template": "basic_network", "port_profile": "nessus"})
     assert {5040, 5357, 7680, 22, 445} <= _tcp(rng)
     assert "U:161" in rng
     assert "widened" in scanner._port_list_status
@@ -148,6 +148,9 @@ class FakeGmp:
     def modify_scan_config_set_name(self, cid, name):
         pass
 
+    def modify_scan_config_set_scanner_preference(self, cid, name, value=None):
+        pass
+
     def modify_scan_config_set_family_selection(self, cid, families, **kwargs):
         self.family_calls.append(families)
         if self.reject_families:
@@ -190,8 +193,8 @@ def test_template_drives_config_alive_test_and_optimize(monkeypatch):
 
 
 def test_basic_network_records_port_list_status(monkeypatch):
-    _, fake, seen, snap = _launch(monkeypatch, {"template": "basic_network"})
-    assert seen["quality"] == "cfg-Full and fast"
+    _, fake, seen, snap = _launch(monkeypatch, {"template": "basic_network", "port_profile": "nessus"})
+    assert seen["quality"] == "clone-of-cfg-Full and fast"  # profile clone still passes the NVT floor
     assert 5357 in _tcp(fake.targets[0]["port_range"])
     assert snap["port_list_status"].startswith("widened")
 
@@ -219,8 +222,8 @@ def test_family_scope_applied_or_falls_back_to_full_config(monkeypatch):
 
     _, fake2, seen2, snap2 = _launch(monkeypatch, {"template": "web_app_tests"}, FakeGmp(reject_families=True))
     assert snap2["family_scope_status"].startswith("not applied")
-    assert fake2.tasks[0]["config_id"] == "cfg-Full and fast"
-    assert seen2["quality"] == "cfg-Full and fast"
+    assert fake2.tasks[0]["config_id"] == "clone-of-cfg-Full and fast"
+    assert seen2["quality"] == "clone-of-cfg-Full and fast"
 
 
 def test_cve_watchlist_marks_hits_and_never_claims_absence():

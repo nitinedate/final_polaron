@@ -14,13 +14,22 @@ def test_legacy_budget_branch_removed():
     assert "LEGACY_IP_BUDGET_IGNORED" in source
 
 
+def test_v167_time_limit_is_explicit_not_a_hidden_completion():
+    """V1.6.7 reintroduces a per-IP limit on request, but explicitly: its own
+    variable (SCAN_IP_DEADLINE_SEC, not the ignored SCAN_IP_BUDGET_SEC), a
+    'time_limit' event, and time_limited/stopped_at_progress evidence."""
+    source = inspect.getsource(main)
+    assert "ip_deadline_sec(" in source and '"time_limit"' in source
+    assert '"time_limited": True' in source and '"stopped_at_progress"' in source
+
+
 def test_legacy_budget_600_no_longer_interrupts(monkeypatch):
     monkeypatch.setenv("SCAN_IP_BUDGET_SEC", "600")
     monkeypatch.setenv("MAX_SCAN_RUNTIME_SEC", "0")
     # _cfg is only for top-level configuration requiring credentials; the
     # obsolete setting has no scan lifecycle branches and default job ceiling is 0.
     assert '600' not in inspect.getsource(main._cfg)
-    assert AGENT_BUILD.startswith("1.6.6-")
+    assert AGENT_BUILD.startswith("1.6.8-")
 
 
 def test_full_profile_ports_and_service_audit_still_enabled():

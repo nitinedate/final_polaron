@@ -60,9 +60,16 @@ def resolve_profile(request: dict[str, Any] | None = None) -> str:
 
 
 def profile_settings(profile: str) -> dict[str, Any]:
-    """Engine settings for a profile. ``None`` means "keep the configured value"."""
+    """Engine settings for a profile. ``None`` means "keep the configured value".
+
+    V1.6.7: these are written as *scanner preferences on the scan config*.
+    gvmd forwards only max_checks/max_hosts from task preferences; every other
+    scanner value comes from the config's SERVER_PREFS or gvmd's global
+    defaults (verified in gvmd manage_osp.c / init_preference_iterator).
+    """
     if profile != "fast":
-        return {"checks_read_timeout": None, "max_checks": None, "nmap_timing": None, "hang_caps": False}
+        return {"checks_read_timeout": None, "max_checks": None, "nmap_timing": None,
+                "hang_caps": False, "plugins_timeout": None}
     timing = (os.environ.get("FAST_NMAP_TIMING") or "Aggressive").strip()
     return {
         # OpenVAS default checks_read_timeout and Nessus "network timeout" are both 5 s.
@@ -71,7 +78,39 @@ def profile_settings(profile: str) -> dict[str, Any]:
         "max_checks": _int_env("FAST_MAX_CHECKS", 5, 1, 10),
         "nmap_timing": None if timing.lower() in {"", "off", "none", "normal"} else timing,
         "hang_caps": (os.environ.get("NVT_HANG_CAPS") or "true").strip().lower() in {"1", "true", "yes", "on"},
+        # Per-check limit for ordinary NVTs: Nessus/OpenVAS default 320 s (V1.6.8:
+        # no reduction). Checks that already hung repeatedly get NVT_HANG_CAP_SEC.
+        "plugins_timeout": _int_env("FAST_PLUGINS_TIMEOUT", 320, 30, 3600),
     }
+
+
+def ip_deadline_sec(profile: str) -> int:
+    """Optional hard per-IP time limit. V1.6.8: OFF (0) unless SCAN_IP_DEADLINE_SEC is set."""
+    del profile
+    return _int_env("SCAN_IP_DEADLINE_SEC", 0, 0, 86400)
+
+
+CHECK_SCOPES = ("vulnerability", "all")
+
+
+def resolve_check_scope(request: dict[str, Any] | None = None) -> str:
+    """Which checks run: policy ``check_scope``, then SCAN_CHECK_SCOPE, default vulnerability.
+
+    ``vulnerability``: only checks that can report Critical/High/Medium/Low,
+    plus whatever detection those checks depend on (OpenVAS auto-loads
+    declared dependencies) and a few cheap host/port reporting checks.
+    ``all``: every check in "Full and fast", including informational ones.
+    """
+    for raw in ((request or {}).get("check_scope"), os.environ.get("SCAN_CHECK_SCOPE")):
+        value = str(raw or "").strip().lower()
+        if value in CHECK_SCOPES:
+            return value
+    return "vulnerability"
+
+
+def fixed_ip_workers() -> int:
+    """Fixed number of IPs scanned at once (default 4). 0 = adaptive capacity sizing."""
+    return _int_env("SCAN_IP_WORKERS_FIXED", 4, 0, 32)
 
 
 def _is_cappable(oid: str, name: str) -> bool:
@@ -143,7 +182,7 @@ class NvtHangRegistry:
 
     def caps(self, now: float | None = None) -> dict[str, int]:
         """OID -> timeout seconds for repeat offenders inside the window."""
-        cap = _int_env("NVT_HANG_CAP_SEC", 120, 30, 600)
+        cap = _int_env("NVT_HANG_CAP_SEC", 60, 30, 600)
         min_events = _int_env("NVT_HANG_MIN_EVENTS", 2, 1, 50)
         window = _int_env("NVT_HANG_WINDOW_DAYS", 30, 1, 365) * 86400
         limit = _int_env("NVT_HANG_MAX_CAPPED", 50, 0, 500)
@@ -241,3 +280,32 @@ def caps_digest(caps: dict[str, int], extra: str = "") -> str:
 
     blob = json.dumps({"caps": caps, "extra": extra}, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:10]
+
+
+def stall_action() -> str:
+    """SCAN_STALL_ACTION: auto (default, evidence-based), stop (old: stop on time), off."""
+    raw = (os.environ.get("SCAN_STALL_ACTION") or "auto").strip().lower()
+    return raw if raw in {"auto", "stop", "off"} else "auto"
+
+
+def stall_decision(activity: dict[str, Any] | None, action: str | None = None) -> str:
+    """Decide what to do with an IP that has shown no progress for a long time.
+
+    V1.6.8 has no time limits: a slow scan is never stopped for being slow.
+    ``auto`` stops only when OpenVAS's own log proves nothing is running on
+    the host (per-check logging on, no running check, host not finished),
+    i.e. the scanner process died. Running checks are bounded by their own
+    timeouts, and a finished host means Greenbone is importing the report;
+    both are waited for. Without log evidence it waits.
+    """
+    mode = action or stall_action()
+    if mode == "off":
+        return "wait"
+    if mode == "stop":
+        return "stop"
+    act = activity or {}
+    if not act.get("available") or not act.get("whole_attack_logging"):
+        return "wait"
+    if act.get("host_finished") or act.get("running"):
+        return "wait"
+    return "stop"

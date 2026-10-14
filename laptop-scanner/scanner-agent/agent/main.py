@@ -509,6 +509,80 @@ def _merge_chunk_details(
     }
 
 
+def _ip_worker_limit(capacity: dict[str, Any], chunk_count: int) -> int:
+    """How many IPs may scan at once.
+
+    V1.6.7: SCAN_IP_WORKERS_FIXED (default 4) gives a fixed pool, independent
+    of CPU-based sizing (which never went below IP_WORKERS_MIN=5). 0 restores
+    adaptive sizing. A critical thermal/memory state still pauses *new* starts.
+    """
+    from agent.scan_performance import fixed_ip_workers
+
+    fixed = fixed_ip_workers()
+    if fixed > 0:
+        return max(1, min(fixed, max(1, chunk_count)))
+    return max(1, min(max(IP_WORKERS_MIN, int(capacity["ip_workers"])), max(1, chunk_count)))
+
+
+def _apply_time_limit(details: dict[str, Any], host: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Turn a task stopped at the per-IP time limit into an honest finished result.
+
+    Findings are kept. If ports were enumerated (port scanning had finished),
+    the host is a finished network scan *with a warning* naming the limit and
+    the progress at which checks were stopped. If the limit hit during port
+    scanning, the host is degraded_time_limit (incomplete). Never clean.
+    """
+    from datetime import datetime, timezone
+
+    from agent.service_policy import analyze_services
+
+    out = dict(details)
+    ev = dict(out.get("evidence") or {})
+    host_cov = dict(ev.get("host_coverage") or {})
+    cov = dict(host_cov.get(host) or {"verdict": "unverified", "open_tcp_ports": [], "open_udp_ports": []})
+    limit = int(info.get("limit") or 0)
+    pct = int(info.get("progress") or 0)
+    note = (
+        f"Per-IP time limit ({limit // 60} min) reached at {pct}%: the task was stopped and checks still "
+        "running did not finish. Findings found before the limit are kept."
+    )
+    warnings = [w for w in (cov.get("warnings") or []) if w != note] + [note]
+    ports_done = bool(cov.get("open_tcp_ports") or cov.get("open_udp_ports")) and pct >= 10 \
+        and not cov.get("port_scanner_errors")
+    cov.update({
+        "time_limited": True, "time_limit_sec": limit, "stopped_at_progress": pct,
+        "warnings": warnings[-20:], "coverage_complete": False, "service_checks_verified": False,
+    })
+    if ports_done:
+        cov["verdict"] = "observed_unverified"
+        cov["network_scan_complete"] = True
+        cov["reason"] = (
+            f"Time limit reached at {pct}% after port scanning finished "
+            f"({len(cov.get('open_tcp_ports') or [])} open TCP port(s)); unfinished checks were stopped"
+        )
+    else:
+        cov["verdict"] = "degraded_time_limit"
+        cov["network_scan_complete"] = False
+        cov["reason"] = f"Per-IP time limit ({limit}s) reached at {pct}% before port scanning finished"
+    host_cov[host] = cov
+    ev["host_coverage"] = host_cov
+    ev["time_limited"] = True
+    ev["assessment_verdict"] = "assessed_time_limited" if ports_done else "time_limit_before_port_scan"
+    ev["assessment_complete"] = bool(ports_done)
+    if not ev.get("scan_end"):
+        ev["scan_end"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ev["scan_end_source"] = "agent_time_limit"
+    snapshot = next(iter((ev.get("policy_snapshots") or {}).values()), {}) or {}
+    services = dict(ev.get("service_coverage") or {})
+    services[host] = analyze_services(list(out.get("vulnerabilities") or []), host=host, coverage=cov,
+                                      scanned_port_range=snapshot.get("port_range"))
+    ev["service_coverage"] = services
+    out["evidence"] = ev
+    out["status"] = "completed"
+    out["progress"] = 100
+    return out
+
+
 def _skipped_ip_details(host: str, reason: str, *, error: str | None = None, task_id: str | None = None) -> dict[str, Any]:
     """Terminal synthetic result for one omitted IP without failing sibling IPs."""
     from datetime import datetime, timezone
@@ -706,7 +780,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
 
     # One permit == one IP.  Normal operation never drops below the requested
     # Capacity-aware IP concurrency; critical pressure pauses new admissions.
-    ip_workers = max(1, min(max(IP_WORKERS_MIN, int(capacity["ip_workers"])), len(chunks)))
+    ip_workers = _ip_worker_limit(capacity, len(chunks))
     for idx, chunk in enumerate(chunks):
         host = str(chunk[0]) if chunk else f"chunk-{idx}"
         emit_ip_event(job_id, host, "queued", chunk_index=idx, semaphore_limit=ip_workers)
@@ -782,10 +856,25 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     # V1.6.6 stalled-task watchdog: (gmp_status, progress) and when it last changed.
     ip_change_since: dict[int, tuple[tuple[str, int], float]] = {}
     ip_stalled: dict[int, dict[str, Any]] = {}
-    from agent.scan_performance import classify_stall, hang_registry, stall_limits
+    from agent.scan_performance import classify_stall, hang_registry, stall_decision, stall_limits
+
+    ip_stall_noted: dict[int, float] = {}
 
     stall_cfg = stall_limits()
-    slot_sem = AdaptiveIPSemaphore(max_permits=int(capacity.get("configured_ceiling") or 10))
+    from agent.scan_performance import fixed_ip_workers, ip_deadline_sec, resolve_profile
+
+    _policy_req = job.get("scan_policy_request") if isinstance(job.get("scan_policy_request"), dict) else None
+    job_profile = resolve_profile(_policy_req)
+    ip_deadline = ip_deadline_sec(job_profile)
+    ip_deadline_hit: dict[int, dict[str, Any]] = {}
+    ip_tail_reported: dict[int, int] = {}
+    log.info("Job %s speed profile=%s per-IP time limit=%ss fixed IP workers=%s",
+             job_id, job_profile, ip_deadline or "off", fixed_ip_workers() or "adaptive")
+    from agent.scan_performance import fixed_ip_workers as _fixed_workers
+
+    slot_sem = AdaptiveIPSemaphore(
+        max_permits=_fixed_workers() or int(capacity.get("configured_ceiling") or 10)
+    )
 
     for idx, tid in resume_map.items():
         ids = [part.strip() for part in str(tid).split(",") if part.strip()] or [str(tid)]
@@ -1085,7 +1174,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         capacity = probe_laptop_capacity()
         # Adaptive semaphore: 6 IP permits whenever admission is allowed. At a
         # critical thermal/memory state, new starts pause while in-flight IPs finish.
-        ip_workers = max(1, min(max(IP_WORKERS_MIN, int(capacity["ip_workers"])), len(chunks)))
+        ip_workers = _ip_worker_limit(capacity, len(chunks))
 
         # Poll in-flight chunks (bounded concurrency for GMP I/O).
         finished_idxs: list[int] = []
@@ -1146,7 +1235,29 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         unchanged_w = now_w - seen[1]
                         stall_reason = classify_stall(gmp_state, progress_i, unchanged_w, stall_cfg)
                         prior = ip_stalled.get(idx)
-                        if stall_reason and (prior is None or now_w - prior["stop_at"] >= 300):
+                        decision = "wait"
+                        activity_w: dict[str, Any] = {}
+                        if stall_reason:
+                            if gmp_state in {"new", "requested", "queued"}:
+                                decision = "stop"  # never started: nothing to lose
+                            else:
+                                from agent.openvas_log import describe, host_activity
+
+                                activity_w = host_activity(host)
+                                decision = stall_decision(activity_w)
+                                if decision == "wait" and now_w - ip_stall_noted.get(idx, 0.0) >= 300:
+                                    ip_stall_noted[idx] = now_w
+                                    log.warning("IP %s: %s; NOT stopping (no time limit): %s",
+                                                host, stall_reason, describe(activity_w))
+                                    emit_ip_event(job_id, host, "stall_wait", task_id=tid, reason=stall_reason,
+                                                  progress=progress_i, evidence=describe(activity_w),
+                                                  running=activity_w.get("running"),
+                                                  host_finished=activity_w.get("host_finished"))
+                        if decision == "stop" and stall_reason and (prior is None or now_w - prior["stop_at"] >= 300):
+                            if activity_w:
+                                from agent.openvas_log import describe
+
+                                stall_reason = f"{stall_reason}; {describe(activity_w)}"
                             ip_stalled[idx] = {"reason": stall_reason, "stop_at": now_w,
                                                "progress": progress_i, "gmp_status": gmp_state}
                             log.error(
@@ -1161,6 +1272,48 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                     openvas.stop(one)
                                 except Exception:
                                     log.warning("stop_task for stalled task %s failed", one, exc_info=True)
+
+                    # --- V1.6.7 per-IP time limit -----------------------------------
+                    if st == "running" and ip_deadline > 0 and idx not in ip_deadline_hit and idx not in ip_stalled:
+                        elapsed_d = now_w - ip_started_mono.get(idx, now_w)
+                        if elapsed_d >= ip_deadline:
+                            ip_deadline_hit[idx] = {"limit": ip_deadline, "progress": progress_i,
+                                                    "elapsed": int(elapsed_d)}
+                            log.warning(
+                                "Job %s IP %s reached the per-IP time limit (%ss) at %s%%; stopping task %s. "
+                                "Findings are kept; the host is reported finished at the time limit",
+                                job_id, host, ip_deadline, progress_i, tid,
+                            )
+                            emit_ip_event(job_id, host, "time_limit", task_id=tid, limit_sec=ip_deadline,
+                                          progress=progress_i, chunk_index=idx)
+                            for one in _ids_for(idx):
+                                try:
+                                    openvas.stop(one)
+                                except Exception:
+                                    log.warning("stop_task at time limit failed for %s", one, exc_info=True)
+                    # --- V1.6.7 what is OpenVAS doing at 90 %+? ------------------------
+                    seen_t = ip_change_since.get(idx)
+                    if (st == "running" and progress_i >= 90 and seen_t is not None
+                            and now_w - seen_t[1] >= 300 and ip_tail_reported.get(idx) != progress_i):
+                        ip_tail_reported[idx] = progress_i
+                        try:
+                            from agent.openvas_log import describe, host_activity
+
+                            activity = host_activity(host)
+                            log.warning(
+                                "IP %s at %s%% for %ss: %s. OpenVAS log NVTs: %s; slow finished: %s",
+                                host, progress_i, int(now_w - seen_t[1]), describe(activity),
+                                ", ".join(activity.get("nvt_oids") or []) or "none found",
+                                ", ".join(f"{x['name']} {x['seconds']}s" for x in (activity.get("slow_finished") or [])[:5])
+                                or "none",
+                            )
+                            emit_ip_event(job_id, host, "tail_activity", task_id=tid, progress=progress_i,
+                                          nvt_oids=activity.get("nvt_oids"), lines=(activity.get("lines") or [])[-8:],
+                                          running=activity.get("running"), slow_finished=activity.get("slow_finished"),
+                                          host_finished=activity.get("host_finished"),
+                                          summary=describe(activity), log_available=activity.get("available"))
+                        except Exception:
+                            log.debug("OpenVAS log diagnostics unavailable", exc_info=True)
 
                     skip_reason = str(details.get("_agent_skip_reason") or "").strip()
                     if skip_reason:
@@ -1253,6 +1406,9 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                 )
                                 ip_progress_since[idx] = (pct_i, now_m - float(high_progress_stall_sec) + 20)
 
+                    if st == "stopped" and idx in ip_deadline_hit and idx not in ip_stalled:
+                        details = _apply_time_limit(details, host, ip_deadline_hit[idx])
+                        st = "completed"
                     if st == "completed":
                         from agent.coverage_reconcile import reconcile_host_observations
                         details = reconcile_host_observations(
@@ -1304,6 +1460,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             cov_verdict = str(cov.get("verdict") or "unverified")
                             if (
                                 cov_verdict.startswith("degraded")
+                                and cov_verdict != "degraded_time_limit"
                                 and degraded_retries.get(idx, 0) < degraded_retry_budget
                             ):
                                 degraded_retries[idx] = degraded_retries.get(idx, 0) + 1

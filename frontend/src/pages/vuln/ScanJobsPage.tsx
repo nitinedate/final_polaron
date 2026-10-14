@@ -1099,9 +1099,19 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                         {policy.template_name ? <p className="mt-2">Template: {policy.template_name}{policy.scan_config_name ? ` · Greenbone config: ${policy.scan_config_name}` : ""}</p> : null}
                         {policy.port_list_status ? <p>Port list: {policy.port_list_status}</p> : null}
                         {policy.family_scope_status ? <p>Check families: {policy.family_scope_status}</p> : null}
+                        {policy.check_scope ? (
+                          <p>
+                            Checks: {policy.check_scope === "all" ? "All checks" : "Vulnerability checks only"}
+                            {policy.check_scope_status?.nvt_count && policy.check_scope_status?.base_nvt_count
+                              ? ` · ${policy.check_scope_status.nvt_count.toLocaleString()} of ${policy.check_scope_status.base_nvt_count.toLocaleString()} checks selected`
+                              : ""}
+                            {policy.check_scope_status?.config?.startsWith("not applied") ? " · not applied, all checks ran" : ""}
+                          </p>
+                        ) : null}
                         {policy.performance ? (
                           <p>
                             Speed: {policy.performance === "fast" ? "Fast" : "Standard"}
+                            {policy.performance_status?.plugins_timeout ? ` · ${policy.performance_status.plugins_timeout} s per check` : ""}
                             {policy.performance_status?.checks_read_timeout ? ` · ${policy.performance_status.checks_read_timeout} s socket timeout` : ""}
                             {policy.performance_status?.max_checks ? ` · ${policy.performance_status.max_checks} checks per host` : ""}
                             {policy.performance_status?.nmap_timing && policy.performance_status.nmap_timing !== "unchanged" ? ` · Nmap timing: ${policy.performance_status.nmap_timing}` : ""}

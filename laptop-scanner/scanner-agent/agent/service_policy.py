@@ -14,15 +14,17 @@ from uuid import UUID
 
 CATALOG_PATH = Path(__file__).with_name("service_catalog.json")
 TEMPLATES_PATH = Path(__file__).with_name("scan_templates.json")
+# nexus    DEFAULT. The Nexus service-port catalog (52 families, ~88 TCP +
+#          30 priority UDP ports). V1.6.7 restores this meaning.
+# catalog  same scope as nexus
+# nessus   wider, opt-in: TCP 1-1024 + catalog, widened at scan time with
+#          Greenbone's "All IANA assigned TCP" port list (much slower on
+#          Windows hosts with many registered-port listeners)
 # full     TCP 1-65535
-# nessus   Nessus "default" parity: TCP 1-1024 + 52-family catalog, widened at
-#          scan time with Greenbone's "All IANA assigned TCP" port list
-# nexus    legacy alias of nessus (field .env files use this spelling)
-# catalog  the 52-family catalog only (the pre-1.6.5 meaning of nexus)
 # vuln/fast/common  legacy catalog-based profiles
 # focused  only custom_tcp_ports / custom_udp_ports (threat templates)
 MODES = {"full", "fast", "common", "vuln", "nessus", "nexus", "catalog", "focused"}
-NESSUS_MODES = {"nessus", "nexus"}
+NESSUS_MODES = {"nessus"}
 UDP_MODES = {"priority", "full", "off"}
 NESSUS_IANA_PORT_LIST = "All IANA assigned TCP"
 SCAN_CONFIGS = {"Full and fast", "Discovery", "Host Discovery", "System Discovery", "Base"}
@@ -81,8 +83,11 @@ SNAPSHOT_FIELDS = {
     "performance",
     "performance_status",
     "nvt_timeout_caps",
+    "check_scope",
+    "check_scope_status",
 }
 PERFORMANCE_PROFILES = {"standard", "fast"}
+CHECK_SCOPES = {"vulnerability", "all"}
 PREFERENCE_FIELDS = {
     "max_checks",
     "max_hosts",
@@ -251,6 +256,11 @@ def _validate_fields(raw: dict[str, Any]) -> dict[str, Any]:
         if value not in PERFORMANCE_PROFILES:
             raise ValueError("performance must be fast or standard")
         out["performance"] = value
+    if raw.get("check_scope") not in (None, ""):
+        value = str(raw["check_scope"]).strip().lower()
+        if value not in CHECK_SCOPES:
+            raise ValueError("check_scope must be vulnerability or all")
+        out["check_scope"] = value
     for key in ("safe_checks", "optimize_test"):
         if raw.get(key) is not None:
             value = _YES_NO.get(str(raw[key]).strip().lower())
@@ -437,6 +447,7 @@ def effective_policy(
     }
     for key in (
         "template", "template_name", "scan_config", "alive_test", "safe_checks", "optimize_test", "performance",
+        "check_scope",
         "require_credentials", "require_credentials_mode", "nvt_families", "cve_watchlist",
     ):
         if key in req:

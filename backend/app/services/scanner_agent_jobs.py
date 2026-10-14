@@ -812,8 +812,15 @@ def classify_host_coverage(
         elif network_ok:
             network_complete.append(str(cov_host))
             entry["status"] = "completed"
+            if cov.get("time_limited"):
+                prefix = (
+                    f"Completed at time limit - stopped after {int(cov.get('time_limit_sec') or 0) // 60} min "
+                    f"at {int(cov.get('stopped_at_progress') or 0)}%; "
+                )
+            else:
+                prefix = "Completed with warnings - " if warnings else "Completed - "
             entry["activity"] = (
-                ("Completed with warnings - " if warnings else "Completed - ")
+                prefix
                 + f"network scan finished, {len(tcp_ports)} open TCP"
                 + (f" / {len(udp_ports)} UDP" if udp_ports else "")
                 + " port(s)"
@@ -834,6 +841,8 @@ def classify_host_coverage(
             "nvts_launched": int(cov.get("nvts_evidenced") or cov.get("nvts_launched") or 0),
             "results_evidenced": int(cov.get("results_evidenced") or 0),
             "warnings": len(warnings),
+            "time_limited": bool(cov.get("time_limited")),
+            "stopped_at_progress": cov.get("stopped_at_progress"),
         }
         tp[str(cov_host)] = entry
     return tp, degraded_now, network_complete

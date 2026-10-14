@@ -18,7 +18,14 @@ def reconcile_host_observations(details: dict[str, Any], host: str, preprobe_por
     coverage["preprobe_is_not_vulnerability_evidence"] = True
     native = sorted({int(x) for x in coverage.get("open_tcp_ports") or [] if str(x).isdigit() and 1 <= int(x) <= 65535})
     coverage["greenbone_tcp_ports"] = native
-    if preprobe and not native:
+    if preprobe and not native and coverage.get("time_limited"):
+        # V1.6.7: the per-IP time limit stopped the scan before Greenbone reported
+        # ports; that is the cause, so keep its verdict and record the probe.
+        warnings = list(coverage.get("warnings") or [])
+        warnings.append(f"TCP connect pre-probe saw port(s) {preprobe} open before the time limit stopped the scan")
+        coverage["warnings"] = warnings[-20:]
+        coverage["network_scan_complete"] = False
+    elif preprobe and not native:
         coverage["verdict"] = "degraded_discovery_mismatch"
         coverage["reason"] = (
             f"Scanner agent established TCP connections on {preprobe}, but Greenbone did not report "

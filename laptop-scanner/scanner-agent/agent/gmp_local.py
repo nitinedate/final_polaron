@@ -588,6 +588,176 @@ def _ensure_family_config(gmp: Any, config_id: str, families: list[str]) -> tupl
         return config_id, f"not applied ({str(exc)[:120]}); full config used"
 
 
+# --- V1.6.8 vulnerability-only check scope -----------------------------------
+# Discovery infrastructure stays whole: without it no port/service is found.
+CHECK_SCOPE_WHOLE_FAMILIES = ("Port scanners", "Settings", "Credentials", "Service detection")
+# Not network vulnerability checks, or not run by Nessus by default.
+CHECK_SCOPE_EXCLUDED_FAMILIES = (
+    "Brute force attacks", "Compliance", "Policy", "IT-Grundschutz", "IT-Grundschutz-15",
+    "IT-Grundschutz-Deprecated", "Nmap NSE", "Nmap NSE net", "Denial of Service",
+)
+# Cheap end-of-scan reporting checks the coverage logic reads (open ports, OS,
+# host details). Kept even though they are informational.
+CHECK_SCOPE_ESSENTIAL_OIDS = (
+    "1.3.6.1.4.1.25623.1.0.900239",  # Check Open TCP Ports (host detail "ports")
+    "1.3.6.1.4.1.25623.1.0.103997",  # Host Details
+    "1.3.6.1.4.1.25623.1.0.105937",  # OS Detection Consolidation and Reporting
+    "1.3.6.1.4.1.25623.1.0.810003",  # Host Summary
+    "1.3.6.1.4.1.25623.1.0.810002",  # CPE Inventory
+    "1.3.6.1.4.1.25623.1.0.108449",  # Hostname Determination Reporting
+)
+
+
+def _nvt_info_type() -> Any:
+    try:
+        from gvm.protocols.gmp.requests.v224 import InfoType
+
+        return InfoType.NVT
+    except Exception:  # older/newer python-gvm layouts
+        class _NVT:
+            value = "NVT"
+
+        return _NVT()
+
+
+def _config_families(gmp: Any, config_id: str) -> list[str]:
+    resp = gmp.get_scan_config(config_id)
+    names = []
+    for fam in resp.xpath(".//families/family"):
+        name = (fam.findtext("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _info_oids(resp: Any) -> list[str]:
+    oids: list[str] = []
+    for info in resp.xpath(".//info"):
+        oid = (info.get("id") or "").strip()
+        if not oid:
+            nvt = info.find("nvt")
+            oid = (nvt.get("oid") or "").strip() if nvt is not None else ""
+        if oid and oid not in oids:
+            oids.append(oid)
+    return oids
+
+
+def _feed_digest(gmp: Any) -> str:
+    import hashlib
+
+    try:
+        feeds = gmp.get_feeds()
+        versions = sorted(f"{f.findtext('type')}={f.findtext('version')}" for f in feeds.xpath(".//feed"))
+    except Exception:
+        versions = []
+    return hashlib.sha256("|".join(versions).encode()).hexdigest()[:10] if versions else "nofeed"
+
+
+def _ensure_check_scope_config(gmp: Any, base_config_id: str) -> tuple[str, dict[str, Any]]:
+    """Clone ``base_config_id`` keeping only checks that can report C/H/M/L (V1.6.8).
+
+    * Whole: port scanners, settings, credentials, service detection, and every
+      "... Local Security Checks" family (they only run with credentials).
+    * Excluded: brute force, compliance/policy/IT-Grundschutz, NSE wrappers, DoS.
+    * Every other family: only NVTs with severity > 0 (gvmd ``get_info`` filter),
+      plus the essential reporting OIDs above.
+    OpenVAS ``auto_enable_dependencies`` (on by default, verified in
+    openvas-scanner pluginscheduler.c) then loads every detection check a
+    selected check declares as a dependency. Any failure, or a result below
+    GVM_MIN_NVT_COUNT, falls back to the unscoped config.
+    """
+    base_count = None
+    try:
+        base_count = _feed_count_from_xml(gmp.get_scan_config(base_config_id))
+    except Exception:
+        pass
+    status: dict[str, Any] = {"scope": "vulnerability", "config": "base", "base_nvt_count": base_count}
+    name = f"Aetheris vuln-scope {_feed_digest(gmp)}-{str(base_config_id)[:8]}"
+    try:
+        resp = gmp.get_scan_configs(filter_string=f'name="{name}" rows=5')
+        for node in resp.xpath("config"):
+            if (node.findtext("name") or "").strip() == name and node.get("id"):
+                try:
+                    saved = json.loads(node.findtext("comment") or "{}")
+                except ValueError:
+                    saved = {}
+                saved["config"] = f"reused {name}"
+                log.info("Vulnerability-only config %s reused (%s checks)", name, saved.get("nvt_count"))
+                return str(node.get("id")), saved
+
+        families = _config_families(gmp, base_config_id)
+        if not families:
+            raise RuntimeError("base config lists no families")
+        whole = [f for f in families if f in CHECK_SCOPE_WHOLE_FAMILIES or f.endswith("Local Security Checks")]
+        excluded = [f for f in families if f in CHECK_SCOPE_EXCLUDED_FAMILIES]
+        filtered = [f for f in families if f not in whole and f not in excluded]
+
+        essential: dict[str, list[str]] = {}
+        for oid in CHECK_SCOPE_ESSENTIAL_OIDS:
+            try:
+                info = gmp.get_info(oid, _nvt_info_type())
+                fam = (info.findtext(".//nvt/family") or "").strip()
+                if fam:
+                    essential.setdefault(fam, []).append(oid)
+            except Exception:
+                log.debug("Essential NVT %s not found in feed", oid)
+
+        selections: dict[str, list[str]] = {}
+        for fam in filtered:
+            resp = gmp.get_info_list(
+                _nvt_info_type(), filter_string=f'family="{fam}" severity>0 rows=-1', details=False,
+            )
+            oids = _info_oids(resp)
+            for oid in essential.get(fam, []):
+                if oid not in oids:
+                    oids.append(oid)
+            if oids:
+                selections[fam] = oids
+
+        cloned = gmp.clone_scan_config(base_config_id)
+        new_id = str(cloned.get("id") or "").strip()
+        if not new_id:
+            raise RuntimeError("clone returned no id")
+        gmp.modify_scan_config_set_name(new_id, name)
+        family_rows = [(f, True, True) for f in whole] + [(f, False, True) for f in selections]
+        gmp.modify_scan_config_set_family_selection(new_id, family_rows, auto_add_new_families=False)
+        for fam, oids in selections.items():
+            gmp.modify_scan_config_set_nvt_selection(new_id, fam, oids)
+        try:
+            gmp.modify_scan_config_set_scanner_preference(new_id, "auto_enable_dependencies", value="yes")
+        except Exception:
+            log.debug("auto_enable_dependencies preference not set; ospd default (1) applies")
+
+        new_count = _feed_count_from_xml(gmp.get_scan_config(new_id))
+        if isinstance(new_count, int) and new_count >= 0 and new_count < _minimum_nvt_count():
+            raise RuntimeError(f"vulnerability-only config has {new_count} checks, below GVM_MIN_NVT_COUNT")
+        status.update({
+            "config": f"created {name}",
+            "nvt_count": new_count,
+            "whole_families": whole,
+            "filtered_families": len(selections),
+            "severity_checks_selected": sum(len(v) for v in selections.values()),
+            "excluded_families": excluded,
+            "essential_reporting_checks": sum(len(v) for v in essential.values()),
+        })
+        try:
+            gmp.modify_scan_config_set_comment(new_id, json.dumps(
+                {k: status[k] for k in ("scope", "nvt_count", "base_nvt_count", "filtered_families",
+                                         "severity_checks_selected", "excluded_families")}))
+        except Exception:
+            pass
+        log.info(
+            "Vulnerability-only config %s (%s): %s of %s checks; %d families filtered to severity>0, "
+            "%d whole, excluded %s",
+            name, new_id, new_count, base_count, len(selections), len(whole), ", ".join(excluded) or "none",
+        )
+        return new_id, status
+    except Exception as exc:
+        log.warning("Vulnerability-only check scope not applied (%s); running all checks", exc)
+        status["config"] = f"not applied ({str(exc)[:160]}); all checks run"
+        return base_config_id, status
+
+
 def _nmap_timing_pref_name(gmp: Any, config_id: str) -> str | None:
     """Full ``oid:id:type:name`` of the Nmap "Timing policy" preference, read from gvmd.
 
@@ -608,24 +778,37 @@ def _nmap_timing_pref_name(gmp: Any, config_id: str) -> str | None:
     return None
 
 
-def _ensure_fast_config(
-    gmp: Any, base_config_id: str, caps: dict[str, int], nmap_timing: str | None
+def _ensure_profile_config(
+    gmp: Any,
+    base_config_id: str,
+    scanner_prefs: dict[str, str],
+    caps: dict[str, int],
+    nmap_timing: str | None,
 ) -> tuple[str, dict[str, Any]]:
-    """Clone ``base_config_id`` with per-NVT timeout caps and Nmap timing (V1.6.6).
+    """Clone ``base_config_id`` carrying this scan's engine settings (V1.6.7).
 
-    Per-NVT timeouts are stored by gvmd as the preference
-    ``<oid>:0:entry:timeout`` and forwarded to the scanner as that VT's
-    timeout. A new clone is made per distinct cap set because gvmd refuses to
-    edit a config that running tasks use. Any rejection falls back to the base
-    config, which is slower but never narrower.
+    gvmd forwards only max_checks/max_hosts from *task* preferences; every
+    other scanner value (plugins_timeout, checks_read_timeout, optimize_test,
+    safe_checks, ...) comes from the config's SERVER_PREFS, falling back to
+    gvmd's global defaults (verified in gvmd manage_osp.c and
+    init_preference_iterator). So the values are written onto a config clone:
+
+    * scanner preferences via ``modify_scan_config_set_scanner_preference``;
+    * per-NVT timeout caps as ``<oid>:0:entry:timeout`` (sent as VT value 0);
+    * the Nmap "Timing policy" preference, looked up by name.
+
+    One clone per distinct setting set (gvmd refuses edits to configs in use).
+    Any rejection falls back to the base config, which is slower, never narrower.
     """
     from agent.scan_performance import caps_digest
 
-    status: dict[str, Any] = {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "config": "base"}
-    if not caps and not nmap_timing:
+    status: dict[str, Any] = {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "config": "base",
+                              "scanner_preferences": {}}
+    if not caps and not nmap_timing and not scanner_prefs:
         return base_config_id, status
-    digest = caps_digest(caps, f"{base_config_id}|{nmap_timing or ''}")
-    name = f"Aetheris fast {digest}"
+    digest = caps_digest(caps, json.dumps({"base": base_config_id, "timing": nmap_timing or "",
+                                           "prefs": scanner_prefs}, sort_keys=True))
+    name = f"Aetheris profile {digest}"
     try:
         resp = gmp.get_scan_configs(filter_string=f'name="{name}" rows=5')
         for node in resp.xpath("config"):
@@ -634,13 +817,24 @@ def _ensure_fast_config(
                     saved = json.loads(node.findtext("comment") or "{}")
                 except ValueError:
                     saved = {}
-                saved.update({"config": f"reused {name}"})
+                saved["config"] = f"reused {name}"
+                log.info("Scan profile config %s reused: scanner prefs %s, %s NVT timeout cap(s), Nmap timing %s",
+                         name, saved.get("scanner_preferences"), saved.get("nvt_timeout_caps"),
+                         saved.get("nmap_timing"))
                 return str(node.get("id")), saved
         cloned = gmp.clone_scan_config(base_config_id)
         new_id = str(cloned.get("id") or "").strip()
         if not new_id:
             raise RuntimeError("clone returned no id")
         gmp.modify_scan_config_set_name(new_id, name)
+        applied_prefs: dict[str, str] = {}
+        for pref_name, value in scanner_prefs.items():
+            try:
+                gmp.modify_scan_config_set_scanner_preference(new_id, pref_name, value=str(value))
+                applied_prefs[pref_name] = str(value)
+            except Exception as exc:
+                log.warning("Scanner preference %s=%s rejected (%s)", pref_name, value, exc)
+        status["scanner_preferences"] = applied_prefs
         if nmap_timing:
             pref = _nmap_timing_pref_name(gmp, new_id)
             if pref:
@@ -661,24 +855,31 @@ def _ensure_fast_config(
         status["config"] = f"created {name}"
         try:
             gmp.modify_scan_config_set_comment(new_id, json.dumps(
-                {"nvt_timeout_caps": applied, "nmap_timing": status["nmap_timing"]}))
+                {k: status[k] for k in ("nvt_timeout_caps", "nmap_timing", "scanner_preferences")}))
         except Exception:
             pass
         _cleanup_fast_configs(gmp, keep_id=new_id)
-        log.info("Fast scan config %s (%s): %d NVT timeout cap(s), Nmap timing %s",
-                 name, new_id, applied, status["nmap_timing"])
+        log.info("Scan profile config %s (%s): scanner prefs %s, %d NVT timeout cap(s), Nmap timing %s",
+                 name, new_id, applied_prefs, applied, status["nmap_timing"])
         return new_id, status
     except Exception as exc:
-        log.warning("Fast scan config not applied (%s); using the standard config", exc)
-        return base_config_id, {"nvt_timeout_caps": 0, "nmap_timing": "unchanged",
-                                "config": f"not applied ({str(exc)[:120]}); standard config used"}
+        log.warning("Scan profile config not applied (%s); using the base config and gvmd defaults", exc)
+        return base_config_id, {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "scanner_preferences": {},
+                                "config": f"not applied ({str(exc)[:120]}); base config used"}
+
+
+def _ensure_fast_config(gmp: Any, base_config_id: str, caps: dict[str, int],
+                        nmap_timing: str | None) -> tuple[str, dict[str, Any]]:
+    """Compatibility wrapper (V1.6.6 name)."""
+    return _ensure_profile_config(gmp, base_config_id, {}, caps, nmap_timing)
 
 
 def _cleanup_fast_configs(gmp: Any, keep_id: str, keep: int = 3) -> None:
     """Best effort: delete superseded, unused "Aetheris fast" clones."""
     try:
-        resp = gmp.get_scan_configs(filter_string='name~"Aetheris fast" rows=100 sort-reverse=creation_time')
-        nodes = [n for n in resp.xpath("config") if (n.findtext("name") or "").startswith("Aetheris fast ")]
+        resp = gmp.get_scan_configs(filter_string='name~"Aetheris" rows=200 sort-reverse=creation_time')
+        nodes = [n for n in resp.xpath("config")
+                 if (n.findtext("name") or "").startswith(("Aetheris fast ", "Aetheris profile "))]
         for node in nodes[keep:]:
             cid = str(node.get("id") or "")
             if not cid or cid == keep_id or (node.findtext("in_use") or "0").strip() not in {"0", ""}:
@@ -1913,6 +2114,10 @@ class LocalOpenVAS:
         from agent.scan_performance import hang_registry, profile_settings, resolve_profile
 
         performance = resolve_profile(snapshot)
+        from agent.scan_performance import resolve_check_scope
+
+        check_scope = resolve_check_scope(snapshot)
+        snapshot["check_scope"] = check_scope
         perf_cfg = profile_settings(performance)
         read_timeout = int(perf_cfg["checks_read_timeout"] or self.checks_read_timeout)
         try:
@@ -1944,9 +2149,19 @@ class LocalOpenVAS:
             full_config = base_config.casefold() == "full and fast"
             if families:
                 config_id, snapshot["family_scope_status"] = _ensure_family_config(gmp, config_id, families)
-            perf_status: dict[str, Any] = {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "config": "base"}
-            if performance == "fast" and (hang_caps or perf_cfg["nmap_timing"]):
-                config_id, perf_status = _ensure_fast_config(gmp, config_id, hang_caps, perf_cfg["nmap_timing"])
+            elif full_config and check_scope == "vulnerability":
+                config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(gmp, config_id)
+            scanner_prefs = {
+                "plugins_timeout": str(int(perf_cfg["plugins_timeout"] or self.plugins_timeout)),
+                "checks_read_timeout": str(read_timeout),
+                "optimize_test": optimize_test,
+                "safe_checks": safe_checks,
+            }
+            config_id, perf_status = _ensure_profile_config(
+                gmp, config_id, scanner_prefs,
+                hang_caps if performance == "fast" else {},
+                perf_cfg["nmap_timing"] if performance == "fast" else None,
+            )
             # The 10k-NVT config floor only applies to an unscoped Full-and-fast
             # config; Discovery or family-scoped configs are smaller by design.
             # The feed-wide NVT floor is always enforced.
@@ -2079,6 +2294,7 @@ class LocalOpenVAS:
                              "performance_status": {
                                  **perf_status,
                                  "checks_read_timeout": read_timeout,
+                                 "plugins_timeout": int(perf_cfg["plugins_timeout"] or self.plugins_timeout),
                                  "max_checks": lane_checks,
                              },
                              "nvt_timeout_caps": {

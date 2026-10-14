@@ -20,7 +20,8 @@ def _env(monkeypatch, tmp_path):
     for key in ("SCAN_PERFORMANCE", "FAST_CHECKS_READ_TIMEOUT", "FAST_MAX_CHECKS", "FAST_NMAP_TIMING",
                 "NVT_HANG_CAPS", "NVT_HANG_CAP_SEC", "NVT_HANG_MIN_EVENTS", "NVT_HANG_WINDOW_DAYS",
                 "SCAN_IP_STALL_SEC", "SCAN_PORTSCAN_STALL_SEC", "SCAN_TASK_START_STALL_SEC",
-                "PORT_PROFILE", "UDP_PROFILE", "UDP_PORT_RANGE", "GVM_OPTIMIZE_TEST"):
+                "PORT_PROFILE", "UDP_PROFILE", "UDP_PORT_RANGE", "GVM_OPTIMIZE_TEST",
+                "SCAN_IP_DEADLINE_SEC", "SCAN_IP_WORKERS_FIXED", "FAST_PLUGINS_TIMEOUT", "SCAN_CHECK_SCOPE"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(perf, "_REGISTRY", NvtHangRegistry(tmp_path / "hangs.json"))
 
@@ -52,8 +53,8 @@ def test_only_repeat_timeouts_are_capped(tmp_path):
     reg.record([_err(OID_A)], host="h1")
     assert reg.caps() == {}  # one event is not a pattern
     reg.record([_err(OID_A), _err(OID_B, desc="Connection refused")], host="h2")
-    assert reg.caps() == {OID_A: 120}  # B was not a timeout
-    assert NvtHangRegistry(tmp_path / "h.json").caps() == {OID_A: 120}  # persisted
+    assert reg.caps() == {OID_A: 60}  # B was not a timeout; V1.6.7 cap default 60 s
+    assert NvtHangRegistry(tmp_path / "h.json").caps() == {OID_A: 60}  # persisted
 
 
 def test_port_scanners_and_crawlers_are_never_capped(tmp_path):
@@ -116,6 +117,7 @@ class FastGmp:
         self.with_timing = with_timing
         self.clone_error = clone_error
         self.prefs: list[tuple[str, str, str, str]] = []
+        self.scanner_prefs: dict[str, str] = {}
         self.names: list[str] = []
 
     def get_scan_configs(self, **kw):
@@ -140,6 +142,9 @@ class FastGmp:
     def modify_scan_config_set_comment(self, cid, comment):
         pass
 
+    def modify_scan_config_set_scanner_preference(self, cid, name, value=None):
+        self.scanner_prefs[name] = value
+
     def delete_scan_config(self, cid, ultimate=False):
         pass
 
@@ -147,7 +152,7 @@ class FastGmp:
 def test_fast_config_sets_gvmd_timeout_preferences_and_looked_up_timing():
     g = FastGmp()
     cid, status = gmp_local._ensure_fast_config(g, "base", {OID_A: 120}, "Aggressive")
-    assert cid == "fast-of-base" and g.names[0].startswith("Aetheris fast ")
+    assert cid == "fast-of-base" and g.names[0].startswith("Aetheris profile ")
     assert ("fast-of-base", f"{OID_A}:0:entry:timeout", OID_A, "120") in g.prefs
     assert ("fast-of-base", f"{NMAP}:11:radio:Timing policy :", NMAP, "Aggressive") in g.prefs
     assert status["nvt_timeout_caps"] == 1 and status["nmap_timing"] == "Aggressive"
@@ -161,9 +166,9 @@ def test_missing_timing_preference_is_reported_not_guessed():
 
 
 def test_fast_config_is_reused_and_falls_back_safely():
-    from agent.scan_performance import caps_digest
-
-    name = f"Aetheris fast {caps_digest({OID_A: 120}, 'base|Aggressive')}"
+    first = FastGmp()
+    gmp_local._ensure_fast_config(first, "base", {OID_A: 120}, "Aggressive")
+    name = first.names[0]
     g = FastGmp(existing=[("fast-1", name, '{"nvt_timeout_caps": 1}')])
     cid, status = gmp_local._ensure_fast_config(g, "base", {OID_A: 120}, "Aggressive")
     assert cid == "fast-1" and status["config"].startswith("reused") and g.prefs == []
@@ -171,8 +176,12 @@ def test_fast_config_is_reused_and_falls_back_safely():
     assert cid == "base" and status["config"].startswith("not applied")
 
 
+g_last: dict = {}
+
+
 def _launch(monkeypatch, policy=None):
     g = FastGmp()
+    g_last["gmp"] = g
     created = {}
 
     g.create_target = lambda **kw: created.setdefault("target", kw) and {"id": "t1"}
@@ -202,21 +211,28 @@ def test_fast_profile_reaches_the_greenbone_task(monkeypatch):
     prefs = created["task"]["preferences"]
     assert prefs["checks_read_timeout"] == "5" and prefs["max_checks"] == "5"
     assert created["task"]["config_id"] == "fast-of-cfg"
+    # V1.6.7: the values that matter reach OpenVAS as scan-config scanner preferences.
+    assert g_last["gmp"].scanner_prefs["plugins_timeout"] == "320"  # V1.6.8: Nessus default, no reduction
+    assert g_last["gmp"].scanner_prefs["checks_read_timeout"] == "5"
+    assert g_last["gmp"].scanner_prefs["optimize_test"] == "yes"
     assert snap["performance"] == "fast"
     assert snap["nvt_timeout_caps"]["oids"] == [OID_A] and snap["nvt_timeout_caps"]["applied"] == 1
     assert snap["performance_status"]["nmap_timing"] == "Aggressive"
 
 
-def test_standard_profile_is_unchanged(monkeypatch):
+def test_standard_profile_keeps_its_values_but_now_applies_them(monkeypatch):
     created, snap = _launch(monkeypatch, {"template": "basic_network", "performance": "standard"})
     prefs = created["task"]["preferences"]
     assert prefs["checks_read_timeout"] == "10" and prefs["max_checks"] == "4"
-    assert created["task"]["config_id"] == "cfg"
+    g = g_last["gmp"]
+    assert g.scanner_prefs == {"plugins_timeout": "320", "checks_read_timeout": "10",
+                               "optimize_test": "yes", "safe_checks": "yes"}
+    assert not any("Timing" in p[1] for p in g.prefs)  # no Nmap change in standard
     assert snap["performance"] == "standard"
 
 
 # --- watchdog in the real job loop ---------------------------------------------
-def _run_loop(monkeypatch, polls, *, stall_env=None):
+def _run_loop(monkeypatch, polls, *, stall_env=None, openvas_log=None, tmp_path=None):
     from agent import reachability
 
     uploaded, stops, events = [], [], []
@@ -262,6 +278,11 @@ def _run_loop(monkeypatch, polls, *, stall_env=None):
 
     for key, value in (stall_env or {}).items():
         monkeypatch.setenv(key, value)
+    if tmp_path is not None:
+        log_path = tmp_path / "openvas.log"
+        if openvas_log is not None:
+            log_path.write_text(openvas_log)
+        monkeypatch.setenv("OPENVAS_LOG_FILE", str(log_path))
     monkeypatch.setattr(main.time, "sleep", lambda _: None)
     monkeypatch.setattr(main.time, "monotonic", mono)
     monkeypatch.setattr(main, "should_watch_lan", lambda *a, **kw: False)
@@ -272,6 +293,7 @@ def _run_loop(monkeypatch, polls, *, stall_env=None):
         "reachable": list(targets), "unreachable": [], "skipped_hosts": []})
     monkeypatch.setenv("SKIP_UNREACHABLE_TARGETS", "false")
     monkeypatch.setenv("SCAN_DEGRADED_RETRY", "0")
+    monkeypatch.setenv("PORT_DISCOVERY_ENABLED", "false")  # hermetic: no real TCP probes
     scanner = Scanner()
     main._run_job_body({"api": Api(), "openvas": scanner, "poll": 0, "max_scan_runtime_sec": 0,
                         "progress_report_interval": 0, "high_progress_warn_sec": 300,
@@ -280,10 +302,17 @@ def _run_loop(monkeypatch, polls, *, stall_env=None):
     return uploaded, stops, events
 
 
-def test_frozen_task_is_stopped_and_reported_stalled_not_completed(monkeypatch):
+DEAD_SCANNER_LOG = (
+    "sd main:MESSAGE:2026-10-14 04h10.00 utc:1: Launching gb_x.nasl (1.3.6.1.4.1.25623.1.0.1) against 10.0.0.9 [501]\n"
+    "sd main:MESSAGE:2026-10-14 04h10.05 utc:1: gb_x.nasl (1.3.6.1.4.1.25623.1.0.1) [501] finished its job in 5.0 seconds\n"
+)
+
+
+def test_frozen_task_with_nothing_running_in_openvas_is_stopped_as_stalled(monkeypatch, tmp_path):
+    """V1.6.8: stop only on evidence. OpenVAS logs show no running check and no host finish."""
     frozen = lambda n: {"status": "running", "gmp_status": "running", "progress": 98,
                         "vulnerabilities": [], "evidence": {}}
-    uploaded, stops, events = _run_loop(monkeypatch, frozen)
+    uploaded, stops, events = _run_loop(monkeypatch, frozen, openvas_log=DEAD_SCANNER_LOG, tmp_path=tmp_path)
     assert stops == ["task-1"]
     stalled = [kw for ev, kw in events if ev == "stalled"]
     assert stalled and "no progress" in stalled[0]["reason"]
@@ -314,3 +343,29 @@ def test_slow_but_moving_task_is_never_stopped(monkeypatch):
     assert not [e for e, _ in events if e == "stalled"]
     plateau = max(stamps[i + 14] - stamps[i] for i in range(0, len(stamps) - 15, 15))
     assert 1000 < plateau < 1800, plateau
+
+
+def _frozen_then_done(limit):
+    def poll(n):
+        if n >= limit:
+            return {"status": "completed", "gmp_status": "done", "progress": 100, "vulnerabilities": [],
+                    "evidence": {"report_id": "rep", "task_status": "done", "assessed_hosts": ["10.0.0.9"],
+                                 "hosts_assessed": 1, "assessment_complete": True}}
+        return {"status": "running", "gmp_status": "running", "progress": 98, "vulnerabilities": [], "evidence": {}}
+    return poll
+
+
+def test_frozen_but_check_still_running_is_waited_for(monkeypatch, tmp_path):
+    log = ("sd main:MESSAGE:2026-10-14 04h10.00 utc:1: Launching gb_slow.nasl (1.3.6.1.4.1.25623.1.0.77) "
+           "against 10.0.0.9 [777]\n")
+    uploaded, stops, events = _run_loop(monkeypatch, _frozen_then_done(80), openvas_log=log, tmp_path=tmp_path)
+    assert stops == []
+    waits = [kw for ev, kw in events if ev == "stall_wait"]
+    assert waits and "gb_slow.nasl" in waits[0]["evidence"]
+    assert uploaded[-1]["status"] == "completed"
+
+
+def test_frozen_without_openvas_log_is_never_stopped_on_time_alone(monkeypatch, tmp_path):
+    uploaded, stops, events = _run_loop(monkeypatch, _frozen_then_done(80), tmp_path=tmp_path)
+    assert stops == [] and uploaded[-1]["status"] == "completed"
+    assert any(ev == "stall_wait" for ev, _ in events)

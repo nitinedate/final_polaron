@@ -14,10 +14,10 @@ const CATEGORY_LABEL: Record<string, string> = {
 };
 
 const PORT_PROFILE_LABEL: Record<string, string> = {
-  nessus: "Nessus default ports (IANA TCP list + service ports)",
-  nexus: "Nessus default ports (IANA TCP list + service ports)",
+  nexus: "Nexus service ports (52 service families)",
+  catalog: "Nexus service ports (52 service families)",
+  nessus: "IANA TCP list + service ports (wider, slower)",
   full: "All 65,535 TCP ports",
-  catalog: "Service catalog ports",
   focused: "Only the listed ports",
 };
 
@@ -141,6 +141,7 @@ export function ScanPoliciesPage() {
                         <span className="block text-xs text-ink-500">
                           {UDP_LABEL[String(effective.udp_profile ?? "")] || "Scanner default UDP"}
                           {effective.performance ? ` · ${String(effective.performance) === "fast" ? "Fast" : "Standard"} speed` : ""}
+                          {effective.check_scope ? ` · ${String(effective.check_scope) === "all" ? "All checks" : "Vulnerability checks only"}` : ""}
                         </span>
                       </td>
                       <td className="px-5 py-3 text-ink-600">
@@ -202,6 +203,7 @@ function PolicyModal({
   const [portProfile, setPortProfile] = useState("");
   const [udpProfile, setUdpProfile] = useState("");
   const [performance, setPerformance] = useState("");
+  const [checkScope, setCheckScope] = useState("");
   const [extraPorts, setExtraPorts] = useState("");
   const [smbRef, setSmbRef] = useState("");
   const [sshRef, setSshRef] = useState("");
@@ -232,6 +234,7 @@ function PolicyModal({
     if (portProfile) settings.port_profile = portProfile;
     if (udpProfile) settings.udp_profile = udpProfile;
     if (performance) settings.performance = performance;
+    if (checkScope) settings.check_scope = checkScope;
     const extra = parsePorts(extraPorts);
     if (extra.length) {
       const base = (template.settings.custom_tcp_ports || []).map(String);
@@ -364,9 +367,9 @@ function PolicyModal({
             <Field label="TCP port scope">
               <Select value={portProfile} onChange={(e) => setPortProfile(e.target.value)}>
                 <option value="">Template default</option>
-                <option value="nessus">Nessus default ports</option>
-                <option value="full">All 65,535 TCP ports</option>
-                <option value="catalog">Service catalog ports</option>
+                <option value="nexus">Nexus service ports</option>
+                <option value="nessus">IANA TCP list (wider, slower)</option>
+                <option value="full">All 65,535 TCP ports (slowest)</option>
               </Select>
             </Field>
             <Field label="UDP">
@@ -384,14 +387,29 @@ function PolicyModal({
           label="Speed"
           hint={
             performance === "standard"
-              ? "Pre-1.6.6 timing: 10 s socket timeout, 4 checks per host, every check gets its full 320 s."
-              : "Fast keeps every check and port. It uses the Nessus/OpenVAS default 5 s socket timeout, 5 checks per host, Nmap Aggressive timing, and shorter time limits only for checks that already timed out repeatedly."
+              ? "Pre-1.6.6 engine timing: 10 s socket timeout and 4 checks at once per host."
+              : "Fast uses the Nessus/OpenVAS default 5 s socket timeout, 5 checks at once per host and Nmap Aggressive timing. Checks that already timed out twice are limited to 60 s. There is no time limit on an IP."
           }
         >
           <Select value={performance} onChange={(e) => setPerformance(e.target.value)}>
             <option value="">Scanner default</option>
             <option value="fast">Fast</option>
             <option value="standard">Standard</option>
+          </Select>
+        </Field>
+
+        <Field
+          label="Checks"
+          hint={
+            checkScope === "all"
+              ? "Every check in Full and fast, including informational inventory and reporting checks."
+              : "Only checks that can report Critical, High, Medium or Low, plus the detection they need. Brute force, compliance and policy checks are skipped."
+          }
+        >
+          <Select value={checkScope} onChange={(e) => setCheckScope(e.target.value)}>
+            <option value="">Scanner default</option>
+            <option value="vulnerability">Vulnerability checks only</option>
+            <option value="all">All checks (includes informational)</option>
           </Select>
         </Field>
 

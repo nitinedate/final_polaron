@@ -33,6 +33,9 @@ def test_multi_host_resume_chunk_updates_every_selected_host():
 def test_job_loop_posts_complete_snapshots_including_waiting_hosts(monkeypatch):
     from agent import main
 
+    # Adaptive sizing path (IP_WORKERS_MIN=5); the V1.6.7 fixed pool is tested separately.
+    monkeypatch.setenv("SCAN_IP_WORKERS_FIXED", "0")
+
     hosts = [f"10.0.0.{i}" for i in range(1, 8)]
     patches = []
     results = []

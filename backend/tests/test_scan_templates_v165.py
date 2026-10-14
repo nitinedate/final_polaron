@@ -91,7 +91,7 @@ def test_template_endpoint_lists_nessus_equivalents(monkeypatch):
     audit = next(r for r in rows if r["key"] == "credentialed_patch_audit")
     assert audit["requires_credentials"] == ["smb", "ssh"]
     basic = next(r for r in rows if r["key"] == "basic_network")
-    assert basic["settings"]["port_profile"] == "nessus" and basic["settings"]["optimize_test"] == "yes"
+    assert basic["settings"]["port_profile"] == "nexus" and basic["settings"]["optimize_test"] == "yes"
 
 
 def test_credential_gap_blocks_patch_audit_without_reference():
