@@ -94,6 +94,10 @@ SNAPSHOT_FIELDS = {
     "service_port_policy_version",
     "scan_addresses",
     "self_scan",
+    # V1.9.0: laptop-local credential provisioning (kind names + status only; no
+    # secret ever enters a snapshot).
+    "auto_provisioned_credentials",
+    "local_credential_status",
 }
 SCAN_PURPOSES = {"vulnerability", "ping_discovery", "credential_validation", "compliance"}
 _NAME_FILTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/()+-]{0,59}$")

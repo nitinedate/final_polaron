@@ -299,6 +299,8 @@ export interface ScanJobSeveritySummary {
   policy_snapshots?: Record<string, { port_range?: string; snapshot_status: string;
     configuration_sha256?: string; feed_versions?: Record<string, string>;
     credential_status?: Record<string, string>; template?: string; template_name?: string;
+    /** V1.9.0: laptop-local credential provisioning (kind -> status text; no secret). */
+    local_credential_status?: Record<string, string>; auto_provisioned_credentials?: string[];
     scan_config_name?: string; port_list_status?: string; family_scope_status?: string;
     tcp_port_count?: number; udp_port_count?: number;
     performance?: "fast" | "standard" | string;

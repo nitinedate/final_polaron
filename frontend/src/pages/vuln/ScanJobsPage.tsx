@@ -1291,6 +1291,15 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                         <p className="break-all font-mono">SHA-256: {policy.configuration_sha256 || "Unavailable"}</p>
                         <p>Feed: {JSON.stringify(policy.feed_versions || {})}</p>
                         <p>Credential status: {JSON.stringify(policy.credential_status || {})}</p>
+                        {policy.local_credential_status && Object.keys(policy.local_credential_status).length ? (
+                          <p className="mt-1 text-sky-800">
+                            Laptop credentials:{" "}
+                            {Object.entries(policy.local_credential_status).map(([k, v]) => `${k.toUpperCase()}: ${v}`).join(" · ")}
+                          </p>
+                        ) : null}
+                        {policy.auto_provisioned_credentials?.length ? (
+                          <p className="text-emerald-700">Authenticated scan — auto-bound {policy.auto_provisioned_credentials.map((k) => k.toUpperCase()).join(", ")} credential(s) from the laptop.</p>
+                        ) : null}
                       </details>
                     ))}
                   </div>

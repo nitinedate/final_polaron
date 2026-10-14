@@ -2193,7 +2193,24 @@ class LocalOpenVAS:
         }
         scan_hosts = [aliases.get(h, h) for h in host_list]
         snapshot = _effective_scan_policy(scan_policy, self.port_profile, self.udp_profile)
-        gap = credential_gap(snapshot)
+        # V1.9.0: a required credential kind the laptop can provision locally is
+        # not a gap; the credential is created inside the session below. Evaluate
+        # the gap against refs the policy supplied PLUS kinds the laptop can
+        # provide, so a Nexpose/credentialed audit with the SMB login set on the
+        # laptop launches instead of being refused.
+        gap_request = dict(snapshot)
+        try:
+            from agent.local_credentials import available_kinds
+
+            local_kinds = set(available_kinds())
+        except Exception:
+            local_kinds = set()
+        if local_kinds:
+            merged_refs = dict(gap_request.get("gmp_credential_refs") or {})
+            for kind in local_kinds:
+                merged_refs.setdefault(kind, "pending-local-provision")
+            gap_request["gmp_credential_refs"] = merged_refs
+        gap = credential_gap(gap_request)
         if gap:
             # Fail before any target/task exists: a patch audit without
             # credentials would look complete while testing nothing it promised.
@@ -2272,6 +2289,30 @@ class LocalOpenVAS:
             scanner_id = _find_scanner_id(gmp)
             bindings: dict[str, str] = {}
             credential_status: dict[str, str] = {}
+            # V1.9.0: provision SMB/SSH credentials held locally on the laptop so a
+            # policy that asks for credentials (or auto-bind) runs authenticated,
+            # instead of only accepting a pre-existing Greenbone credential UUID.
+            # Passwords/keys never came through the central policy; they are read
+            # from the laptop environment inside agent.local_credentials.
+            try:
+                from agent.local_credentials import resolve_refs
+
+                resolved = resolve_refs(
+                    gmp,
+                    requested_kinds=list(snapshot.get("require_credentials") or []),
+                    existing_refs=dict(snapshot.get("gmp_credential_refs") or {}),
+                )
+                snapshot["gmp_credential_refs"] = dict(resolved["refs"])
+                if resolved["provisioned"]:
+                    snapshot["auto_provisioned_credentials"] = resolved["provisioned"]
+                if resolved["status"]:
+                    snapshot["local_credential_status"] = resolved["status"]
+                    log.info(
+                        "Local credential provisioning: %s",
+                        ", ".join(f"{k}: {v}" for k, v in sorted(resolved["status"].items())),
+                    )
+            except Exception:
+                log.warning("Local credential provisioning failed; using only policy-supplied refs", exc_info=True)
             for kind, credential_id in snapshot["gmp_credential_refs"].items():
                 try:
                     response = gmp.get_credential(credential_id)
