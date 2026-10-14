@@ -81,3 +81,32 @@ def test_bind_full_flow(monkeypatch):
     assert calls[0][2]["body"] == {"token": "client"}
     assert calls[1][2]["bearer"] == "session"
     assert calls[2][2]["bearer"] == "agent"
+
+
+# V1.9.0: connection-level failures get an actionable cause, not the old
+# "keep CENTRAL_API_URL on the server IP" message (which is wrong for a refusal).
+def test_connect_diagnosis_connection_refused_names_the_port():
+    msg = b._connect_diagnosis(OSError("[Errno 111] Connection refused"), "122.179.141.248", 443)
+    assert "nothing is listening on port 443" in msg
+    assert "setup-public-https.ps1" in msg
+    assert "not a laptop or" in msg  # tells the operator it is server-side
+
+
+def test_connect_diagnosis_distinguishes_timeout_dns_and_cert():
+    assert "timed out" in b._connect_diagnosis(TimeoutError("timed out"), "10.0.0.5", 443)
+    assert "could not be resolved" in b._connect_diagnosis(
+        OSError("Name or service not known"), "central.invalid", 443)
+    assert "certificate" in b._connect_diagnosis(
+        Exception("certificate verify failed"), "10.0.0.5", 443).lower()
+
+
+def test_preflight_connection_refused_sets_diagnosis(monkeypatch):
+    def boom(*args, **kwargs):
+        raise OSError("[Errno 111] Connection refused")
+
+    monkeypatch.setattr(b, "_request_json", boom)
+    monkeypatch.setattr(b, "_cert_details", lambda host, port: {"error": "[Errno 111] Connection refused"})
+    monkeypatch.setattr(b, "_http_redirect_hint", lambda base, tenant: None)
+    result = b.preflight("https://122.179.141.248", "p", False)
+    assert result["ok"] is False and result["stage"] == "tls_or_connect"
+    assert "nothing is listening on port 443" in result["diagnosis"]

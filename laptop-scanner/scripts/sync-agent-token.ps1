@@ -800,9 +800,11 @@ function Format-BootstrapFailure($Result) {
     $stage = [string]$Result.stage
     $status = [string]$Result.status
     $error = [string]$Result.error
+    $diagnosis = [string]$Result.diagnosis
     if ($stage) { $parts.Add("stage=$stage") }
     if ($status) { $parts.Add("HTTP=$status") }
     if ($error) { $parts.Add($error) }
+    if ($diagnosis) { $parts.Add("Cause: $diagnosis") }
     $cert = $Result.certificate
     if ($null -ne $cert) {
         if ([string]$cert.subject) { $parts.Add("Certificate subject: $([string]$cert.subject)") }
@@ -832,7 +834,9 @@ function Sync-LaptopAgentToken {
     $pre = Invoke-DockerBootstrapJson -Root $Root -Mode 'preflight' -Base $central -Tenant $tenant -VerifyTls $verifyTls
     if (-not [bool]$pre.ok) {
         $detail = Format-BootstrapFailure $pre
-        throw "Central HTTPS preflight failed inside Linux Docker.`n$detail`nKeep VERIFY_TLS=true and keep CENTRAL_API_URL on the server IP address."
+        # The specific cause (connection refused / timeout / DNS / certificate) is in
+        # $detail now; do not assert a single fixed remedy that may be wrong.
+        throw "Central HTTPS preflight failed inside Linux Docker.`n$detail"
     }
     $canonical = ([string]$pre.canonical_url).Trim().TrimEnd('/')
     if ([string]::IsNullOrWhiteSpace($canonical)) { throw 'Docker bootstrap did not return canonical_url.' }

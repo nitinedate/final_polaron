@@ -164,6 +164,49 @@ def _name_to_text(items: Any) -> str:
     return ", ".join(parts)
 
 
+def _connect_diagnosis(exc: BaseException, host: str, port: int) -> str:
+    """Turn a low-level connect/TLS error into an operator-facing cause.
+
+    The default message ("keep CENTRAL_API_URL on the server IP") is wrong for a
+    connection-refused: the host is reachable but nothing is listening on that
+    port. Name the real cause so the fix is obvious.
+    """
+    text = _exception_text(exc).lower()
+    where = f"{host}:{port}"
+    if "refused" in text or "errno 111" in text:
+        return (
+            f"The central server answered but refused the connection on {where}: "
+            f"nothing is listening on port {port}. The HTTPS gateway is not running on "
+            "the central server (its public HTTPS listener on 80/443 was never started), "
+            "or CENTRAL_API_URL points at the wrong port. On the central server run "
+            "scripts/setup-public-https.ps1 to publish 80/443, or set CENTRAL_API_URL to "
+            "the port the gateway actually serves (for example :3000 for the HTTP gateway). "
+            "This is a central-server/firewall/port-forwarding issue, not a laptop or "
+            "certificate problem."
+        )
+    if "timed out" in text or "timeout" in text:
+        return (
+            f"The connection to {where} timed out: packets are being dropped. Check the "
+            "router WAN->LAN port-forward for this port, the central host firewall, and "
+            "that the central server is powered on and reachable from this network."
+        )
+    if "name or service not known" in text or "nodename" in text or "getaddrinfo" in text or "temporary failure in name" in text:
+        return (
+            f"The hostname in CENTRAL_API_URL ({host}) could not be resolved. Use the "
+            "server IP address, or fix DNS."
+        )
+    if "certificate" in text or "ssl" in text or "verify failed" in text or "tlsv1" in text:
+        return (
+            f"TLS negotiated to {where} but the certificate was rejected. Set VERIFY_TLS=false "
+            "for a self-signed/IP certificate, or install a certificate whose SAN covers "
+            f"{host}."
+        )
+    return (
+        f"Could not establish an HTTPS session to {where}. Confirm the central gateway is "
+        f"running and reachable on port {port} from this laptop's network."
+    )
+
+
 def _exception_text(exc: BaseException) -> str:
     parts: list[str] = []
     current: BaseException | None = exc
@@ -255,6 +298,7 @@ def preflight(base: str, tenant: str, verify_tls: bool) -> dict[str, Any]:
             "ok": False,
             "stage": "tls_or_connect",
             "error": _exception_text(exc),
+            "diagnosis": _connect_diagnosis(exc, host, port),
             "certificate": details,
             "http_redirect_hint": hint,
             "transport": "docker-httpx-openssl",
