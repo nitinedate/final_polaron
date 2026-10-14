@@ -1,6 +1,10 @@
 from unittest.mock import Mock
 
-from app.db.sql_helpers import is_retryable_db_error, retry_on_deadlock
+from app.db.sql_helpers import (
+    is_retryable_db_error,
+    lock_job_artifacts_in_id_order,
+    retry_on_deadlock,
+)
 from app.services.artifact_parse import (
     PATH_ANY_CHUNK,
     _claim_pending_rows,
@@ -22,6 +26,14 @@ def test_iter_path_chunks_keeps_any_bind_small():
 
 def test_iter_path_chunks_skips_empty():
     assert list(iter_path_chunks(["", "a", ""])) == [["a"]]
+
+
+def test_artifact_locks_are_taken_in_id_order():
+    import inspect
+
+    source = inspect.getsource(lock_job_artifacts_in_id_order)
+    assert "ORDER BY id" in source
+    assert "FOR UPDATE" in source
 
 
 def test_retryable_db_errors():

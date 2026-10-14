@@ -17,7 +17,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 from typing import Any
 
-from app.db.sql_helpers import execute, fetchall
+from app.db.sql_helpers import fetchall, lock_job_artifacts_in_id_order, retry_on_deadlock
 
 log = logging.getLogger("mobile_quality_ocr")
 OCR_QUALITY_POLICY = "v68-text-likelihood"
@@ -224,7 +224,10 @@ def _route_forensic_quality_to_ocr_impl(
         return {"checked": 0, "queued": 0, "clear": 0, "errors": 0}
 
     # Remove known cache/vendor noise before spending CPU/GPU on quality checks.
+    # Skips are written once, locked in id order. Row-by-row updates in path
+    # order deadlocked with parse, which locks the same artifacts by id.
     candidates: list[dict[str, Any]] = []
+    skips: list[tuple[str, str, str]] = []
     for row in rows:
         ext = str(row.get("extension") or Path(str(row.get("file_path") or "")).suffix).lower()
         if ext and not ext.startswith("."):
@@ -233,24 +236,53 @@ def _route_forensic_quality_to_ocr_impl(
         if isinstance(meta,str):
             try: meta=json.loads(meta)
             except Exception: meta={}
+        artifact_id = str(row["id"])
         if ext in _DOC_EXT and _normalized_text_is_usable(meta):
-            execute(db, """UPDATE job_artifacts SET metadata=coalesce(metadata,'{}'::jsonb)||CAST(:m AS jsonb),
-                       ocr_status=CASE WHEN coalesce(ocr_status,'')='done' THEN ocr_status ELSE 'skipped' END, updated_at=NOW() WHERE id=:id""",
-                    {"id":row["id"],"m":json.dumps({"ocr_quality_checked":True,"ocr_quality_bucket":False,"ocr_quality_reason":"native_text_readable"})})
+            skips.append((
+                artifact_id,
+                json.dumps({"ocr_quality_checked": True, "ocr_quality_bucket": False, "ocr_quality_reason": "native_text_readable"}),
+                "native",
+            ))
             continue
         if is_ocr_noise_path(str(row.get("file_path") or ""), size_bytes=int(row.get("size_bytes") or 0), extension=ext):
-            execute(
-                db,
-                """UPDATE job_artifacts SET metadata=coalesce(metadata,'{}'::jsonb) || CAST(:m AS jsonb),
-                       ocr_status=CASE WHEN ocr_status='pending' THEN 'skipped' ELSE ocr_status END,
-                       updated_at=NOW() WHERE id=:id""",
-                {"id": row["id"], "m": json.dumps({"ocr_quality_checked": True, "ocr_quality_bucket": False, "ocr_quality_reason": "known_noise"})},
-            )
+            skips.append((
+                artifact_id,
+                json.dumps({"ocr_quality_checked": True, "ocr_quality_bucket": False, "ocr_quality_reason": "known_noise"}),
+                "noise",
+            ))
             continue
         item = dict(row)
         item["_ext"] = ext
         candidates.append(item)
-    db.commit()
+
+    def _write_quality_skips() -> None:
+        if not skips:
+            db.commit()
+            return
+        ordered = sorted(skips, key=lambda item: item[0])
+        lock_job_artifacts_in_id_order(db, [item[0] for item in ordered])
+        from psycopg2.extras import execute_values
+
+        with db.connection().connection.cursor() as cur:
+            execute_values(
+                cur,
+                """UPDATE job_artifacts AS ja
+                   SET metadata=coalesce(ja.metadata,'{}'::jsonb) || v.meta::jsonb,
+                       ocr_status=CASE
+                           WHEN v.kind='native' AND coalesce(ja.ocr_status,'')='done' THEN ja.ocr_status
+                           WHEN v.kind='native' THEN 'skipped'
+                           WHEN v.kind='noise' AND ja.ocr_status='pending' THEN 'skipped'
+                           ELSE ja.ocr_status
+                       END,
+                       updated_at=NOW()
+                   FROM (VALUES %s) AS v(id, meta, kind)
+                   WHERE ja.id=v.id::uuid""",
+                ordered,
+                page_size=500,
+            )
+        db.commit()
+
+    retry_on_deadlock(db, _write_quality_skips)
 
     # V58: coalesce quality reads by extracted tar.zst shard. The old path
     # called _read_artifact_bytes() once per image/document, which can decompress
@@ -372,9 +404,16 @@ def _route_forensic_quality_to_ocr_impl(
         updates.append((str(row["id"]), json.dumps(meta), poor))
 
     # V58: one set-based PostgreSQL write per quality batch instead of one
-    # UPDATE statement per evidence item. This matters at 100k+ artifacts.
-    if updates:
+    # UPDATE statement per evidence item. Lock ids in order so this batch cannot
+    # deadlock with parse or OCR updates of the same artifacts.
+    def _write_quality_results() -> None:
+        if not updates:
+            db.commit()
+            return
+        ordered = sorted(updates, key=lambda item: item[0])
+        lock_job_artifacts_in_id_order(db, [item[0] for item in ordered])
         from psycopg2.extras import execute_values
+
         with db.connection().connection.cursor() as cur:
             execute_values(
                 cur,
@@ -386,10 +425,12 @@ def _route_forensic_quality_to_ocr_impl(
                        updated_at=NOW()
                    FROM (VALUES %s) AS v(id,meta,poor)
                    WHERE ja.id=v.id::uuid""",
-                updates,
+                ordered,
                 page_size=500,
             )
-    db.commit()
+        db.commit()
+
+    retry_on_deadlock(db, _write_quality_results)
 
     if queued:
         try:

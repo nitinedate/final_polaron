@@ -211,7 +211,24 @@ function Remove-ForeignComposeContainerNames {
 function Invoke-StackUp {
     param([string]$Name, [string[]]$ComposeArgs)
     Remove-ForeignComposeContainerNames -Name $Name -ComposeArgs $ComposeArgs
-    Invoke-Docker -Title "Start $Name" -DockerArgs ($ComposeArgs + @('up', '-d', '--no-build', '--pull', 'missing'))
+    $upArgs = @($ComposeArgs) + @('up', '-d', '--no-build', '--pull', 'missing')
+    Write-Host "Start $Name"
+    & docker @upArgs
+    if ($LASTEXITCODE -eq 0) { return }
+    $firstCode = $LASTEXITCODE
+    # Replacing the API sends SIGTERM, which is exit 143. Compose then reports
+    # "dependency api failed to start" and leaves workers Created, even when the
+    # replacement API is coming up. Wait until it is healthy and start them.
+    $project = "aetheris-$Name"
+    $ready = Wait-ComposeServiceReady -ProjectName $project -Service 'api' -TimeoutSeconds 240
+    if (-not $ready) {
+        throw "Docker action 'Start $Name' failed (exit $firstCode)."
+    }
+    Write-Host "    $Name API is healthy after the recreate. Starting services left created."
+    & docker @upArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Docker action 'Start $Name' failed (exit $LASTEXITCODE)."
+    }
 }
 
 function Ensure-MobileCoreWorkersStarted {
