@@ -16,7 +16,23 @@ import type {
   ScanJobSeveritySummary,
   ScanJobTargetProgress,
   ScanPolicy,
+  ScanPolicyTemplate,
 } from "../../lib/types/vuln";
+
+/** V1.8.0: launch-dialog policy groups (custom first, then built-ins by scanner). */
+const POLICY_GROUP_ORDER = ["custom", "nexpose", "nessus", "aetheris"];
+const POLICY_GROUP_LABEL: Record<string, string> = {
+  custom: "Your policies",
+  nexpose: "Nexpose / InsightVM equivalents (built-in)",
+  nessus: "Nessus equivalents (built-in)",
+  aetheris: "Threat checks (built-in)",
+};
+const DEFAULT_TEMPLATE_KEY = "nx_full_audit";
+
+function policyGroup(p: ScanPolicy): string {
+  if (!p.is_builtin) return "custom";
+  return POLICY_GROUP_ORDER.includes(String(p.vendor)) ? String(p.vendor) : "nessus";
+}
 
 function isRemoteScannerUrl(url: string | null | undefined): boolean {
   const u = (url || "").trim().toLowerCase();
@@ -844,11 +860,17 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
     targetRows.some((row) => ["incomplete", "failed", "skipped"].includes(String(row.status).toLowerCase())) ||
     /host\(s\) incomplete|coverage incomplete/i.test(summary?.progress_label || "")
   );
-  // Every host finished its network scan, but the result is not clean-eligible
-  // (scanner warnings, no credentials, or unverified per-service checks).
+  // V1.8.0: amber only for real problems (plugin errors, skipped or unfinished
+  // hosts, check warnings). An unauthenticated scan that finished is
+  // "completed" with a neutral note. Older servers without the warnings list
+  // keep the previous behaviour.
+  const assessmentWarnings = summary?.assessment?.warnings;
   const completedWithWarnings = jobStatus === "completed" && !coverageIncomplete && summary?.assessment
-    ? summary.assessment.clean_eligible === false
+    ? Array.isArray(assessmentWarnings)
+      ? assessmentWarnings.length > 0
+      : summary.assessment.clean_eligible === false
     : false;
+  const assessmentNotes = summary?.assessment?.notes || [];
   const shownStatus = coverageIncomplete
     ? "Completed · coverage incomplete"
     : completedWithWarnings
@@ -888,8 +910,17 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                     The network scan finished for every host. Findings are valid; a clean result is not claimed because:
                   </p>
                   <ul className="mt-1 list-disc pl-5">
-                    {(cleanBlockers.length ? cleanBlockers : ["Service checks are not verified per family"]).map((reason) => (
+                    {(assessmentWarnings?.length ? assessmentWarnings : cleanBlockers.length ? cleanBlockers : ["Service checks are not verified per family"]).map((reason) => (
                       <li key={reason}>{reason}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {jobStatus === "completed" && !coverageIncomplete && assessmentNotes.length ? (
+                <div className="mt-2 max-w-xl rounded-md border border-ink-200 bg-ink-50 px-3 py-2 text-sm text-ink-700">
+                  <ul className="list-disc pl-5">
+                    {assessmentNotes.map((note) => (
+                      <li key={note} className="break-words">{note}</li>
                     ))}
                   </ul>
                 </div>
@@ -952,11 +983,29 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                                 {row.coverage.open_udp_port_list?.length ? ` · UDP: ${row.coverage.open_udp_port_list.join(", ")}` : ""}
                               </span>
                             ) : null}
+                            {row.self_scan ? (
+                              <span className="mt-1 block text-xs text-sky-800">
+                                Scanner laptop: scanned through loopback {row.self_scan.scanned_via} (local view)
+                                {row.self_scan.network_exposure
+                                  ? row.self_scan.network_exposure.open?.length
+                                    ? ` · exposed to the network: ${row.self_scan.network_exposure.open.join(", ")}`
+                                    : ` · from the network: ${row.self_scan.network_exposure.filtered_count ?? 0} port(s) blocked by its firewall`
+                                  : ""}
+                              </span>
+                            ) : null}
                             {row.warnings?.length ? (
                               <details className="mt-1 text-xs">
                                 <summary className="cursor-pointer text-amber-800">{row.warnings.length} check warning(s)</summary>
                                 <ul className="mt-1 list-disc pl-4 text-ink-600">
                                   {row.warnings.map((w) => <li key={w} className="break-words">{w}</li>)}
+                                </ul>
+                              </details>
+                            ) : null}
+                            {row.notes?.length ? (
+                              <details className="mt-1 text-xs">
+                                <summary className="cursor-pointer text-ink-600">{row.notes.length} note(s)</summary>
+                                <ul className="mt-1 list-disc pl-4 text-ink-600">
+                                  {row.notes.map((n) => <li key={n} className="break-words">{n}</li>)}
                                 </ul>
                               </details>
                             ) : null}
@@ -1035,7 +1084,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                     <span className={summary.assessment.verified ? "font-semibold text-emerald-700" : "font-semibold text-red-700"}>
                       {summary.assessment.label}
                     </span>
-                    <span className="font-semibold text-ink-700">Clean-result eligible (all required evidence)</span>
+                    <span className="font-semibold text-ink-700" title="A clean (no vulnerabilities) conclusion needs authenticated evidence: add an SMB or SSH credential to the policy">Clean-result eligible (needs credentials)</span>
                     <span className={summary.assessment.clean_eligible ? "font-semibold text-emerald-700" : "font-semibold text-amber-700"}>
                       {summary.assessment.clean_eligible ? "YES" : "NO"}
                     </span>
@@ -1267,6 +1316,12 @@ function LaunchModal({
   const [loading, setLoading] = useState(false);
   const [scanners, setScanners] = useState<Scanner[]>([]);
   const [networkSession, setNetworkSession] = useState<NetworkToken | null>(null);
+  // V1.8.0: reload policies whenever the dialog opens. The page used to load
+  // them once and hide any error, which showed an empty dropdown.
+  const [policyRows, setPolicyRows] = useState<ScanPolicy[]>(policies);
+  const [templates, setTemplates] = useState<ScanPolicyTemplate[]>([]);
+  const [policyError, setPolicyError] = useState("");
+  const [policiesLoading, setPoliciesLoading] = useState(true);
   const [form, setForm] = useState({
     policy_id: "",
     scanner_id: "",
@@ -1276,6 +1331,51 @@ function LaunchModal({
     authorization_ref: "CHG-12345 / written authorization ID",
     preflight_confirmed: false,
   });
+
+  useEffect(() => {
+    let cancelled = false;
+    setPoliciesLoading(true);
+    Promise.all([
+      vulnApi.listScanPolicies(caseId).then(
+        (rows) => ({ rows, error: "" }),
+        (e: unknown) => ({ rows: [] as ScanPolicy[], error: e instanceof Error ? e.message : "Could not load policies" }),
+      ),
+      vulnApi.listScanPolicyTemplates().catch(() => [] as ScanPolicyTemplate[]),
+    ]).then(([res, tpls]) => {
+      if (cancelled) return;
+      setPolicyRows(res.rows);
+      setPolicyError(res.error);
+      setTemplates(tpls);
+      setPoliciesLoading(false);
+      setForm((prev) => {
+        if (prev.policy_id) return prev;
+        const preferred = res.rows.find((p) => p.is_builtin && p.template_key === DEFAULT_TEMPLATE_KEY);
+        if (preferred) return { ...prev, policy_id: preferred.id };
+        if (!res.rows.length && tpls.some((t) => t.key === DEFAULT_TEMPLATE_KEY)) {
+          return { ...prev, policy_id: `tpl:${DEFAULT_TEMPLATE_KEY}` };
+        }
+        return prev;
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [caseId]);
+
+  const policyGroups = useMemo(() => {
+    const out = new Map<string, ScanPolicy[]>();
+    for (const p of policyRows) out.set(policyGroup(p), [...(out.get(policyGroup(p)) || []), p]);
+    return POLICY_GROUP_ORDER.filter((g) => out.has(g)).map((g) => [g, out.get(g) || []] as const);
+  }, [policyRows]);
+  // Fallback when no policy row could be loaded: launch straight from a template.
+  const templateFallback = useMemo(
+    () => (policyRows.length ? [] : templates.filter((t) => t.seed_as_builtin)),
+    [policyRows, templates],
+  );
+  const selectedPolicy = policyRows.find((p) => p.id === form.policy_id);
+  const selectedTemplate = templates.find(
+    (t) => t.key === (form.policy_id.startsWith("tpl:") ? form.policy_id.slice(4) : selectedPolicy?.template_key),
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -1413,8 +1513,10 @@ function LaunchModal({
     }
     setLoading(true);
     try {
+      const fromTemplate = form.policy_id.startsWith("tpl:") ? form.policy_id.slice(4) : null;
       await vulnApi.createScanJob(caseId, {
-        policy_id: form.policy_id || null,
+        policy_id: fromTemplate ? null : form.policy_id || null,
+        template_key: fromTemplate,
         scanner_id: form.scanner_id || null,
         authorization_ref: form.authorization_ref,
         targets,
@@ -1471,13 +1573,21 @@ function LaunchModal({
             a token, this launch uses the selected server/VPN scanner as before.
           </p>
         )}
-        <Field label="Policy">
+        <Field
+          label="Policy"
+          error={policyError ? `Policies could not be loaded: ${policyError}` : undefined}
+          hint={
+            policiesLoading
+              ? "Loading policies…"
+              : "Credentialed templates (Microsoft hotfix, Linux RPMs, CIS, DISA, patch audit) can be launched after you create them with a credential in Scan policies."
+          }
+        >
           <Select
             className="text-base"
             value={form.policy_id}
             onChange={(e) => {
               const policyId = e.target.value;
-              const pol = policies.find((p) => p.id === policyId);
+              const pol = policyRows.find((p) => p.id === policyId);
               setForm({
                 ...form,
                 policy_id: policyId,
@@ -1485,13 +1595,35 @@ function LaunchModal({
               });
             }}
           >
-            <option value="">— default —</option>
-            {policies.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
+            <option value="">— scanner default (service ports, Full and fast) —</option>
+            {policyGroups.map(([group, rows]) => (
+              <optgroup key={group} label={POLICY_GROUP_LABEL[group] || group}>
+                {rows.map((p) => (
+                  <option key={p.id} value={p.id} disabled={Boolean(p.credentials_missing)}>
+                    {p.name}
+                    {p.credentials_missing ? " (needs a credential)" : ""}
+                  </option>
+                ))}
+              </optgroup>
             ))}
+            {templateFallback.length ? (
+              <optgroup label="Built-in templates">
+                {templateFallback.map((t) => (
+                  <option key={t.key} value={`tpl:${t.key}`}>
+                    {t.name}
+                  </option>
+                ))}
+              </optgroup>
+            ) : null}
           </Select>
+          {selectedTemplate ? (
+            <p className="mt-1.5 text-sm text-ink-600">
+              {selectedTemplate.description}
+              {selectedTemplate.vendor === "nexpose" && selectedTemplate.nexpose_template
+                ? ` (Nexpose: ${selectedTemplate.nexpose_template})`
+                : ""}
+            </p>
+          ) : null}
         </Field>
 
         <Field

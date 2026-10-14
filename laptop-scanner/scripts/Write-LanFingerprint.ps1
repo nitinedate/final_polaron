@@ -30,9 +30,25 @@ function Get-LanFingerprint {
     } catch {
         $gw = ""
     }
+    # V1.8.0: every IPv4 address of this laptop, so the scanner-agent can tell
+    # when an authorized target is the scanner itself (scanned via loopback).
+    $hostIps = @()
+    try {
+        $hostIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object {
+                $_.IPAddress -notlike '127.*' -and
+                $_.IPAddress -notlike '169.254.*' -and
+                ($_.AddressState -eq 'Preferred' -or "$($_.AddressState)" -eq '4')
+            } |
+            ForEach-Object { [string]$_.IPAddress } |
+            Sort-Object -Unique)
+    } catch {
+        $hostIps = @()
+    }
     $payload = @{
         gateway   = $gw
         subnet    = $subnet
+        host_ips  = @($hostIps)
         source    = "host"
         updated_at = (Get-Date).ToUniversalTime().ToString("o")
     } | ConvertTo-Json -Compress

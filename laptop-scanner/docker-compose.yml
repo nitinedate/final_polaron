@@ -222,6 +222,10 @@ services:
     image: registry.community.greenbone.net/community/ospd-openvas:stable
     hostname: ospd-openvas.local
     restart: on-failure
+    # V1.8.0: lets a scan of the laptop's own IP go through the Docker loopback,
+    # which the laptop firewall does not filter (see scanner-agent/agent/self_target.py).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -353,7 +357,7 @@ services:
       CENTRAL_API_CONNECT_TIMEOUT_SEC: ${CENTRAL_API_CONNECT_TIMEOUT_SEC:-4}
       CENTRAL_RESULT_TIMEOUT_SEC: ${CENTRAL_RESULT_TIMEOUT_SEC:-120}
       PROGRESS_REPORT_INTERVAL_SEC: ${PROGRESS_REPORT_INTERVAL_SEC:-45}
-      AGENT_VERSION: ${AGENT_VERSION:-1.7.0}
+      AGENT_VERSION: ${AGENT_VERSION:-1.8.0}
       # V1.6.6 speed and hang handling (see RELEASE_V1_6_6_FAST_SCAN_AND_HANG_HANDLING.md)
       SCAN_PERFORMANCE: ${SCAN_PERFORMANCE:-fast}
       FAST_CHECKS_READ_TIMEOUT: ${FAST_CHECKS_READ_TIMEOUT:-5}
@@ -378,6 +382,11 @@ services:
       SCAN_IP_WORKERS_FIXED: ${SCAN_IP_WORKERS_FIXED:-4}
       OPENVAS_LOG_FILE: /var/log/openvas/openvas.log
       SCANNER_ROLE: ${SCANNER_ROLE:-portable}
+      # V1.8.0: scan the scanner laptop itself through the Docker loopback.
+      SELF_SCAN_MODE: ${SELF_SCAN_MODE:-auto}
+      SELF_SCAN_ADDRESS: ${SELF_SCAN_ADDRESS:-}
+      SCANNER_HOST_IPS: ${SCANNER_HOST_IPS:-}
+      SELF_SCAN_FINGERPRINT_MAX_AGE_SEC: ${SELF_SCAN_FINGERPRINT_MAX_AGE_SEC:-300}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

@@ -26,7 +26,7 @@ def test_nexus_is_the_service_port_catalog_again(monkeypatch):
     nexus = gmp_local._effective_scan_policy(None, "nexus", "priority")
     catalog = gmp_local._effective_scan_policy(None, "catalog", "priority")
     assert nexus["port_range"] == catalog["port_range"]
-    assert nexus["tcp_port_count"] < 120  # ~88, not the 1,055+ floor of the nessus profile
+    assert nexus["tcp_port_count"] < 200  # 154 in policy 1.1, not the 1,055+ floor of the nessus profile
     assert {22, 135, 139, 445, 3389, 8443} <= {
         p for tok in nexus["port_range"].split(",") if tok.startswith("T:")
         for p in gmp_local.port_numbers(tok[2:])}

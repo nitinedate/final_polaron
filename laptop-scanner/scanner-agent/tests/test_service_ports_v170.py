@@ -27,23 +27,25 @@ def _env(monkeypatch, tmp_path):
 # --- the policy ----------------------------------------------------------------------
 def test_policy_is_the_nexus_scope_minus_ports_that_cannot_have_findings(monkeypatch):
     doc = service_port_policy()
-    assert len(doc["services"]) == 67
+    # V1.8.0 (policy 1.1): 28 services added for Nexpose Full-audit parity.
+    assert len(doc["services"]) == 95
     assert all(s["low_plus_examples"] for s in doc["services"])
     tcp, udp = policy_ports()
-    assert len(tcp) == 87 and len(udp) == 25
+    assert len(tcp) == 154 and len(udp) == 33
     assert 20 not in tcp and not {67, 68, 138, 4789, 5004} & set(udp)
-    assert {s["port"] for s in doc["not_checked"]} == {"20/tcp", "67-68/udp", "138/udp", "4789/udp", "5004/udp"}
+    assert {"20/tcp", "67-68/udp", "138/udp", "4789/udp", "5004/udp"} <= {s["port"] for s in doc["not_checked"]}
     monkeypatch.setenv("UDP_PORT_RANGE", "U:67-69,U:4789,U:5004")  # Compose default; ignored for nexus
     p = gmp_local._effective_scan_policy(None, "nexus", "priority")
-    assert p["tcp_port_count"] == 87 and p["udp_port_count"] == 25
-    assert p["service_port_policy_version"] == "aetheris-service-ports-1.0"
+    assert p["tcp_port_count"] == 154 and p["udp_port_count"] == 33
+    assert p["service_port_policy_version"] == "aetheris-service-ports-1.1"
 
 
 def test_services_can_be_switched_off_and_extras_added(monkeypatch):
     p = gmp_local._effective_scan_policy({"disabled_services": ["vnc", "telnet"]}, "nexus", "priority")
-    assert p["tcp_port_count"] == 87 - 11  # 10 VNC ports + 23
-    monkeypatch.setenv("SERVICE_EXTRA_TCP_PORTS", "8888")
-    assert gmp_local._effective_scan_policy(None, "nexus", "priority")["tcp_port_count"] == 88
+    full = len(policy_ports()[0])
+    assert p["tcp_port_count"] == full - 11  # 10 VNC ports + 23
+    monkeypatch.setenv("SERVICE_EXTRA_TCP_PORTS", "8899")  # not a policy port
+    assert gmp_local._effective_scan_policy(None, "nexus", "priority")["tcp_port_count"] == full + 1
     with pytest.raises(ValueError):
         validate_request({"disabled_services": ["not-a-service"]})
 
@@ -70,7 +72,7 @@ def test_probe_keeps_open_closed_and_filtered_apart(monkeypatch):
 def test_probe_uses_policy_ports_for_nexus(monkeypatch):
     monkeypatch.setenv("PORT_PROFILE", "nexus")
     monkeypatch.setenv("PORT_DISCOVERY_RANGE", "T:22")  # must not narrow the policy probe
-    assert len(port_discovery.parse_tcp_ports(port_discovery.candidate_range())) == 87
+    assert len(port_discovery.parse_tcp_ports(port_discovery.candidate_range())) == len(policy_ports()[0])
 
 
 # --- verdicts --------------------------------------------------------------------------------
@@ -86,7 +88,7 @@ def test_all_filtered_is_no_exposed_services_with_an_honest_reason():
     cov = d["evidence"]["host_coverage"][HOST]
     assert cov["verdict"] == "no_exposed_services" and cov["network_scan_complete"] is True
     assert cov["host_responded"] is False and "firewall" in cov["reason"]
-    assert cov["port_state_counts"] == {"open": 0, "closed": 0, "filtered": 87}
+    assert cov["port_state_counts"] == {"open": 0, "closed": 0, "filtered": len(tcp)}
 
 
 def test_refused_ports_prove_the_host_is_up():
@@ -164,4 +166,4 @@ def test_job_loop_turns_a_firewalled_host_into_no_exposed_services(monkeypatch):
     cov = uploaded[-1]["host_coverage"][HOST]
     assert cov["verdict"] == "no_exposed_services"
     disc = [kw for h, e, kw in events if e == "port_discovery"]
-    assert disc and disc[0]["filtered_port_count"] == 87 and disc[0]["closed_port_count"] == 0
+    assert disc and disc[0]["filtered_port_count"] == len(policy_ports()[0]) and disc[0]["closed_port_count"] == 0

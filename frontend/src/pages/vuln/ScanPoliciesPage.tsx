@@ -13,6 +13,21 @@ const CATEGORY_LABEL: Record<string, string> = {
   threat: "Threat checks (Aetheris, not Nessus templates)",
 };
 
+/** V1.8.0: which scanner's built-in template a policy mirrors. */
+const VENDOR_LABEL: Record<string, string> = {
+  nexpose: "Nexpose / InsightVM",
+  nessus: "Nessus",
+  aetheris: "Aetheris",
+};
+const VENDOR_ORDER = ["nexpose", "nessus", "aetheris"];
+
+function templateEquivalent(t: ScanPolicyTemplate | undefined): string {
+  if (!t) return "";
+  if (t.vendor === "nexpose" && t.nexpose_template) return `Nexpose: ${t.nexpose_template}`;
+  if (t.nessus_template) return `Nessus: ${t.nessus_template}`;
+  return "Aetheris threat check";
+}
+
 const SEVERITY_FLOOR: { value: string; label: string }[] = [
   { value: "0.1", label: "Low and above (0.1+)" },
   { value: "4", label: "Medium and above (4.0+)" },
@@ -91,7 +106,7 @@ export function ScanPoliciesPage() {
     <div>
       <PageHeader
         title="Scan policies"
-        subtitle="Reusable scan settings. Start from a Nessus-equivalent template, then adjust ports, UDP, and credentials."
+        subtitle="Reusable scan settings. Built-in Nexpose and Nessus equivalents are ready to launch; create your own from a template to change ports, UDP, and credentials."
         actions={
           canManage && (
             <Button variant="brand" onClick={() => setCreateOpen(true)} disabled={templates.length === 0 && !loading}>
@@ -134,15 +149,14 @@ export function ScanPoliciesPage() {
                         <div className="flex items-center gap-3">
                           <Shield className="h-4 w-4 text-brand-600" />
                           <span className="font-semibold text-ink-800">{p.name}</span>
+                          {p.is_builtin ? <Badge tone="neutral">Built-in</Badge> : null}
                         </div>
                       </td>
                       <td className="px-5 py-3">
                         {template ? (
                           <div>
                             <span className="text-ink-800">{template.name}</span>
-                            <span className="block text-xs text-ink-500">
-                              {template.nessus_template ? `Nessus: ${template.nessus_template}` : "Aetheris threat check"}
-                            </span>
+                            <span className="block text-xs text-ink-500">{templateEquivalent(template)}</span>
                           </div>
                         ) : (
                           <Badge tone="neutral">{p.policy_type}</Badge>
@@ -161,7 +175,7 @@ export function ScanPoliciesPage() {
                           <span className="inline-flex items-center gap-1">
                             <KeyRound className="h-3.5 w-3.5" /> {credKinds.map((k) => k.toUpperCase()).join(", ")}
                           </span>
-                        ) : template?.requires_credentials.length ? (
+                        ) : p.credentials_missing || template?.requires_credentials.length ? (
                           <span className="text-red-700">Missing (required)</span>
                         ) : (
                           "None"
@@ -209,7 +223,8 @@ function PolicyModal({
 }) {
   const toast = useToast();
   const [loading, setLoading] = useState(false);
-  const initial = templates.find((t) => t.key === "basic_network") || templates[0];
+  const initial =
+    templates.find((t) => t.key === "nx_full_audit") || templates.find((t) => t.key === "basic_network") || templates[0];
   const [templateKey, setTemplateKey] = useState(initial?.key || "");
   const template = templates.find((t) => t.key === templateKey);
   const [name, setName] = useState(initial?.name || "");
@@ -228,8 +243,21 @@ function PolicyModal({
   const [framework, setFramework] = useState(initial?.compliance_framework || "");
 
   const grouped = useMemo(() => {
+    // V1.8.0: grouped by scanner (Nexpose first), then category.
     const out = new Map<string, ScanPolicyTemplate[]>();
-    for (const t of templates) out.set(t.category, [...(out.get(t.category) || []), t]);
+    const sorted = [...templates].sort(
+      (a, b) =>
+        VENDOR_ORDER.indexOf(a.vendor || "nessus") - VENDOR_ORDER.indexOf(b.vendor || "nessus") ||
+        a.category.localeCompare(b.category),
+    );
+    for (const t of sorted) {
+      const vendor = t.vendor || (t.category === "threat" ? "aetheris" : "nessus");
+      const label =
+        vendor === "aetheris"
+          ? CATEGORY_LABEL[t.category] || t.category
+          : `${VENDOR_LABEL[vendor] || vendor} — ${CATEGORY_LABEL[t.category] || t.category}`;
+      out.set(label, [...(out.get(label) || []), t]);
+    }
     return out;
   }, [templates]);
 
@@ -338,7 +366,7 @@ function PolicyModal({
         <Field label="Template">
           <Select value={templateKey} onChange={(e) => chooseTemplate(e.target.value)}>
             {Array.from(grouped.entries()).map(([category, items]) => (
-              <optgroup key={category} label={CATEGORY_LABEL[category] || category}>
+              <optgroup key={category} label={category}>
                 {items.map((t) => (
                   <option key={t.key} value={t.key}>
                     {t.name}
@@ -353,8 +381,8 @@ function PolicyModal({
           <div className="rounded-xl border border-ink-200 bg-white px-4 py-3 text-sm">
             <p className="text-ink-700">{template.description}</p>
             <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-ink-600">
-              <dt className="font-semibold text-ink-700">Nessus equivalent</dt>
-              <dd>{template.nessus_template || "None in Nessus 10.11 (Aetheris threat check)"}</dd>
+              <dt className="font-semibold text-ink-700">Equivalent of</dt>
+              <dd>{templateEquivalent(template)}</dd>
               <dt className="font-semibold text-ink-700">TCP ports</dt>
               <dd>{effectivePorts}</dd>
               <dt className="font-semibold text-ink-700">UDP</dt>
@@ -392,12 +420,15 @@ function PolicyModal({
               ) : null}
             </dl>
             <details className="mt-3">
-              <summary className="cursor-pointer text-xs font-semibold text-brand-700">How this differs from Nessus</summary>
+              <summary className="cursor-pointer text-xs font-semibold text-brand-700">
+                How this differs from {template.vendor === "nexpose" ? "Nexpose" : template.vendor === "aetheris" ? "a vendor template" : "Nessus"}
+              </summary>
+              {template.reference ? <p className="mt-1 text-xs text-ink-500">Reference: {template.reference}</p> : null}
               <p className="mt-1 text-xs text-ink-600">{template.deviations}</p>
             </details>
           </div>
         ) : (
-          <p className="text-sm text-red-700">Templates could not be loaded. Check that the server is on Polaron 1.6.5.</p>
+          <p className="text-sm text-red-700">Templates could not be loaded. Check that the server is on Polaron 1.8.0 or later.</p>
         )}
 
         <Field label="Name">

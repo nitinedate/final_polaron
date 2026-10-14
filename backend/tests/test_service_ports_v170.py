@@ -25,8 +25,9 @@ def test_service_port_policy_endpoint(monkeypatch):
 
     monkeypatch.setattr(vuln, "_require_vuln_module", lambda: None)
     out = vuln.get_service_port_policy(current=None)
-    assert out["tcp_port_count"] == 87 and out["udp_port_count"] == 25
-    assert len(out["services"]) == 67 and all(s["low_plus_examples"] for s in out["services"])
+    # V1.8.0: policy 1.1 (Nexpose Full-audit parity additions).
+    assert out["tcp_port_count"] == 154 and out["udp_port_count"] == 33
+    assert len(out["services"]) == 95 and all(s["low_plus_examples"] for s in out["services"])
     assert {x["port"] for x in out["not_checked"]} >= {"20/tcp", "67-68/udp"}
 
 

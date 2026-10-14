@@ -29,7 +29,7 @@ def test_legacy_budget_600_no_longer_interrupts(monkeypatch):
     # _cfg is only for top-level configuration requiring credentials; the
     # obsolete setting has no scan lifecycle branches and default job ceiling is 0.
     assert '600' not in inspect.getsource(main._cfg)
-    assert AGENT_BUILD.startswith("1.7.0-")
+    assert AGENT_BUILD.startswith("1.8.0-")
 
 
 def test_full_profile_ports_and_service_audit_still_enabled():

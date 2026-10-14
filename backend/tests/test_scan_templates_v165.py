@@ -35,7 +35,7 @@ def test_field_host_is_completed_with_warnings_not_incomplete():
     row = tp[FIELD]
     assert row["status"] == "completed"
     assert row["activity"].startswith("Completed with warnings - network scan finished, 3 open TCP")
-    assert "service checks unverified" in row["activity"]
+    assert "unauthenticated checks" in row["activity"]  # V1.8.0 wording
     assert row["coverage"]["open_tcp_port_list"] == [135, 139, 445]
     assert len(row["warnings"]) == 2
 
