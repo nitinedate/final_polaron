@@ -446,16 +446,33 @@ def _session(
 def _find_config_id(gmp: Any, name: str = "Full and fast") -> str:
     resp = gmp.get_scan_configs()
     available: list[str] = []
+    by_name: dict[str, str] = {}
     wanted = name.strip().casefold()
+    is_full_and_fast = wanted in {"full and fast", FULL_AND_FAST_ID.casefold()}
     for node in resp.xpath("config"):
         cid = (node.get("id") or "").strip()
         config_name = (node.findtext("name") or "").strip()
         if config_name:
             available.append(config_name)
+            if cid:
+                by_name[config_name.casefold()] = cid
         if cid and config_name.casefold() == wanted:
             return cid
-        if cid == FULL_AND_FAST_ID and wanted in {"full and fast", FULL_AND_FAST_ID.casefold()}:
+        if cid == FULL_AND_FAST_ID and is_full_and_fast:
             return cid
+    # V1.9.0: this Aetheris deployment re-imports the stock "Full and fast" base
+    # config under the name "Aetheris Full and fast" (the stock name/ID may be
+    # absent). When the stock Full-and-fast was requested but not present, fall
+    # back to the Aetheris copy instead of failing readiness with
+    # "Scan config not found: Full and fast".
+    if is_full_and_fast:
+        for candidate in (AETHERIS_SCAN_CONFIG, "aetheris full and fast"):
+            cid = by_name.get(candidate.strip().casefold())
+            if cid:
+                log.info(
+                    "Base config 'Full and fast' not present; using '%s' instead", AETHERIS_SCAN_CONFIG
+                )
+                return cid
     summary = ", ".join(available[:8]) if available else "none"
     raise RuntimeError(
         f"Scan config not found: {name}. Available configs: {summary}. "
