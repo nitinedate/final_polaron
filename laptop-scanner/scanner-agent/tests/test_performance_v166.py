@@ -36,7 +36,10 @@ def test_profile_resolution_policy_beats_env(monkeypatch):
     monkeypatch.setenv("SCAN_PERFORMANCE", "fast")
     assert resolve_profile(None) == "fast"
     assert resolve_profile({"performance": "standard"}) == "standard"
-    assert resolve_profile({"performance": "turbo"}) == "fast"  # invalid policy value -> env
+    # V1.9.0: turbo is now a valid profile and a policy value wins over the env.
+    assert resolve_profile({"performance": "turbo"}) == "turbo"
+    # A genuinely invalid policy value still falls back to the env.
+    assert resolve_profile({"performance": "nonsense"}) == "fast"
 
 
 def test_fast_settings_are_nessus_and_openvas_defaults():

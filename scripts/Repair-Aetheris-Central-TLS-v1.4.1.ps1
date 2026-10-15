@@ -2,7 +2,7 @@
 param(
     [string]$ProjectRoot = "",
     [string]$PublicIP = "122.179.140.167",
-    [string]$LanIP = "192.168.1.16",
+    [string]$LanIP = "192.168.1.15",
     [string]$Email = "",
     [switch]$SelfSigned,
     [switch]$SkipCertificateIssue

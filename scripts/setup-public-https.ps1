@@ -4,15 +4,15 @@
 
 .DESCRIPTION
   - Opens Windows Firewall for TCP 80 and 443
-  - Optionally verifies LAN IP 192.168.1.16 is present
+  - Optionally verifies LAN IP 192.168.1.15 is present
   - Issues a Let's Encrypt short-lived IP certificate for 122.179.141.248
     (or installs a self-signed cert with -SelfSigned)
   - Starts aetheris-gateway with public HTTPS bindings on 80/443
   - Leaves :3000/:3001 available for local LAN use
 
   Router requirement (manual):
-    WAN 122.179.141.248 TCP 80  →  LAN 192.168.1.16:80
-    WAN 122.179.141.248 TCP 443 →  LAN 192.168.1.16:443
+    WAN 122.179.141.248 TCP 80  →  LAN 192.168.1.15:80
+    WAN 122.179.141.248 TCP 443 →  LAN 192.168.1.15:443
 
 .EXAMPLE
   # Administrator PowerShell, from repo root:
@@ -30,7 +30,7 @@
 param(
     [string]$ProjectRoot = "",
     [string]$PublicIP = "122.179.141.248",
-    [string]$LanIP = "192.168.1.16",
+    [string]$LanIP = "192.168.1.15",
     [string]$Domain = "",
     [string]$Email = "",
     [switch]$SelfSigned,

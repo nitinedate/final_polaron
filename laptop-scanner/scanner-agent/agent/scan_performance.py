@@ -26,7 +26,32 @@ from typing import Any
 
 log = logging.getLogger("scanner_agent.performance")
 
-PROFILES = ("standard", "fast")
+PROFILES = ("standard", "fast", "turbo")
+
+
+def _cpu_count() -> int:
+    try:
+        return max(1, int(os.cpu_count() or 1))
+    except Exception:
+        return 1
+
+
+def turbo_max_checks() -> int:
+    """Per-host NVT concurrency for the turbo profile.
+
+    This is the main lever for a *single* IP: host-level concurrency does
+    nothing when there is one host, but running many NVTs at once against that
+    host does. OpenVAS runs one OS process per concurrent check, so we scale
+    with CPUs (default 4x, since NVT checks are I/O/network-bound and spend most
+    of their time waiting on the target) and cap it so a small laptop is not
+    overwhelmed. Override with TURBO_MAX_CHECKS.
+    """
+    override = _int_env("TURBO_MAX_CHECKS", 0, 0, 128)
+    if override:
+        return override
+    per_cpu = _int_env("TURBO_CHECKS_PER_CPU", 4, 1, 16)
+    hard_cap = _int_env("TURBO_MAX_CHECKS_CAP", 40, 4, 128)
+    return max(10, min(hard_cap, _cpu_count() * per_cpu))
 _TIMEOUT_RE = re.compile(r"time ?out|timed out|took too long|exceeded|killed", re.I)
 # Port scanners and service discovery are never capped: they define coverage.
 _NEVER_CAP_OIDS = frozenset({
@@ -67,9 +92,27 @@ def profile_settings(profile: str) -> dict[str, Any]:
     scanner value comes from the config's SERVER_PREFS or gvmd's global
     defaults (verified in gvmd manage_osp.c / init_preference_iterator).
     """
-    if profile != "fast":
+    if profile not in {"fast", "turbo"}:
         return {"checks_read_timeout": None, "max_checks": None, "nmap_timing": None,
                 "hang_caps": False, "plugins_timeout": None}
+    hang_on = (os.environ.get("NVT_HANG_CAPS") or "true").strip().lower() in {"1", "true", "yes", "on"}
+    if profile == "turbo":
+        # Turbo (V1.9.0): maximise per-host NVT concurrency and keep the tail
+        # short. Coverage is unchanged - every applicable NVT still runs - but
+        # many more run at once and a stuck check is capped sooner so it cannot
+        # pin the host at 98%. Aggressive Nmap timing. Best with
+        # optimize_test=yes (skip NVTs whose prerequisite ports/services were
+        # not found) and enough CPU/RAM on the OpenVAS container.
+        timing = (os.environ.get("TURBO_NMAP_TIMING") or "Aggressive").strip()
+        return {
+            "checks_read_timeout": _int_env("TURBO_CHECKS_READ_TIMEOUT", 5, 2, 30),
+            "max_checks": turbo_max_checks(),
+            "nmap_timing": None if timing.lower() in {"", "off", "none", "normal"} else timing,
+            "hang_caps": hang_on,
+            # Shorter per-check ceiling so one slow NVT costs ~2 min instead of
+            # 5.5 at the tail. Still well above a normal check's runtime.
+            "plugins_timeout": _int_env("TURBO_PLUGINS_TIMEOUT", 180, 30, 3600),
+        }
     timing = (os.environ.get("FAST_NMAP_TIMING") or "Aggressive").strip()
     return {
         # OpenVAS default checks_read_timeout and Nessus "network timeout" are both 5 s.
@@ -77,7 +120,7 @@ def profile_settings(profile: str) -> dict[str, Any]:
         # Nessus default "max simultaneous checks per host" is 5.
         "max_checks": _int_env("FAST_MAX_CHECKS", 5, 1, 10),
         "nmap_timing": None if timing.lower() in {"", "off", "none", "normal"} else timing,
-        "hang_caps": (os.environ.get("NVT_HANG_CAPS") or "true").strip().lower() in {"1", "true", "yes", "on"},
+        "hang_caps": hang_on,
         # Per-check limit for ordinary NVTs: Nessus/OpenVAS default 320 s (V1.6.8:
         # no reduction). Checks that already hung repeatedly get NVT_HANG_CAP_SEC.
         "plugins_timeout": _int_env("FAST_PLUGINS_TIMEOUT", 320, 30, 3600),

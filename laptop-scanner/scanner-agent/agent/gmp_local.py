@@ -2026,7 +2026,12 @@ class LocalOpenVAS:
         # concurrent IP tasks became 128 NVT processes on a laptop.
         configured_checks = max(1, int(os.environ.get("GVM_MAX_CHECKS") or 8))
         self.max_hosts = max(1, int(os.environ.get("GVM_MAX_HOSTS") or 1))
-        self.max_checks = min(configured_checks, 16)
+        # V1.9.0: ceiling raised 16 -> 128 so the turbo profile can run many NVTs
+        # at once against a single host (the only concurrency that helps one IP).
+        # The configured GVM_MAX_CHECKS is still honoured as the floor for
+        # standard/fast; turbo overrides it via the performance profile.
+        self.max_checks_cap = max(16, int(os.environ.get("GVM_MAX_CHECKS_CAP") or 128))
+        self.max_checks = min(configured_checks, self.max_checks_cap)
         assessment = self.port_profile == "full" or self.port_profile in _VULN_PROFILES
         read_raw = max(1, int(os.environ.get("GVM_CHECKS_READ_TIMEOUT") or (10 if assessment else 5)))
         retry_raw = max(0, int(os.environ.get("GVM_TIMEOUT_RETRY") or (3 if assessment else 1)))
@@ -2240,11 +2245,13 @@ class LocalOpenVAS:
         except Exception:
             log.warning("NVT hang statistics unavailable; no timeout caps applied", exc_info=True)
             hang_caps = {}
-        lane_checks = self.max_checks if max_checks is None else max(1, min(16, int(max_checks)))
+        cap = getattr(self, "max_checks_cap", 128)
+        lane_checks = self.max_checks if max_checks is None else max(1, min(cap, int(max_checks)))
         if perf_cfg["max_checks"]:
-            # Nessus default is 5 simultaneous checks per host; capacity.py still
-            # limits how many IPs run at once under thermal/memory pressure.
-            lane_checks = max(lane_checks, min(16, int(perf_cfg["max_checks"])))
+            # Nessus default is 5 simultaneous checks per host; the turbo profile
+            # scales with CPU count. capacity.py still limits how many IPs run at
+            # once under thermal/memory pressure.
+            lane_checks = max(lane_checks, min(cap, int(perf_cfg["max_checks"])))
         snapshot["requested_port_range"] = snapshot["port_range"]
         for transport, key in (("T", "tcp_port_count"), ("U", "udp_port_count")):
             snapshot[key] = len({p for token in port_range.split(",") if token.startswith(transport + ":")

@@ -1863,18 +1863,52 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             merged = _merge_chunk_details(
                 final_live, all_targets=selected_targets, skipped_hosts=skipped_hosts
             )
-            payload = _result_payload(
-                details=merged,
-                task_id=external_blob,
-                status="failed",
-                partial=True,
-                partial_reason=f"maximum runtime {max_scan_runtime_sec}s exceeded",
-                error=(
-                    f"OpenVAS exceeded maximum runtime {max_scan_runtime_sec}s "
-                    f"while status={merged.get('gmp_status')} progress={float(merged.get('progress') or 0):.0f}%"
-                ),
-                skipped_hosts=list((merged.get("evidence") or {}).get("skipped_hosts") or skipped_hosts),
+            # V1.9.0: the runtime cap often fires at 98% on a nearly-finished task
+            # that OpenVAS left in "stopped" (a slow NVT at the tail, or the
+            # scanner running low on memory). If real evidence was collected,
+            # keep it as a PARTIAL / completed-with-warnings result instead of
+            # hard-failing and discarding a usable scan. Only fail outright when
+            # the cap fired with nothing usable (genuinely hung from the start).
+            cap_evidence = dict(merged.get("evidence") or {})
+            cap_vulns = merged.get("vulnerabilities") or []
+            cap_progress = float(merged.get("progress") or 0)
+            cap_open_ports = 0
+            for _cov in (cap_evidence.get("host_coverage") or {}).values():
+                if isinstance(_cov, dict):
+                    cap_open_ports += len(_cov.get("open_tcp_ports") or []) + len(_cov.get("open_udp_ports") or [])
+            has_usable_evidence = bool(cap_vulns) or cap_open_ports > 0 or int(cap_evidence.get("hosts_assessed") or 0) > 0
+            cap_detail = (
+                f"maximum runtime {max_scan_runtime_sec}s exceeded while "
+                f"status={merged.get('gmp_status')} progress={cap_progress:.0f}%"
             )
+            if has_usable_evidence:
+                log.warning(
+                    "Job %s hit the runtime cap at %.0f%% with usable evidence "
+                    "(%d finding(s), %d open port(s)); keeping it as a partial result",
+                    job_id, cap_progress, len(cap_vulns), cap_open_ports,
+                )
+                cap_evidence["completed_with_warnings"] = True
+                cap_evidence["assessment_complete"] = False
+                merged["evidence"] = cap_evidence
+                payload = _result_payload(
+                    details=merged,
+                    task_id=external_blob,
+                    status="completed",
+                    partial=True,
+                    partial_reason=cap_detail + "; partial coverage kept, not clean-eligible",
+                    error=None,
+                    skipped_hosts=list(cap_evidence.get("skipped_hosts") or skipped_hosts),
+                )
+            else:
+                payload = _result_payload(
+                    details=merged,
+                    task_id=external_blob,
+                    status="failed",
+                    partial=True,
+                    partial_reason=cap_detail,
+                    error=f"OpenVAS exceeded maximum runtime {max_scan_runtime_sec}s " + cap_detail,
+                    skipped_hosts=list(cap_evidence.get("skipped_hosts") or skipped_hosts),
+                )
             _upload_results_reliably(api, job_id, payload)
             return
 
