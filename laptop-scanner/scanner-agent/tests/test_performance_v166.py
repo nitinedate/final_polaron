@@ -312,6 +312,9 @@ def _run_loop(monkeypatch, polls, *, stall_env=None, openvas_log=None, tmp_path=
 
 
 DEAD_SCANNER_LOG = (
+    # V1.9.2: real OpenVAS always logs the host start (attack.c); "nothing running" is only
+    # evidence when the log reader saw the host's whole scan from this line on.
+    "sd main:MESSAGE:2026-10-14 04h09.59 utc:1: Vulnerability scan s1 started for host: 10.0.0.9\n"
     "sd main:MESSAGE:2026-10-14 04h10.00 utc:1: Launching gb_x.nasl (1.3.6.1.4.1.25623.1.0.1) against 10.0.0.9 [501]\n"
     "sd main:MESSAGE:2026-10-14 04h10.05 utc:1: gb_x.nasl (1.3.6.1.4.1.25623.1.0.1) [501] finished its job in 5.0 seconds\n"
 )

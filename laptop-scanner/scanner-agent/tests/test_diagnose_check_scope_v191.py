@@ -76,3 +76,22 @@ def test_diagnostic_flags_the_legacy_fingerprint_writer(tmp_path, monkeypatch):
     out = diag.diagnose(DiagGvmd(), check_sentinels=False)
     assert out["fingerprint"]["legacy_writer"] is True
     assert any(v.startswith("SELF-SCAN OFF") for v in out["verdicts"])
+
+
+def test_diagnostic_flags_debug_level_openvas_log(tmp_path, monkeypatch):
+    """V1.9.2: names the DEBUG flood that hid running checks (field job 3c4f45e0)."""
+    from agent import openvas_log
+    from tests.test_openvas_log_v192 import _debug_flood, _msg
+
+    log = tmp_path / "openvas.log"
+    log.write_text(_msg("07h36.00", "Vulnerability scan s1 started for host: 192.168.1.8")
+                   + _msg("07h36.05", "Launching a.nasl (1.3.6.1.4.1.25623.1.0.900234) against 192.168.1.8 [9]")
+                   + _debug_flood("192.168.1.8", 5000))
+    monkeypatch.setenv("OPENVAS_LOG_FILE", str(log))
+    monkeypatch.setattr(diag, "_fingerprint", lambda: {"available": False})
+    openvas_log.reset()
+    out = diag.diagnose(DiagGvmd(), check_sentinels=False)
+    openvas_log.reset()
+    assert out["openvas_log"]["whole_attack_logging"] is True
+    assert any(v.startswith("OPENVAS DEBUG LOGGING") for v in out["verdicts"])
+    assert not any(v.startswith("OPENVAS PER-CHECK LOGGING OFF") for v in out["verdicts"])

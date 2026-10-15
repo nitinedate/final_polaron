@@ -370,7 +370,8 @@ def stall_decision(activity: dict[str, Any] | None, action: str | None = None) -
     the host (per-check logging on, no running check, host not finished),
     i.e. the scanner process died. Running checks are bounded by their own
     timeouts, and a finished host means Greenbone is importing the report;
-    both are waited for. Without log evidence it waits.
+    both are waited for. Without log evidence it waits, and (V1.9.2) without
+    the host's whole history in the log it waits.
     """
     mode = action or stall_action()
     if mode == "off":
@@ -379,6 +380,11 @@ def stall_decision(activity: dict[str, Any] | None, action: str | None = None) -
         return "stop"
     act = activity or {}
     if not act.get("available") or not act.get("whole_attack_logging"):
+        return "wait"
+    # V1.9.2: "nothing running" is only proof when the log reader saw the host's
+    # whole scan, from its "started for host" line on. A check launched before
+    # the part of openvas.log that was read would otherwise look finished.
+    if not act.get("host_started_seen"):
         return "wait"
     if act.get("host_finished") or act.get("running"):
         return "wait"

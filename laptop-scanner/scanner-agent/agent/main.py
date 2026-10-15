@@ -875,6 +875,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     preprobe_states_by_host: dict[str, dict[str, list[int]]] = {}
     # V1.8.0: targets that are the scanner laptop itself (see agent/self_target.py).
     self_scan_by_host: dict[str, dict[str, Any]] = {}
+
+    def _openvas_log_host(host: str) -> str:
+        """The address OpenVAS itself scanned (and logs): the loopback alias for a self-scan."""
+        return str((self_scan_by_host.get(host) or {}).get("scanned_via") or host)
+
     degraded_retry_budget = max(0, int(os.environ.get("SCAN_DEGRADED_RETRY") or 0))
     # Historical .env files frequently retain SCAN_IP_BUDGET_SEC=600.  It is
     # now a deprecated, diagnostic-only setting.  Never stop a Greenbone task,
@@ -1365,7 +1370,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             else:
                                 from agent.openvas_log import describe, host_activity
 
-                                activity_w = host_activity(host)
+                                activity_w = host_activity(_openvas_log_host(host))
                                 decision = stall_decision(activity_w)
                                 if decision == "wait" and now_w - ip_stall_noted.get(idx, 0.0) >= 300:
                                     ip_stall_noted[idx] = now_w
@@ -1421,8 +1426,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         try:
                             from agent.openvas_log import describe, host_activity
 
-                            activity = host_activity(host)
-                            log.warning(
+                            activity = host_activity(_openvas_log_host(host))
+                            # V1.9.2: a named running check (or a finished host) at 98 % is the
+                            # normal tail of a scan, not a problem; only blind spots warn.
+                            seen = bool(activity.get("running") or activity.get("host_finished"))
+                            (log.info if seen else log.warning)(
                                 "IP %s at %s%% for %ss: %s. OpenVAS log NVTs: %s; slow finished: %s",
                                 host, progress_i, int(now_w - seen_t[1]), describe(activity),
                                 ", ".join(activity.get("nvt_oids") or []) or "none found",
@@ -1433,7 +1441,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                           nvt_oids=activity.get("nvt_oids"), lines=(activity.get("lines") or [])[-8:],
                                           running=activity.get("running"), slow_finished=activity.get("slow_finished"),
                                           host_finished=activity.get("host_finished"),
-                                          summary=describe(activity), log_available=activity.get("available"))
+                                          summary=describe(activity), log_available=activity.get("available"),
+                                          whole_attack_logging=activity.get("whole_attack_logging"),
+                                          host_started_seen=activity.get("host_started_seen"),
+                                          debug_share=activity.get("debug_share"),
+                                          log_host=_openvas_log_host(host))
                         except Exception:
                             log.debug("OpenVAS log diagnostics unavailable", exc_info=True)
 

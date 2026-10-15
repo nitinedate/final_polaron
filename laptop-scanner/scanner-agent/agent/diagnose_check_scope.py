@@ -12,7 +12,8 @@ It changes nothing in Greenbone. It reports:
 * whether known Windows/TCP findings (DCE/RPC reporting 10736, TCP/ICMP
   timestamps) are in each config, and which config recent tasks used;
 * whether the stock "Full and fast" config and the Feed Import Owner exist;
-* the LAN fingerprint the self-scan depends on.
+* the LAN fingerprint the self-scan depends on;
+* (V1.9.2) whether openvas.log is at DEBUG level and logs check launches.
 """
 
 from __future__ import annotations
@@ -145,6 +146,12 @@ def diagnose(gmp: Any, *, check_sentinels: bool = True, task_limit: int = 8) -> 
         out["configs"].append(cfg)
     out["recent_tasks"] = _recent_tasks(gmp, task_limit)
     out["fingerprint"] = _fingerprint()
+    try:
+        from agent.openvas_log import log_health
+
+        out["openvas_log"] = log_health()
+    except Exception as exc:  # pragma: no cover - diagnostics must not fail
+        out["openvas_log"] = {"available": False, "error": str(exc)[:200]}
 
     v = out["verdicts"]
     capped = [c for c in out["configs"] if c.get("capped_families")]
@@ -167,6 +174,15 @@ def diagnose(gmp: Any, *, check_sentinels: bool = True, task_limit: int = 8) -> 
                  "run Start-Laptop.cmd again")
     elif fp.get("available") and isinstance(fp.get("age_sec"), int) and fp["age_sec"] > 300:
         v.append(f"SELF-SCAN OFF: .lan-fingerprint is {fp['age_sec']} s old (writer loop not running)")
+    lg = out["openvas_log"]
+    if lg.get("available"):
+        if float(lg.get("debug_share") or 0) >= 0.5:
+            v.append(f"OPENVAS DEBUG LOGGING: {int(float(lg['debug_share']) * 100)}% of openvas.log lines are DEBUG "
+                     f"({int(lg.get('bytes') or 0) // 1048576} MB); the agent cannot see running checks and DEBUG may "
+                     "log passwords. Set OPENVAS_LOG_LEVEL=127, then: docker compose up -d configure-openvas")
+        if lg.get("hosts_started") and not lg.get("whole_attack_logging"):
+            v.append("OPENVAS PER-CHECK LOGGING OFF: hosts were scanned but no check launches are logged; "
+                     "set OPENVAS_LOG_WHOLE_ATTACK=yes, then: docker compose up -d configure-openvas")
     if not v:
         v.append("OK: no truncated Aetheris configs, sentinel checks present, self-scan fingerprint usable")
     return out
@@ -203,6 +219,7 @@ def _print_text(out: dict[str, Any]) -> None:
     fp = out["fingerprint"]
     print()
     print(f"LAN fingerprint: {json.dumps(fp)}")
+    print(f"OpenVAS log    : {json.dumps(out.get('openvas_log') or {})}")
     print()
     for line in out["verdicts"]:
         print(f">> {line}")

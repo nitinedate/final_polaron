@@ -82,7 +82,10 @@ def test_host_finished_means_greenbone_is_processing(tmp_path):
     ({"available": True, "whole_attack_logging": False}, "wait"),
     ({"available": True, "whole_attack_logging": True, "running": [{"oid": "x"}]}, "wait"),
     ({"available": True, "whole_attack_logging": True, "host_finished": True}, "wait"),
-    ({"available": True, "whole_attack_logging": True, "running": [], "host_finished": False}, "stop"),
+    ({"available": True, "whole_attack_logging": True, "running": [], "host_finished": False,
+      "host_started_seen": True}, "stop"),
+    # V1.9.2: without the host's start line in the log, "nothing running" is not proof.
+    ({"available": True, "whole_attack_logging": True, "running": [], "host_finished": False}, "wait"),
 ])
 def test_stall_decision_is_evidence_based(activity, expected):
     assert stall_decision(activity, "auto") == expected

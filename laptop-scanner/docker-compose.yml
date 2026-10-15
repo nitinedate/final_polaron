@@ -161,6 +161,10 @@ services:
       SCANNER_PLUGINS_TIMEOUT_SEC: ${SCANNER_PLUGINS_TIMEOUT_SEC:-36000}
       # V1.6.8: log each check launch/finish so the agent can name what an IP is waiting on.
       OPENVAS_LOG_WHOLE_ATTACK: ${OPENVAS_LOG_WHOLE_ATTACK:-yes}
+      # V1.9.2: openvas.log level. 127 = upstream default (everything except DEBUG; keeps
+      # every line the agent reads). 128 = DEBUG: floods the log during SSL/TLS cipher
+      # checks (hiding running checks from the agent) and, per upstream, may log passwords.
+      OPENVAS_LOG_LEVEL: ${OPENVAS_LOG_LEVEL:-127}
     volumes:
       - gvm_openvas_data:/mnt
       - gvm_openvas_log:/var/log/openvas
@@ -171,7 +175,8 @@ services:
         # V45: Nessus-parity scanner defaults. plugins_timeout/scanner_plugins_timeout
         # were 60/90 s, which killed the full-port Nmap NVT before it finished.
         printf "table_driven_lsc = yes\nopenvasd_server = http://openvasd:80\nmax_hosts = %s\nmax_checks = %s\noptimize_test = %s\nplugins_timeout = %s\nscanner_plugins_timeout = %s\nchecks_read_timeout = %s\ntimeout_retry = %s\nopen_sock_max_attempts = %s\nsafe_checks = yes\nreport_host_details = yes\nexpand_vhosts = yes\ntest_empty_vhost = yes\nlog_whole_attack = %s\n" "$${GVM_MAX_HOSTS}" "$${GVM_MAX_CHECKS}" "$${GVM_OPTIMIZE_TEST}" "$${PLUGINS_TIMEOUT_SEC}" "$${SCANNER_PLUGINS_TIMEOUT_SEC}" "$${GVM_CHECKS_READ_TIMEOUT}" "$${GVM_TIMEOUT_RETRY}" "$${GVM_OPEN_SOCK_MAX_ATTEMPTS}" "$${OPENVAS_LOG_WHOLE_ATTACK}" > /mnt/openvas.conf
-        sed "s/127/128/" /etc/openvas/openvas_log.conf | sed 's/gvm/openvas/' > /mnt/openvas_log.conf
+        case "$${OPENVAS_LOG_LEVEL}" in ''|*[!0-9]*) OPENVAS_LOG_LEVEL=127 ;; esac
+        sed "s/^level=.*/level=$${OPENVAS_LOG_LEVEL}/" /etc/openvas/openvas_log.conf | sed 's/gvm/openvas/' > /mnt/openvas_log.conf
         chmod 644 /mnt/openvas.conf /mnt/openvas_log.conf
         touch /var/log/openvas/openvas.log
         chmod 666 /var/log/openvas/openvas.log
