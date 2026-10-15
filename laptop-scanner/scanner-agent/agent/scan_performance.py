@@ -318,6 +318,34 @@ def classify_stall(gmp_status: str, progress: float, unchanged_sec: float,
     return None
 
 
+# Known-slow NVTs that routinely pin a host at ~98% at the tail of a scan,
+# especially on a full-port (T:1-65535) sweep where the SSL/TLS cipher
+# enumeration runs against many ports. OpenVAS does not time these out by
+# default, so one slow TLS endpoint can run for the whole scan window. We cap
+# them from the first scan (not only after the hang registry has learned them)
+# so the scan can reach "Done". Coverage is unchanged: the check still runs, it
+# just cannot run unbounded. Override per-OID budget with SSL_CIPHER_CAP_SEC.
+_KNOWN_SLOW_SSL_OIDS = (
+    "1.3.6.1.4.1.25623.1.0.900234",   # SSL/TLS: Report Supported Cipher Suites
+    "1.3.6.1.4.1.25623.1.0.802067",   # SSL/TLS: Check Supported Cipher Suites
+    "1.3.6.1.4.1.25623.1.0.108013",   # SSL/TLS: Report Perfect Forward Secrecy Ciphers
+    "1.3.6.1.4.1.25623.1.0.105880",   # SSL/TLS: Report Weak/NULL/anon Cipher Suites family
+    "1.3.6.1.4.1.25623.1.0.94437",    # SSL/TLS: Diffie-Hellman / parameter checks
+)
+
+
+def static_caps() -> dict[str, int]:
+    """Per-NVT timeout caps applied on every scan, independent of learning.
+
+    Empty when SSL_CIPHER_STATIC_CAP is turned off.
+    """
+    raw = (os.environ.get("SSL_CIPHER_STATIC_CAP") or "on").strip().lower()
+    if raw in {"off", "0", "false", "no"}:
+        return {}
+    budget = _int_env("SSL_CIPHER_CAP_SEC", 120, 30, 600)
+    return {oid: budget for oid in _KNOWN_SLOW_SSL_OIDS}
+
+
 def caps_digest(caps: dict[str, int], extra: str = "") -> str:
     import hashlib
 

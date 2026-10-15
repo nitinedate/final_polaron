@@ -86,6 +86,7 @@ const STATUS_TONE: Record<string, "neutral" | "green" | "amber" | "red" | "indig
   syncing: "indigo",
   running: "indigo",
   completed: "green",
+  incomplete: "amber",
   failed: "red",
   cancelled: "neutral",
 };
@@ -824,7 +825,8 @@ function scannerIsScanReady(scanner: Scanner | null | undefined): boolean {
 function targetStatusTone(status: string): "neutral" | "green" | "amber" | "red" | "indigo" {
   const s = (status || "").toLowerCase();
   if (s === "completed") return "green";
-  if (s === "failed" || s === "incomplete") return "red";
+  if (s === "incomplete") return "amber";
+  if (s === "failed") return "red";
   if (s === "scanning" || s === "running") return "indigo";
   if (s === "skipped" || s === "cancelled") return "neutral";
   return "amber";

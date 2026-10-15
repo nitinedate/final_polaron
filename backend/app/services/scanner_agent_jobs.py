@@ -1450,6 +1450,31 @@ def evaluate_edge_ingest_verdict(
         reasons.append(f"report read error: {report_read_error}")
 
     final_status = "completed" if verified_complete else "failed"
+    # V1.9.0: a partial scan that genuinely collected evidence (the agent hit the
+    # runtime cap at ~98% and kept its results) is "incomplete", not "failed".
+    # The agent sends status="completed", partial=True with findings and host
+    # coverage; without this it collapses to a red "failed" and the 20-30 findings
+    # and open-port map vanish behind "OpenVAS task status is stopped". Incomplete
+    # keeps the evidence and shows an amber "partial coverage" verdict instead.
+    # Only the runtime-cap case: the task was stopped mid-scan on hosts that were
+    # actually reached (no requested IP missing from the report, integrity ok).
+    # A requested target that never appeared, or a result-count mismatch, still
+    # fails — this is not a backdoor around those gates.
+    partial_with_evidence = (
+        not verified_complete
+        and status_norm not in {"failed", "cancelled", "canceled"}
+        and bool(partial)
+        and evidence_present
+        and (vulnerability_count > 0 or hosts_assessed > 0)
+        and bool(external_scan_id)
+        and bool(effective_report_id)
+        and not missing_ip_targets
+        and result_payload_ok
+        and not report_read_error
+        and task_status_norm in {"stopped", "interrupted", "stop requested"}
+    )
+    if partial_with_evidence:
+        final_status = "incomplete"
     if status_norm in {"cancelled", "canceled"}:
         final_status = "cancelled"
 
@@ -1898,6 +1923,16 @@ def ingest_agent_results(
                 f"{findings} finding(s) ingested"
             )
         event_type = "scan.completed"
+    elif final_status == "incomplete":
+        # V1.9.0: partial scan that kept its evidence (runtime cap at ~98%).
+        # Not a failure: the findings are ingested and shown with a partial-
+        # coverage banner.
+        summary = (
+            f"Edge assessment incomplete (partial coverage): {assessed}/{target_count} target(s) "
+            f"assessed; {findings} finding(s) ingested; "
+            + (err_text or "scan stopped before full completion")
+        )[:500]
+        event_type = "scan.incomplete"
     else:
         summary = (err_text or "Edge assessment incomplete")[:500]
         event_type = "scan.cancelled" if final_status == "cancelled" else "scan.failed"

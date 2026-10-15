@@ -219,7 +219,13 @@ def test_fast_profile_reaches_the_greenbone_task(monkeypatch):
     assert g_last["gmp"].scanner_prefs["checks_read_timeout"] == "5"
     assert g_last["gmp"].scanner_prefs["optimize_test"] == "yes"
     assert snap["performance"] == "fast"
-    assert snap["nvt_timeout_caps"]["oids"] == [OID_A] and snap["nvt_timeout_caps"]["applied"] == 1
+    # V1.9.0: the learned cap (OID_A) is still applied, now alongside the static
+    # SSL/TLS cipher caps that bound the tail hang on every scan.
+    from agent.scan_performance import static_caps
+    applied_oids = set(snap["nvt_timeout_caps"]["oids"])
+    assert OID_A in applied_oids
+    assert set(static_caps().keys()) <= applied_oids
+    assert snap["nvt_timeout_caps"]["applied"] == len(applied_oids)
     assert snap["performance_status"]["nmap_timing"] == "Aggressive"
 
 

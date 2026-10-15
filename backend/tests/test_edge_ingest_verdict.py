@@ -94,3 +94,55 @@ def test_partial_result_loss_fails_integrity_gate():
     assert v["final_status"] == "failed"
     assert "81" in " ".join(v["reasons"])
     assert "3" in " ".join(v["reasons"])
+
+
+def test_runtime_cap_partial_with_evidence_is_incomplete_not_failed():
+    """V1.9.0: a scan stopped at the runtime cap at ~98%, on the one reachable
+    target, with findings and a report, is 'incomplete' (keeps evidence), not a
+    red 'failed'."""
+    v = _verdict(
+        target_list=["192.168.0.163"],
+        skipped_details=[],
+        skipped_set=set(),
+        assessed_list=["192.168.0.163"],
+        status="completed",
+        partial=True,
+        partial_reason="maximum runtime 3600s exceeded while status=stopped progress=98%",
+        task_status="stopped",
+        hosts_attempted=1,
+        hosts_assessed=1,
+        report_result_count=26,
+        vulnerability_count=26,
+        assessment_complete=False,
+        assessment_verdict="partial_coverage",
+    )
+    assert v["final_status"] == "incomplete"
+    assert v["verified_complete"] is False
+    assert v["clean_eligible"] is False
+
+
+def test_runtime_cap_partial_without_evidence_still_fails():
+    v = _verdict(
+        target_list=["192.168.0.163"],
+        skipped_details=[],
+        skipped_set=set(),
+        assessed_list=[],
+        status="completed",
+        partial=True,
+        partial_reason="maximum runtime 3600s exceeded",
+        task_status="stopped",
+        hosts_attempted=1,
+        hosts_assessed=0,
+        report_result_count=0,
+        vulnerability_count=0,
+        assessment_complete=False,
+    )
+    assert v["final_status"] == "failed"
+
+
+def test_missing_target_is_still_failed_even_with_findings():
+    # Regression: the incomplete path must NOT rescue a scan where a requested
+    # IP never appeared in the report.
+    v = _verdict(task_status="stopped")
+    assert v["final_status"] == "failed"
+    assert v["missing_ip_targets"] == ["192.168.0.103"]

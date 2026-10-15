@@ -2231,7 +2231,7 @@ class LocalOpenVAS:
         safe_checks = str(snapshot.get("safe_checks") or self.safe_checks)
         optimize_test = str(snapshot.get("optimize_test") or self.optimize_test)
         families = list(snapshot.get("nvt_families") or [])
-        from agent.scan_performance import hang_registry, profile_settings, resolve_profile
+        from agent.scan_performance import hang_registry, profile_settings, resolve_profile, static_caps
 
         performance = resolve_profile(snapshot)
         from agent.scan_performance import resolve_check_scope
@@ -2241,10 +2241,17 @@ class LocalOpenVAS:
         perf_cfg = profile_settings(performance)
         read_timeout = int(perf_cfg["checks_read_timeout"] or self.checks_read_timeout)
         try:
-            hang_caps = hang_registry().caps() if perf_cfg["hang_caps"] else {}
+            learned_caps = hang_registry().caps() if perf_cfg["hang_caps"] else {}
         except Exception:
-            log.warning("NVT hang statistics unavailable; no timeout caps applied", exc_info=True)
-            hang_caps = {}
+            log.warning("NVT hang statistics unavailable; no learned timeout caps applied", exc_info=True)
+            learned_caps = {}
+        # V1.9.0: always bound the known-slow SSL/TLS cipher checks (the tail hang
+        # at ~98% on full-port scans), even in the standard profile and on the
+        # first run before the hang registry has learned them. Learned caps still
+        # win where they are tighter.
+        hang_caps = dict(static_caps())
+        for oid, secs in learned_caps.items():
+            hang_caps[oid] = min(hang_caps.get(oid, secs), secs)
         cap = getattr(self, "max_checks_cap", 128)
         lane_checks = self.max_checks if max_checks is None else max(1, min(cap, int(max_checks)))
         if perf_cfg["max_checks"]:
