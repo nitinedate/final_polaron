@@ -87,6 +87,8 @@ SNAPSHOT_FIELDS = {
     "nvt_timeout_caps",
     "check_scope",
     "check_scope_status",
+    # V1.9.1: what the task's config really runs (total checks, partial families).
+    "check_selection",
     "scan_purpose",
     "nvt_filter",
     "require_families",
@@ -102,7 +104,7 @@ SNAPSHOT_FIELDS = {
 SCAN_PURPOSES = {"vulnerability", "ping_discovery", "credential_validation", "compliance"}
 _NAME_FILTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:/()+-]{0,59}$")
 PERFORMANCE_PROFILES = {"standard", "fast", "turbo"}
-CHECK_SCOPES = {"vulnerability", "all"}
+CHECK_SCOPES = {"vulnerability", "all", "severity"}
 PREFERENCE_FIELDS = {
     "max_checks",
     "max_hosts",
@@ -319,7 +321,7 @@ def _validate_fields(raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("check_scope") not in (None, ""):
         value = str(raw["check_scope"]).strip().lower()
         if value not in CHECK_SCOPES:
-            raise ValueError("check_scope must be vulnerability or all")
+            raise ValueError("check_scope must be vulnerability, all or severity")
         out["check_scope"] = value
     for key in ("safe_checks", "optimize_test"):
         if raw.get(key) is not None:

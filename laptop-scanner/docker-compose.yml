@@ -374,7 +374,9 @@ services:
       # Per-check limit written onto the scan config; optional per-IP limit
       # (empty/0 = no limit); fixed pool of 4 IPs.
       FAST_PLUGINS_TIMEOUT: ${FAST_PLUGINS_TIMEOUT:-320}
-      # V1.6.8: only checks that can report Critical/High/Medium/Low (+ their detection).
+      # V1.9.1: vulnerability = every Full-and-fast family whole and growing, minus brute
+      # force / compliance / NSE / DoS (verified per family before use). severity = opt-in
+      # static severity>0 selection, paged under gvmd's 1000-row cap. all = everything.
       SCAN_CHECK_SCOPE: ${SCAN_CHECK_SCOPE:-vulnerability}
       # V1.6.8: no time limits; stop only when OpenVAS shows nothing running (auto).
       SCAN_STALL_ACTION: ${SCAN_STALL_ACTION:-auto}

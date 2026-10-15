@@ -25,6 +25,9 @@ Safety rules
 * Results are always reported under the original target IP and are labelled
   ``self_scan`` with the network-exposure evidence kept separately.
 * ``SELF_SCAN_MODE=off`` disables the whole feature.
+* V1.9.1: a fingerprint without ``host_ips`` (stale pre-1.8.0 writer racing the
+  current one) is re-read for up to SELF_SCAN_FINGERPRINT_WAIT_SEC; the reason
+  is always reported in the ``self_target_check`` event, never dropped.
 """
 
 from __future__ import annotations
@@ -75,41 +78,110 @@ def _fingerprint_paths() -> list[Path]:
     return list(FINGERPRINT_PATHS)
 
 
-def scanner_host_ips(*, now: float | None = None) -> dict[str, Any]:
-    """Return {"ips": set[str], "source": str, "reason": str} for the scanner host.
+def _wait_sec() -> float:
+    """How long to wait for a fingerprint that carries host_ips (V1.9.1)."""
+    try:
+        return max(0.0, min(60.0, float(os.environ.get("SELF_SCAN_FINGERPRINT_WAIT_SEC") or 25)))
+    except (TypeError, ValueError):
+        return 25.0
 
-    Explicit SCANNER_HOST_IPS wins. Otherwise the host-side fingerprint file is
-    used only when it carries ``host_ips`` and was written recently.
-    """
-    explicit = [ip for ip in (_canonical(x) for x in (os.environ.get("SCANNER_HOST_IPS") or "").split(",")) if ip]
-    if explicit:
-        return {"ips": set(explicit), "source": "env:SCANNER_HOST_IPS", "reason": "configured"}
-    current = time.time() if now is None else now
+
+# V1.9.1: field jobs 320903ac and 64b549f1 scanned the laptop through its own
+# firewall (149 of 154 ports "no answer") because the fingerprint they read had
+# no host_ips. A pre-V1.8.0 Write-LanFingerprint loop, started by an earlier
+# Start-Laptop run, was still overwriting the file every 10 s without that key,
+# racing the current writer. The read below retries briefly so the current
+# writer's next write is seen, and a short negative cache keeps a many-IP job
+# from waiting on every chunk.
+_NEGATIVE_CACHE_SEC = 120.0
+_negative: dict[str, Any] = {"until": 0.0, "result": None}
+
+
+def _read_fingerprint(now: float) -> dict[str, Any]:
+    """One pass over the fingerprint files. Adds "retry": True for conditions a rewrite can fix."""
+    saw_file = False
     for path in _fingerprint_paths():
         try:
             if not path.is_file():
                 continue
+            saw_file = True
             raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
-            continue
+            # Usually a read that landed mid-write; the writer rewrites in place.
+            return {"ips": set(), "source": f"file:{path.name}", "reason": "fingerprint unreadable (mid-write?)",
+                    "retry": True}
         if not isinstance(raw, dict):
             continue
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            age = float("inf")
+        if age > _max_age_sec():
+            return {"ips": set(), "source": f"file:{path.name}",
+                    "reason": f"fingerprint is {int(age)} s old; host addresses not trusted "
+                              "(is the Write-LanFingerprint loop running?)"}
+        if "host_ips" not in raw:
+            return {"ips": set(), "source": f"file:{path.name}", "retry": True, "legacy_writer": True,
+                    "reason": "fingerprint has no host_ips key: a pre-1.8.0 Write-LanFingerprint loop is still "
+                              "running; run Start-Laptop.cmd again (it stops stale writers)"}
         listed = raw.get("host_ips") or []
         if isinstance(listed, str):  # PowerShell can collapse a one-item array
             listed = [part for part in listed.replace(";", ",").split(",")]
         ips = {ip for ip in (_canonical(x) for x in listed) if ip}
         if not ips:
             return {"ips": set(), "source": f"file:{path.name}",
-                    "reason": "fingerprint has no host_ips (update scripts/Write-LanFingerprint.ps1)"}
-        try:
-            age = current - path.stat().st_mtime
-        except OSError:
-            age = float("inf")
-        if age > _max_age_sec():
-            return {"ips": set(), "source": f"file:{path.name}",
-                    "reason": f"fingerprint is {int(age)} s old; host addresses not trusted"}
+                    "reason": "fingerprint lists no usable host addresses"}
         return {"ips": ips, "source": f"file:{path.name}", "reason": "fresh host fingerprint"}
+    if saw_file:
+        return {"ips": set(), "source": "none", "reason": "fingerprint file is not a JSON object"}
     return {"ips": set(), "source": "none", "reason": "no host fingerprint file"}
+
+
+def scanner_host_ips(*, now: float | None = None, wait_sec: float | None = None) -> dict[str, Any]:
+    """Return {"ips": set[str], "source": str, "reason": str} for the scanner host.
+
+    Explicit SCANNER_HOST_IPS wins. Otherwise the host-side fingerprint file is
+    used only when it carries ``host_ips`` and was written recently. A missing
+    host_ips key or an unreadable file is retried for up to
+    SELF_SCAN_FINGERPRINT_WAIT_SEC, because a current writer may be racing a
+    stale one. A stale file is never trusted.
+    """
+    explicit = [ip for ip in (_canonical(x) for x in (os.environ.get("SCANNER_HOST_IPS") or "").split(",")) if ip]
+    if explicit:
+        return {"ips": set(explicit), "source": "env:SCANNER_HOST_IPS", "reason": "configured"}
+    fixed_now = now is not None
+    clock = (lambda: now) if fixed_now else time.time
+    result = _read_fingerprint(clock())
+    if not result.get("retry"):
+        return _public(result)
+    with _lock:
+        cached = _negative.get("result")
+        if cached is not None and time.monotonic() < float(_negative.get("until") or 0.0):
+            return _public(dict(cached))
+    budget = _wait_sec() if wait_sec is None else max(0.0, float(wait_sec))
+    deadline = time.monotonic() + budget
+    while result.get("retry") and time.monotonic() < deadline:
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        result = _read_fingerprint(clock())
+    if result.get("retry"):
+        result["reason"] = f"{result['reason']} (still after {int(budget)} s)"
+        with _lock:
+            _negative.update({"until": time.monotonic() + _NEGATIVE_CACHE_SEC, "result": dict(result)})
+    return _public(result)
+
+
+def _public(result: dict[str, Any]) -> dict[str, Any]:
+    out = {"ips": set(result.get("ips") or set()), "source": result.get("source", ""),
+           "reason": result.get("reason", "")}
+    if result.get("legacy_writer"):
+        out["legacy_writer"] = True
+    return out
+
+
+def reset_cache() -> None:
+    """Forget the negative fingerprint cache (tests, and after a writer restart)."""
+    with _lock:
+        _negative.update({"until": 0.0, "result": None})
 
 
 def loopback_address() -> str | None:
@@ -138,7 +210,7 @@ def plan_self_targets(targets: list[str]) -> dict[str, Any]:
 
     Returns {"aliases": {target: loopback_ip}, "host_ips": [...], "source": ..., "reason": ...}.
     """
-    out: dict[str, Any] = {"aliases": {}, "host_ips": [], "source": "", "reason": ""}
+    out: dict[str, Any] = {"aliases": {}, "host_ips": [], "source": "", "reason": "", "undetermined": False}
     if mode() == "off":
         out["reason"] = "SELF_SCAN_MODE=off"
         return out
@@ -146,6 +218,10 @@ def plan_self_targets(targets: list[str]) -> dict[str, Any]:
     out["host_ips"] = sorted(info["ips"])
     out["source"] = info["source"]
     out["reason"] = info["reason"]
+    out["legacy_writer"] = bool(info.get("legacy_writer"))
+    # V1.9.1: True when the scanner could not tell whether a target is itself,
+    # so the caller can record why the network path was used.
+    out["undetermined"] = not info["ips"]
     own = [t for t in targets if _canonical(t) in info["ips"]]
     if not own:
         return out

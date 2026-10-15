@@ -1,5 +1,13 @@
 # Writes the Windows host default gateway + /24 into .lan-fingerprint so the
 # portable scanner-agent (in Docker NAT) can detect a mid-scan LAN move.
+#
+# V1.9.1: only ONE looping writer may run. Every Start-Laptop run used to start
+# another hidden loop, and loops started by pre-1.8.0 packages kept writing the
+# file WITHOUT host_ips. The agent then could not recognise the laptop's own IP
+# and scanned it through the firewall (field jobs 320903ac, 64b549f1).
+# start-laptop.ps1 now stops stale loops; this mutex stops duplicates.
+# The file is rewritten IN PLACE on purpose: it is a single-file Docker bind
+# mount, and replacing it by rename would leave the container on the old inode.
 param(
     [string]$Root = "",
     [switch]$Once
@@ -46,17 +54,34 @@ function Get-LanFingerprint {
         $hostIps = @()
     }
     $payload = @{
-        gateway   = $gw
-        subnet    = $subnet
-        host_ips  = @($hostIps)
-        source    = "host"
-        updated_at = (Get-Date).ToUniversalTime().ToString("o")
+        gateway        = $gw
+        subnet         = $subnet
+        host_ips       = @($hostIps)
+        source         = "host"
+        writer_version = "1.9.1"
+        writer_pid     = $PID
+        updated_at     = (Get-Date).ToUniversalTime().ToString("o")
     } | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText($out, $payload)
 }
 
+if ($Once) {
+    Get-LanFingerprint
+    exit 0
+}
+
+# Single looping writer per laptop-scanner folder.
+$mutexName = 'Local\AetherisLanFingerprint_' + ([BitConverter]::ToString(
+    [System.Security.Cryptography.SHA1]::Create().ComputeHash(
+        [System.Text.Encoding]::UTF8.GetBytes($Root.ToLowerInvariant()))) -replace '-', '').Substring(0, 16)
+$createdNew = $false
+$script:writerMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
+if (-not $createdNew) {
+    # Another current writer already owns this folder.
+    exit 0
+}
+
 Get-LanFingerprint
-if ($Once) { exit 0 }
 
 while ($true) {
     Start-Sleep -Seconds 10

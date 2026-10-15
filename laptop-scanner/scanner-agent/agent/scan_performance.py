@@ -133,15 +133,18 @@ def ip_deadline_sec(profile: str) -> int:
     return _int_env("SCAN_IP_DEADLINE_SEC", 0, 0, 86400)
 
 
-CHECK_SCOPES = ("vulnerability", "all")
+# V1.9.1: "severity" is the opt-in static severity>0 selection (the V1.6.8
+# behaviour, now paged under the gvmd row cap and verified).
+CHECK_SCOPES = ("vulnerability", "all", "severity")
 
 
 def resolve_check_scope(request: dict[str, Any] | None = None) -> str:
     """Which checks run: policy ``check_scope``, then SCAN_CHECK_SCOPE, default vulnerability.
 
-    ``vulnerability``: only checks that can report Critical/High/Medium/Low,
-    plus whatever detection those checks depend on (OpenVAS auto-loads
-    declared dependencies) and a few cheap host/port reporting checks.
+    ``vulnerability``: every family of "Full and fast", whole and growing,
+    except brute force, compliance/policy, NSE wrappers and DoS (V1.9.1).
+    ``severity``: opt-in static selection of severity>0 checks (plus their
+    detection), fetched in pages under gvmd's row cap and verified.
     ``all``: every check in "Full and fast", including informational ones.
     """
     for raw in ((request or {}).get("check_scope"), os.environ.get("SCAN_CHECK_SCOPE")):

@@ -161,25 +161,43 @@ class ScopeGmp:
     def modify_scan_config_set_scanner_preference(self, cid, name, value=None):
         self.scanner_prefs[name] = value
 
-    def modify_scan_config_set_comment(self, cid, comment):
+    def modify_scan_config_set_comment(self, cid, *, comment=None):  # keyword-only, like python-gvm
+        self.comment = comment
+
+    def delete_scan_config(self, cid, ultimate=False):
         pass
 
 
-def test_vulnerability_scope_selects_severity_checks_and_keeps_discovery():
+def test_vulnerability_scope_keeps_every_non_excluded_family_whole():
+    """V1.9.1: no OID enumeration, so gvmd's 1000-row cap cannot truncate anything."""
     g = ScopeGmp()
     cid, status = gmp_local._ensure_check_scope_config(g, "base-1")
-    assert cid == "vs-base-1" and g.names[0].startswith("Aetheris vuln-scope ")
+    assert cid == "vs-base-1" and g.names[0].startswith("Aetheris vuln-scope v2 ")
     rows = {name: (growing, whole) for name, growing, whole in g.family_rows}
-    for fam in ("Port scanners", "Service detection", "Settings", "Ubuntu Local Security Checks"):
-        assert rows[fam] == (True, True)  # discovery + credentialed-only families stay whole
-    assert "Brute force attacks" not in rows and "Policy" not in rows  # Nessus default: no brute force
+    for fam in FAMILIES:
+        if fam in ("Brute force attacks", "Policy"):
+            assert fam not in rows  # Nessus default: no brute force / compliance
+        else:
+            assert rows[fam] == (True, True), fam  # whole and growing
+    assert g.info_filters == [] and g.nvt_selection == {}
+    assert g.scanner_prefs["auto_enable_dependencies"] == "yes"
+    assert status["scope"] == "vulnerability" and status["excluded_families"] == ["Brute force attacks", "Policy"]
+
+
+def test_severity_scope_selects_severity_checks_and_keeps_discovery():
+    """Opt-in V1.6.8 behaviour, now with detection kept whole."""
+    g = ScopeGmp()
+    cid, status = gmp_local._ensure_check_scope_config(g, "base-1", mode="severity")
+    assert cid == "vs-base-1" and g.names[0].startswith("Aetheris severity-scope v2 ")
+    rows = {name: (growing, whole) for name, growing, whole in g.family_rows}
+    for fam in ("Port scanners", "Service detection", "Settings", "Product detection",
+                "Ubuntu Local Security Checks"):
+        assert rows[fam] == (True, True)
+    assert "Brute force attacks" not in rows and "Policy" not in rows
     assert g.nvt_selection["Windows"] == ["w-1", "w-2", "w-3"]
-    # informational-only checks dropped, essential host/port reporting kept
     assert g.nvt_selection["General"] == ["g-vuln-1", "g-vuln-2", "1.3.6.1.4.1.25623.1.0.900239",
                                           "1.3.6.1.4.1.25623.1.0.103997"]
-    assert g.nvt_selection["Product detection"] == ["1.3.6.1.4.1.25623.1.0.105937"]
-    assert all("severity>0" in f for f in g.info_filters)
-    assert g.scanner_prefs["auto_enable_dependencies"] == "yes"
+    assert all("severity>0" in f and "rows=" in f and "first=" in f for f in g.info_filters)
     assert status["nvt_count"] == 40000 and status["excluded_families"] == ["Brute force attacks", "Policy"]
 
 
@@ -192,7 +210,7 @@ def test_vulnerability_scope_reuses_config_for_same_feed():
 
 
 def test_vulnerability_scope_falls_back_to_all_checks_on_any_problem(monkeypatch):
-    cid, status = gmp_local._ensure_check_scope_config(ScopeGmp(fail_on="Windows"), "base-1")
+    cid, status = gmp_local._ensure_check_scope_config(ScopeGmp(fail_on="Windows"), "base-1", mode="severity")
     assert cid == "base-1" and status["config"].startswith("not applied")
     monkeypatch.setenv("GVM_MIN_NVT_COUNT", "50000")
     cid, status = gmp_local._ensure_check_scope_config(ScopeGmp(new_count=40000), "base-1")
@@ -227,8 +245,10 @@ def test_basic_network_runs_vulnerability_checks_only_by_default(monkeypatch):
     created, snap, g = _start(monkeypatch, {"template": "basic_network"})
     assert snap["check_scope"] == "vulnerability"
     assert snap["check_scope_status"]["config"].startswith("created")
-    assert g.nvt_selection  # severity-filtered selection happened
+    assert g.nvt_selection == {}  # V1.9.1: whole families, no truncatable OID lists
+    assert all(growing and whole for _f, growing, whole in g.family_rows)
     assert created["task"]["config_id"].startswith("vs-")  # profile clone of the vuln-scope config
+    assert snap["check_selection"]["available"] is True
 
 
 def test_all_checks_discovery_and_family_templates_are_not_filtered(monkeypatch):

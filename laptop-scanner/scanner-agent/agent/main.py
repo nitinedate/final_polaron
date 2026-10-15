@@ -48,6 +48,24 @@ logging.basicConfig(
 log = logging.getLogger("scanner_agent")
 
 
+_LEGACY_WRITER_WARNED = {"at": 0.0}
+
+
+def _warn_legacy_fingerprint_writer(reason: str) -> None:
+    """Rate-limited (15 min) operator warning for the stale fingerprint writer."""
+    import time as _time
+
+    now = _time.monotonic()
+    if now - _LEGACY_WRITER_WARNED["at"] < 900 and _LEGACY_WRITER_WARNED["at"]:
+        return
+    _LEGACY_WRITER_WARNED["at"] = now
+    log.warning(
+        "SELF-SCAN DISABLED: %s. A scan of this laptop's own IP goes through its firewall "
+        "(services show as 'no answer'). Fix on the laptop: run Start-Laptop.cmd again.",
+        reason,
+    )
+
+
 def _env_bool(name: str, default: bool = True) -> bool:
     raw = (os.environ.get(name) or "").strip().lower()
     if not raw:
@@ -957,13 +975,19 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
 
             self_plan = plan_self_targets(chunk)
             scan_addresses = dict(self_plan.get("aliases") or {})
-            if scan_addresses or self_plan.get("host_ips"):
+            # V1.9.1: also record when the scanner could NOT tell whether the
+            # target is itself (stale/legacy fingerprint). Jobs 320903ac and
+            # 64b549f1 silently took the firewalled network path with no event.
+            if scan_addresses or self_plan.get("host_ips") or self_plan.get("undetermined"):
                 emit_ip_event(
                     job_id, host, "self_target_check",
                     is_self=host in scan_addresses, scan_address=scan_addresses.get(host),
                     host_ips=self_plan.get("host_ips"), source=self_plan.get("source"),
-                    reason=self_plan.get("reason"), chunk_index=idx,
+                    reason=self_plan.get("reason"), undetermined=bool(self_plan.get("undetermined")),
+                    legacy_writer=bool(self_plan.get("legacy_writer")), chunk_index=idx,
                 )
+            if self_plan.get("legacy_writer"):
+                _warn_legacy_fingerprint_writer(str(self_plan.get("reason") or ""))
         except Exception:
             log.warning("Self-target check failed for %s; scanning the network path", host, exc_info=True)
             scan_addresses = {}

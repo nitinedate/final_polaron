@@ -470,7 +470,9 @@ def _find_config_id(gmp: Any, name: str = "Full and fast") -> str:
             cid = by_name.get(candidate.strip().casefold())
             if cid:
                 log.info(
-                    "Base config 'Full and fast' not present; using '%s' instead", AETHERIS_SCAN_CONFIG
+                    "Base config 'Full and fast' not present; using '%s' instead. gvmd is not importing its "
+                    "predefined data objects: set the Feed Import Owner (scripts/Repair-Greenbone-Feed-v1.4.1.ps1)",
+                    AETHERIS_SCAN_CONFIG,
                 )
                 return cid
     summary = ", ".join(available[:8]) if available else "none"
@@ -698,93 +700,344 @@ def _severity_filter(nvt_filter: dict[str, Any] | None) -> str:
     return " ".join(terms)
 
 
-def _ensure_check_scope_config(
-    gmp: Any, base_config_id: str, nvt_filter: dict[str, Any] | None = None
-) -> tuple[str, dict[str, Any]]:
-    """Clone ``base_config_id`` keeping only checks that can report C/H/M/L (V1.6.8).
+# --- V1.9.1 check-scope engine ------------------------------------------------
+# Field regression (jobs 1598a7c8, dffcee8e, 64b549f1 on 192.168.0.163): every
+# scan since V1.6.8 finished Info-only, while V1.6.4 on the same laptop reported
+# 2 Medium + 1 Low. V1.6.8 built a *static* per-family OID list with
+# ``get_info_list(... rows=-1)``. gvmd caps every GET at its immutable
+# "Max Rows Per Page" setting (default 1000; rows=-1 is rewritten to 1000), so
+# every family with more than 1000 matching checks was silently truncated, and
+# the truncated snapshot was then reused by name forever because the
+# verification comment was never stored (python-gvm takes ``comment=`` as a
+# keyword-only argument; the positional call raised TypeError inside a bare
+# ``except``).
+#
+# Now:
+# * ``vulnerability`` (default): every family whole and growing, minus the
+#   excluded families. No OID enumeration, so nothing can be truncated and new
+#   feed checks are picked up automatically (Nessus "Advanced Scan" parity).
+# * ``severity`` (opt-in, SCAN_CHECK_SCOPE=severity) and Advanced Dynamic
+#   ``nvt_filter``: static OID lists fetched in pages below the gvmd cap and
+#   verified against gvmd's own filtered total.
+# * Every config is verified family-by-family (selected == available for whole
+#   families, selected == expected for static ones) before it is used, and
+#   again before a stored config is reused. A config that fails is rebuilt.
+CHECK_SCOPE_CONFIG_VERSION = "v2"
+# Families that stay whole in the opt-in severity mode: discovery, plus the
+# detection checks whose evidence every vulnerability check depends on.
+SEVERITY_SCOPE_WHOLE_FAMILIES = CHECK_SCOPE_WHOLE_FAMILIES + ("Product detection",)
+_LEGACY_SCOPE_PREFIXES = ("Aetheris vuln-scope ", "Aetheris dynamic ")
 
-    * Whole: port scanners, settings, credentials, service detection, and every
-      "... Local Security Checks" family (they only run with credentials).
-    * Excluded: brute force, compliance/policy/IT-Grundschutz, NSE wrappers, DoS.
-    * Every other family: only NVTs with severity > 0 (gvmd ``get_info`` filter),
-      plus the essential reporting OIDs above.
-    OpenVAS ``auto_enable_dependencies`` (on by default, verified in
-    openvas-scanner pluginscheduler.c) then loads every detection check a
-    selected check declares as a dependency. Any failure, or a result below
-    GVM_MIN_NVT_COUNT, falls back to the unscoped config.
+
+def _info_page_rows() -> int:
+    """Rows per get_info page; always below gvmd's default Max Rows Per Page (1000)."""
+    try:
+        return max(50, min(1000, int(os.environ.get("GVM_INFO_PAGE_ROWS") or 500)))
+    except (TypeError, ValueError):
+        return 500
+
+
+def _filtered_total(resp: Any) -> int | None:
+    for xpath in (".//info_count/filtered/text()", ".//nvt_count/filtered/text()"):
+        try:
+            values = resp.xpath(xpath)
+        except Exception:
+            values = []
+        for raw in values:
+            try:
+                return int(str(raw).strip())
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _paged_info_oids(gmp: Any, filter_terms: str) -> list[str]:
+    """Every NVT OID matching ``filter_terms``, fetched in pages under the gvmd row cap.
+
+    Raises RuntimeError when the collected set does not match gvmd's own
+    filtered total, so an incomplete list can never become a scan config.
     """
+    page = _info_page_rows()
+    last_error = ""
+    for attempt in range(2):
+        oids: list[str] = []
+        seen: set[str] = set()
+        expected: int | None = None
+        first = 1
+        for _guard in range(10000):
+            resp = gmp.get_info_list(
+                _nvt_info_type(),
+                filter_string=f"{filter_terms} sort=name first={first} rows={page}",
+                details=False,
+            )
+            if expected is None:
+                expected = _filtered_total(resp)
+            batch = _info_oids(resp)
+            for oid in batch:
+                if oid not in seen:
+                    seen.add(oid)
+                    oids.append(oid)
+            if len(batch) < page or (expected is not None and first - 1 + len(batch) >= expected):
+                break
+            first += page
+        if expected is None or len(oids) == expected:
+            return oids
+        last_error = f"collected {len(oids)} of {expected} matching checks ({filter_terms})"
+        log.warning("NVT list incomplete on attempt %d: %s", attempt + 1, last_error)
+    raise RuntimeError(f"incomplete NVT list from gvmd: {last_error}")
+
+
+def _config_family_stats(gmp: Any, config_id: str) -> tuple[dict[str, dict[str, Any]], int | None]:
+    """Per-family selection of a scan config: {family: {nvt_count, max_nvt_count, growing}}."""
+    resp = gmp.get_scan_config(config_id)
+    stats: dict[str, dict[str, Any]] = {}
+    for fam in resp.xpath(".//families/family"):
+        name = (fam.findtext("name") or "").strip()
+        if not name:
+            continue
+        growing_node = fam.find("growing")
+        growing = None
+        if growing_node is not None:
+            growing = (growing_node.text or "").strip().lower() in {"1", "true", "yes"}
+        stats[name] = {
+            "nvt_count": _as_int(fam.findtext("nvt_count"), -1),
+            "max_nvt_count": _as_int(fam.findtext("max_nvt_count"), -1),
+            "growing": growing,
+        }
+    return stats, _feed_count_from_xml(resp)
+
+
+def _partial_families(stats: dict[str, dict[str, Any]]) -> dict[str, str]:
+    """Families that carry only part of their checks, as {family: "selected/available"}.
+
+    gvmd lists every feed family, unselected ones as 0/N (GSA's "0 of N"). An
+    unselected family is excluded, not truncated, so it is not partial.
+    """
+    out: dict[str, str] = {}
+    for name, row in stats.items():
+        sel, avail = row.get("nvt_count", -1), row.get("max_nvt_count", -1)
+        if sel > 0 and avail >= 0 and sel < avail:
+            out[name] = f"{sel}/{avail}"
+    return out
+
+
+def _unselected_families(stats: dict[str, dict[str, Any]]) -> list[str]:
+    return sorted(name for name, row in stats.items()
+                  if row.get("nvt_count", -1) == 0 and row.get("max_nvt_count", 0) > 0)
+
+
+def _verify_scope_config(
+    gmp: Any,
+    config_id: str,
+    *,
+    whole: list[str],
+    excluded: list[str],
+    static_counts: dict[str, int] | None = None,
+    min_total: int | None = None,
+) -> dict[str, Any]:
+    """Prove a scope config contains what it should. Returns {"ok": bool, ...evidence}."""
+    stats, total = _config_family_stats(gmp, config_id)
+    problems: list[str] = []
+    truncated: dict[str, str] = {}
+    for fam in whole:
+        row = stats.get(fam)
+        if row is None:
+            problems.append(f"missing family {fam}")
+            continue
+        sel, avail = row["nvt_count"], row["max_nvt_count"]
+        if sel >= 0 and avail >= 0 and sel < avail:
+            truncated[fam] = f"{sel}/{avail}"
+        elif row.get("growing") is False:
+            problems.append(f"whole family not growing: {fam}")
+    if truncated:
+        problems.append("whole families truncated: " + ", ".join(f"{k} {v}" for k, v in sorted(truncated.items())))
+    for fam in excluded:
+        row = stats.get(fam)
+        if row is not None and row.get("nvt_count", 0) > 0:
+            problems.append(f"excluded family selected: {fam}")
+    for fam, want in (static_counts or {}).items():
+        row = stats.get(fam)
+        have = row["nvt_count"] if row else 0
+        if have >= 0 and have != want:
+            problems.append(f"{fam}: {have} selected, expected {want}")
+    if min_total is not None and isinstance(total, int) and 0 <= total < min_total:
+        problems.append(f"{total} checks, below GVM_MIN_NVT_COUNT={min_total}")
+    return {"ok": not problems, "problems": problems[:12], "nvt_count": total,
+            "families": len(stats), "partial_families": _partial_families(stats),
+            "families_unselected": _unselected_families(stats)}
+
+
+def _nvt_feed_version(gmp: Any) -> str:
+    """NVT feed version only; SCAP/CERT/data-object versions do not change NVT selection."""
+    try:
+        for feed in gmp.get_feeds().xpath(".//feed"):
+            if (feed.findtext("type") or "").strip().upper() == "NVT":
+                version = (feed.findtext("version") or "").strip()
+                if version:
+                    return version
+    except Exception:
+        log.debug("NVT feed version unavailable", exc_info=True)
+    return "nofeed"
+
+
+def _set_config_comment(gmp: Any, config_id: str, payload: dict[str, Any]) -> bool:
+    """Store JSON evidence on a config. python-gvm takes ``comment`` keyword-only."""
+    try:
+        gmp.modify_scan_config_set_comment(config_id, comment=json.dumps(payload, sort_keys=True))
+        return True
+    except Exception:
+        log.warning("Could not store the verification comment on scan config %s", config_id, exc_info=True)
+        return False
+
+
+def _scope_candidates(gmp: Any, name: str) -> list[tuple[str, str, bool, dict[str, Any]]]:
+    """Existing configs called ``name`` or ``name r<n>``: (id, name, in_use, saved_comment)."""
+    out = []
+    try:
+        resp = gmp.get_scan_configs(filter_string=f'name~"{name}" rows=50')
+    except Exception:
+        return out
+    for node in resp.xpath("config"):
+        cname = (node.findtext("name") or "").strip()
+        cid = str(node.get("id") or "").strip()
+        if not cid or not (cname == name or cname.startswith(name + " r")):
+            continue
+        try:
+            saved = json.loads(node.findtext("comment") or "{}")
+        except ValueError:
+            saved = {}
+        in_use = (node.findtext("in_use") or "0").strip() not in {"0", ""}
+        out.append((cid, cname, in_use, saved if isinstance(saved, dict) else {}))
+    return out
+
+
+def _retire_legacy_scope_configs(gmp: Any) -> None:
+    """Best effort: delete unused pre-V1.9.1 scope configs so they can never be reused."""
+    try:
+        resp = gmp.get_scan_configs(filter_string='name~"Aetheris" rows=200')
+    except Exception:
+        return
+    for node in resp.xpath("config"):
+        cname = (node.findtext("name") or "").strip()
+        cid = str(node.get("id") or "").strip()
+        if not cid or not cname.startswith(_LEGACY_SCOPE_PREFIXES):
+            continue
+        if f" {CHECK_SCOPE_CONFIG_VERSION} " in cname:
+            continue
+        if (node.findtext("in_use") or "0").strip() not in {"0", ""}:
+            continue
+        try:
+            gmp.delete_scan_config(cid, ultimate=True)
+            log.info("Retired legacy scan config %s (%s)", cname, cid)
+        except Exception:
+            log.debug("Could not retire legacy scan config %s", cid, exc_info=True)
+
+
+def _ensure_check_scope_config(
+    gmp: Any, base_config_id: str, nvt_filter: dict[str, Any] | None = None, mode: str = "vulnerability",
+) -> tuple[str, dict[str, Any]]:
+    """Clone ``base_config_id`` for the requested check scope and prove its contents.
+
+    Modes: ``vulnerability`` (default, whole growing families minus exclusions),
+    ``severity`` (static severity>0 selection, opt-in), or an Advanced Dynamic
+    ``nvt_filter``. Non-dynamic failures fall back to the unscoped base config
+    (all checks); dynamic failures raise, because running everything would
+    silently ignore the user's filter.
+    """
+    dynamic = bool(nvt_filter)
+    mode = "dynamic" if dynamic else ("severity" if str(mode).lower() == "severity" else "vulnerability")
     base_count = None
     try:
         base_count = _feed_count_from_xml(gmp.get_scan_config(base_config_id))
     except Exception:
         pass
-    dynamic = bool(nvt_filter)
-    status: dict[str, Any] = {"scope": "dynamic" if dynamic else "vulnerability", "config": "base",
-                              "base_nvt_count": base_count}
+    status: dict[str, Any] = {"scope": mode, "config": "base", "base_nvt_count": base_count,
+                              "version": CHECK_SCOPE_CONFIG_VERSION}
     if dynamic:
         status["filter"] = dict(nvt_filter or {})
-        digest = hashlib.sha256(json.dumps(nvt_filter, sort_keys=True).encode()).hexdigest()[:8]
-        name = f"Aetheris dynamic {digest}-{_feed_digest(gmp)}-{str(base_config_id)[:8]}"
-    else:
-        name = f"Aetheris vuln-scope {_feed_digest(gmp)}-{str(base_config_id)[:8]}"
+    base8 = str(base_config_id)[:8]
     try:
-        resp = gmp.get_scan_configs(filter_string=f'name="{name}" rows=5')
-        for node in resp.xpath("config"):
-            if (node.findtext("name") or "").strip() == name and node.get("id"):
-                try:
-                    saved = json.loads(node.findtext("comment") or "{}")
-                except ValueError:
-                    saved = {}
-                saved["config"] = f"reused {name}"
-                log.info("Vulnerability-only config %s reused (%s checks)", name, saved.get("nvt_count"))
-                return str(node.get("id")), saved
-
+        _retire_legacy_scope_configs(gmp)
         families = _config_families(gmp, base_config_id)
         if not families:
             raise RuntimeError("base config lists no families")
         wanted = set((nvt_filter or {}).get("families") or [])
-        # gvmd FAMILIES_WHOLE_ONLY are all "... Local Security Checks": they can
-        # only be selected whole and growing, never filtered (manage.h).
         lsc = [f for f in families if f.endswith("Local Security Checks")]
-        whole = [f for f in families if f in CHECK_SCOPE_WHOLE_FAMILIES]
-        whole += [f for f in lsc if not wanted or f in wanted]
-        if wanted:  # explicit family list: honour it, including normally excluded families
-            excluded = [f for f in families if f not in wanted and f not in whole]
-            filtered = [f for f in families if f in wanted and f not in whole]
-        else:
+
+        if mode == "vulnerability":
             excluded = [f for f in families if f in CHECK_SCOPE_EXCLUDED_FAMILIES]
-            filtered = [f for f in families if f not in whole and f not in excluded and f not in lsc]
+            whole = [f for f in families if f not in excluded]
+            filtered: list[str] = []
+            digest = hashlib.sha256("|".join(sorted(excluded) + ["#"] + sorted(families)).encode()).hexdigest()[:8]
+            name = f"Aetheris vuln-scope {CHECK_SCOPE_CONFIG_VERSION} {digest}-{base8}"
+        else:
+            whole_set = SEVERITY_SCOPE_WHOLE_FAMILIES if mode == "severity" else CHECK_SCOPE_WHOLE_FAMILIES
+            whole = [f for f in families if f in whole_set]
+            whole += [f for f in lsc if (not wanted or f in wanted) and f not in whole]
+            if wanted:  # explicit family list: honour it, including normally excluded families
+                excluded = [f for f in families if f not in wanted and f not in whole]
+                filtered = [f for f in families if f in wanted and f not in whole]
+            else:
+                excluded = [f for f in families if f in CHECK_SCOPE_EXCLUDED_FAMILIES]
+                filtered = [f for f in families if f not in whole and f not in excluded and f not in lsc]
+            fdigest = hashlib.sha256(json.dumps(nvt_filter or {}, sort_keys=True).encode()).hexdigest()[:8]
+            label = "dynamic" if dynamic else "severity-scope"
+            name = f"Aetheris {label} {CHECK_SCOPE_CONFIG_VERSION} {fdigest}-{_nvt_feed_version(gmp)}-{base8}"
+
+        min_total = None if dynamic else _minimum_nvt_count()
+
+        # Reuse only a config that still proves its contents.
+        for cid, cname, in_use, saved in _scope_candidates(gmp, name):
+            static_counts = {k: int(v) for k, v in (saved.get("static_counts") or {}).items()} if filtered else None
+            if filtered and not static_counts:
+                verdict = {"ok": False, "problems": ["no stored selection evidence"]}
+            else:
+                verdict = _verify_scope_config(gmp, cid, whole=whole, excluded=excluded,
+                                               static_counts=static_counts, min_total=min_total)
+            if verdict["ok"]:
+                status.update({k: v for k, v in saved.items() if k not in {"config"}})
+                status.update({"config": f"reused {cname}", "verification": verdict})
+                log.info("Check-scope config %s reused: %s checks, verified (%d families, partial: %s)",
+                         cname, verdict.get("nvt_count"), verdict.get("families", 0),
+                         verdict.get("partial_families") or "none")
+                return cid, status
+            log.warning("Check-scope config %s failed verification (%s); rebuilding",
+                        cname, "; ".join(verdict.get("problems") or []))
+            if not in_use:
+                try:
+                    gmp.delete_scan_config(cid, ultimate=True)
+                except Exception:
+                    log.debug("Could not delete invalid scope config %s", cid, exc_info=True)
+
         flt_terms = _severity_filter(nvt_filter)
-
         essential: dict[str, list[str]] = {}
-        for oid in CHECK_SCOPE_ESSENTIAL_OIDS:
-            try:
-                info = gmp.get_info(oid, _nvt_info_type())
-                fam = (info.findtext(".//nvt/family") or "").strip()
-                if fam:
-                    essential.setdefault(fam, []).append(oid)
-            except Exception:
-                log.debug("Essential NVT %s not found in feed", oid)
-
         selections: dict[str, list[str]] = {}
         essential_added = 0
-        for fam in filtered:
-            resp = gmp.get_info_list(
-                _nvt_info_type(), filter_string=f'family="{fam}" {flt_terms} rows=-1', details=False,
-            )
-            oids = _info_oids(resp)
-            for oid in essential.get(fam, []):
-                if oid not in oids:
-                    oids.append(oid)
-                    essential_added += 1
-            if oids:
-                selections[fam] = oids
+        if filtered:
+            for oid in CHECK_SCOPE_ESSENTIAL_OIDS:
+                try:
+                    info = gmp.get_info(oid, _nvt_info_type())
+                    fam = (info.findtext(".//nvt/family") or "").strip()
+                    if fam:
+                        essential.setdefault(fam, []).append(oid)
+                except Exception:
+                    log.debug("Essential NVT %s not found in feed", oid)
+            for fam in filtered:
+                oids = _paged_info_oids(gmp, f'family="{fam}" {flt_terms}')
+                for oid in essential.get(fam, []):
+                    if oid not in oids:
+                        oids.append(oid)
+                        essential_added += 1
+                if oids:
+                    selections[fam] = oids
 
+        existing_names = {c[1] for c in _scope_candidates(gmp, name)}
+        final_name = name if name not in existing_names else f"{name} r{int(time.time())}"
         cloned = gmp.clone_scan_config(base_config_id)
         new_id = str(cloned.get("id") or "").strip()
         if not new_id:
             raise RuntimeError("clone returned no id")
-        gmp.modify_scan_config_set_name(new_id, name)
+        gmp.modify_scan_config_set_name(new_id, final_name)
         family_rows = [(f, True, True) for f in whole] + [(f, False, True) for f in selections]
         gmp.modify_scan_config_set_family_selection(new_id, family_rows, auto_add_new_families=False)
         for fam, oids in selections.items():
@@ -794,43 +1047,60 @@ def _ensure_check_scope_config(
         except Exception:
             log.debug("auto_enable_dependencies preference not set; ospd default (1) applies")
 
-        new_count = _feed_count_from_xml(gmp.get_scan_config(new_id))
         selected = sum(len(v) for v in selections.values())
-        if dynamic:
-            # A narrow filter is the point of a dynamic scan; require only that it matched something.
-            if selected - essential_added <= 0:
-                raise RuntimeError(f"dynamic filter {_severity_filter(nvt_filter)} matched no checks")
-        elif isinstance(new_count, int) and new_count >= 0 and new_count < _minimum_nvt_count():
-            raise RuntimeError(f"vulnerability-only config has {new_count} checks, below GVM_MIN_NVT_COUNT")
+        if dynamic and selected - essential_added <= 0:
+            raise RuntimeError(f"dynamic filter {_severity_filter(nvt_filter)} matched no checks")
+        static_counts = {fam: len(oids) for fam, oids in selections.items()}
+        verdict = _verify_scope_config(gmp, new_id, whole=whole, excluded=excluded,
+                                       static_counts=static_counts, min_total=min_total)
+        if not verdict["ok"]:
+            try:
+                gmp.delete_scan_config(new_id, ultimate=True)
+            except Exception:
+                log.debug("Could not delete rejected scope config %s", new_id, exc_info=True)
+            raise RuntimeError("new check-scope config failed verification: " + "; ".join(verdict["problems"]))
         status.update({
-            "config": f"created {name}",
-            "nvt_count": new_count,
-            "whole_families": whole,
+            "config": f"created {final_name}",
+            "nvt_count": verdict.get("nvt_count"),
+            "whole_families": len(whole),
             "filtered_families": len(selections),
             "severity_checks_selected": selected,
             "excluded_families": excluded,
             "essential_reporting_checks": essential_added,
+            "verification": verdict,
         })
-        try:
-            gmp.modify_scan_config_set_comment(new_id, json.dumps(
-                {k: status[k] for k in ("scope", "nvt_count", "base_nvt_count", "filtered_families",
-                                         "severity_checks_selected", "excluded_families", "filter")
-                 if k in status}))
-        except Exception:
-            pass
+        _set_config_comment(gmp, new_id, {
+            **{k: status[k] for k in ("scope", "version", "nvt_count", "base_nvt_count", "whole_families",
+                                      "filtered_families", "severity_checks_selected", "excluded_families",
+                                      "filter") if k in status},
+            "static_counts": static_counts,
+        })
         log.info(
-            "Vulnerability-only config %s (%s): %s of %s checks; %d families filtered to severity>0, "
-            "%d whole, excluded %s",
-            name, new_id, new_count, base_count, len(selections), len(whole), ", ".join(excluded) or "none",
+            "Check-scope config %s (%s) [%s]: %s of %s checks verified; %d whole families, "
+            "%d filtered, excluded %s; partial families: %s",
+            final_name, new_id, mode, verdict.get("nvt_count"), base_count, len(whole), len(selections),
+            ", ".join(excluded) or "none", verdict.get("partial_families") or "none",
         )
         return new_id, status
     except Exception as exc:
         if dynamic:
             # Falling back to "all checks" would silently ignore the user's filter.
             raise ValueError(f"Advanced Dynamic Scan filter could not be applied: {exc}") from exc
-        log.warning("Vulnerability-only check scope not applied (%s); running all checks", exc)
+        log.warning("Check scope %s not applied (%s); running all checks", mode, exc)
         status["config"] = f"not applied ({str(exc)[:160]}); all checks run"
         return base_config_id, status
+
+
+def effective_selection(gmp: Any, config_id: str) -> dict[str, Any]:
+    """What the task's config will actually run: total checks and any partial families."""
+    try:
+        stats, total = _config_family_stats(gmp, config_id)
+    except Exception as exc:
+        return {"available": False, "error": str(exc)[:200]}
+    selected_families = [f for f, row in stats.items() if row.get("nvt_count", 0) > 0]
+    return {"available": True, "nvt_count": total, "families_selected": len(selected_families),
+            "families_total": len(stats), "partial_families": _partial_families(stats),
+            "families_unselected": _unselected_families(stats)}
 
 
 def _nmap_timing_pref_name(gmp: Any, config_id: str) -> str | None:
@@ -928,11 +1198,10 @@ def _ensure_profile_config(
                 log.warning("Could not cap NVT %s timeout (%s)", oid, exc)
         status["nvt_timeout_caps"] = applied
         status["config"] = f"created {name}"
-        try:
-            gmp.modify_scan_config_set_comment(new_id, json.dumps(
-                {k: status[k] for k in ("nvt_timeout_caps", "nmap_timing", "scanner_preferences")}))
-        except Exception:
-            pass
+        # V1.9.1: ``comment`` is keyword-only in python-gvm; the old positional
+        # call raised TypeError, was swallowed, and every reuse logged "None".
+        _set_config_comment(gmp, new_id, {k: status[k] for k in ("nvt_timeout_caps", "nmap_timing",
+                                                                  "scanner_preferences")})
         _cleanup_fast_configs(gmp, keep_id=new_id)
         log.info("Scan profile config %s (%s): scanner prefs %s, %d NVT timeout cap(s), Nmap timing %s",
                  name, new_id, applied_prefs, applied, status["nmap_timing"])
@@ -2299,8 +2568,9 @@ class LocalOpenVAS:
                     gmp, config_id, families, require=bool(snapshot.get("require_families")))
             elif full_config and nvt_filter:
                 config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(gmp, config_id, nvt_filter)
-            elif full_config and check_scope == "vulnerability":
-                config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(gmp, config_id)
+            elif full_config and check_scope in {"vulnerability", "severity"}:
+                config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(
+                    gmp, config_id, mode=check_scope)
             scanner_prefs = {
                 "plugins_timeout": str(int(perf_cfg["plugins_timeout"] or self.plugins_timeout)),
                 "checks_read_timeout": str(read_timeout),
@@ -2312,6 +2582,20 @@ class LocalOpenVAS:
                 hang_caps if performance == "fast" else {},
                 perf_cfg["nmap_timing"] if performance == "fast" else None,
             )
+            # V1.9.1: record what the task's own config will run. A partial family
+            # here is exactly the silent truncation that hid every Medium/Low.
+            selection = effective_selection(gmp, config_id)
+            snapshot["check_selection"] = selection
+            if selection.get("available"):
+                partial = selection.get("partial_families") or {}
+                log.info(
+                    "Effective check selection for task config %s: %s checks in %s/%s families; "
+                    "partial families: %s; not selected: %s",
+                    config_id, selection.get("nvt_count"), selection.get("families_selected"),
+                    selection.get("families_total"),
+                    ", ".join(f"{k} {v}" for k, v in sorted(partial.items())) or "none",
+                    ", ".join(selection.get("families_unselected") or []) or "none",
+                )
             # The 10k-NVT config floor only applies to an unscoped Full-and-fast
             # config; Discovery or family-scoped configs are smaller by design.
             # The feed-wide NVT floor is always enforced.

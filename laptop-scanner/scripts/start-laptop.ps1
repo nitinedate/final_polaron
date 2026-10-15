@@ -111,11 +111,39 @@ Write-Host ''
 Write-Host '==> Recording host LAN fingerprint (portable roam detection)'
 $fp = Join-Path $root 'scripts\Write-LanFingerprint.ps1'
 if (Test-Path $fp) {
+    # V1.9.1: stop every running writer loop first. Loops left by earlier
+    # Start-Laptop runs (including pre-1.8.0 packages that never write
+    # host_ips) otherwise keep racing the current writer, and the agent then
+    # scans this laptop's own IP through its firewall.
+    $staleWriters = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.Name -eq 'powershell.exe' -or $_.Name -eq 'pwsh.exe') -and
+            $_.ProcessId -ne $PID -and
+            $_.CommandLine -and $_.CommandLine -match 'Write-LanFingerprint\.ps1'
+        })
+    foreach ($w in $staleWriters) {
+        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($staleWriters.Count -gt 0) {
+        Write-Host ("[OK] Stopped {0} old LAN fingerprint writer(s)." -f $staleWriters.Count)
+        Start-Sleep -Milliseconds 500
+    }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fp -Root $root -Once
     Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
         '-NoProfile','-ExecutionPolicy','Bypass','-File',$fp,'-Root',$root
     ) | Out-Null
     Write-Host '[OK] LAN fingerprint writer started.'
+    $fpFile = Join-Path $root '.lan-fingerprint'
+    try {
+        $fpJson = Get-Content -LiteralPath $fpFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($fpJson.PSObject.Properties.Name -contains 'host_ips') {
+            Write-Host ("[OK] Fingerprint host_ips: {0}" -f ((@($fpJson.host_ips)) -join ', '))
+        } else {
+            Write-Host '[WARN] .lan-fingerprint has no host_ips; self-scan of this laptop will use the network path.' -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host '[WARN] Could not read .lan-fingerprint after writing it.' -ForegroundColor Yellow
+    }
 }
 
 $compose=$null

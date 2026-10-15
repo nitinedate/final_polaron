@@ -142,8 +142,8 @@ class FastGmp:
     def modify_scan_config_set_nvt_preference(self, cid, name, nvt_oid, value=None):
         self.prefs.append((cid, name, nvt_oid, value))
 
-    def modify_scan_config_set_comment(self, cid, comment):
-        pass
+    def modify_scan_config_set_comment(self, cid, *, comment=None):  # keyword-only, like python-gvm
+        self.comment = comment
 
     def modify_scan_config_set_scanner_preference(self, cid, name, value=None):
         self.scanner_prefs[name] = value
