@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 
 import httpx
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 
 from pathlib import Path
 from typing import Any
@@ -146,7 +147,10 @@ def _cfg() -> dict[str, Any]:
         "high_progress_stall_pct": max(80, min(99, int(os.environ.get("HIGH_PROGRESS_STALL_PCT") or 90))),
         # Optional absolute safety ceiling. This is NOT a progress-based timeout.
         # Set to 0 to disable. Default is disabled; configure explicitly if desired.
+        # V1.9.3: MAX_SCAN_RUNTIME_SEC is applied per IP (scan_performance.ip_runtime_limit);
+        # the whole-job cap is MAX_JOB_RUNTIME_SEC (default off).
         "max_scan_runtime_sec": max(0, int(os.environ.get("MAX_SCAN_RUNTIME_SEC") or 0)),
+        "max_job_runtime_sec": max(0, int(os.environ.get("MAX_JOB_RUNTIME_SEC") or 0)),
         "version": _read_agent_version(),
     }
 
@@ -560,6 +564,19 @@ def _ip_worker_limit(capacity: dict[str, Any], chunk_count: int) -> int:
     return max(1, min(max(IP_WORKERS_MIN, int(capacity["ip_workers"])), max(1, chunk_count)))
 
 
+def _silent_preprobe(states: Any) -> int:
+    """Number of probed ports if the pre-probe got no answer at all, else 0 (V1.9.7).
+
+    "No answer" means no port accepted the connection and none refused it with
+    a TCP reset: every probe timed out. A host that resets ports is up.
+    """
+    if not isinstance(states, dict):
+        return 0
+    if states.get("open") or states.get("closed"):
+        return 0
+    return len(states.get("filtered") or [])
+
+
 def _apply_time_limit(details: dict[str, Any], host: str, info: dict[str, Any]) -> dict[str, Any]:
     """Turn a task stopped at the per-IP time limit into an honest finished result.
 
@@ -578,10 +595,19 @@ def _apply_time_limit(details: dict[str, Any], host: str, info: dict[str, Any]) 
     cov = dict(host_cov.get(host) or {"verdict": "unverified", "open_tcp_ports": [], "open_udp_ports": []})
     limit = int(info.get("limit") or 0)
     pct = int(info.get("progress") or 0)
-    note = (
-        f"Per-IP time limit ({limit // 60} min) reached at {pct}%: the task was stopped and checks still "
-        "running did not finish. Findings found before the limit are kept."
-    )
+    no_response = info.get("kind") == "no_response"
+    if no_response:
+        note = (
+            f"No response: none of the {int(info.get('probed_ports') or 0)} TCP ports the agent probed answered "
+            f"(no open port, no reset), and OpenVAS found no open port in {limit // 60} min of port scanning. "
+            "The host is offline or drops all traffic. It was stopped so its scan slot could go to the next IP; "
+            "it was not assessed."
+        )
+    else:
+        note = (
+            f"Per-IP time limit ({limit // 60} min) reached at {pct}%: the task was stopped and checks still "
+            "running did not finish. Findings found before the limit are kept."
+        )
     warnings = [w for w in (cov.get("warnings") or []) if w != note] + [note]
     ports_done = bool(cov.get("open_tcp_ports") or cov.get("open_udp_ports")) and pct >= 10 \
         and not cov.get("port_scanner_errors")
@@ -596,6 +622,11 @@ def _apply_time_limit(details: dict[str, Any], host: str, info: dict[str, Any]) 
             f"Time limit reached at {pct}% after port scanning finished "
             f"({len(cov.get('open_tcp_ports') or [])} open TCP port(s)); unfinished checks were stopped"
         )
+    elif no_response:
+        cov["verdict"] = "no_response"
+        cov["network_scan_complete"] = False
+        cov["reason"] = (f"No response on any probed port; OpenVAS port scan found no open port in "
+                         f"{limit // 60} min (host offline or all traffic dropped). Not assessed")
     else:
         cov["verdict"] = "degraded_time_limit"
         cov["network_scan_complete"] = False
@@ -603,7 +634,8 @@ def _apply_time_limit(details: dict[str, Any], host: str, info: dict[str, Any]) 
     host_cov[host] = cov
     ev["host_coverage"] = host_cov
     ev["time_limited"] = True
-    ev["assessment_verdict"] = "assessed_time_limited" if ports_done else "time_limit_before_port_scan"
+    ev["assessment_verdict"] = ("assessed_time_limited" if ports_done
+                                else "no_response" if no_response else "time_limit_before_port_scan")
     ev["assessment_complete"] = bool(ports_done)
     if not ev.get("scan_end"):
         ev["scan_end"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -905,15 +937,39 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     ip_stall_noted: dict[int, float] = {}
 
     stall_cfg = stall_limits()
-    from agent.scan_performance import fixed_ip_workers, ip_deadline_sec, resolve_profile
+    from agent.scan_performance import (fixed_ip_workers, ip_runtime_limit, nvt_max_sec,
+                                        per_ip_check_concurrency, resolve_profile)
 
     _policy_req = job.get("scan_policy_request") if isinstance(job.get("scan_policy_request"), dict) else None
     job_profile = resolve_profile(_policy_req)
-    ip_deadline = ip_deadline_sec(job_profile)
+    # V1.9.3: each IP has its own clock, started when its OpenVAS task starts.
+    # MAX_SCAN_RUNTIME_SEC used to be ONE clock for the whole job (job 3c4f45e0:
+    # the 2nd IP got what the 1st IP left of 3600 s, and IPs still waiting got 0).
+    ip_deadline, ip_deadline_source = ip_runtime_limit()
     ip_deadline_hit: dict[int, dict[str, Any]] = {}
+    # V1.9.7: a host that answered none of the pre-probe ports (no open port, no
+    # TCP reset) and is still in OpenVAS's port scan (0%) after this long is
+    # stopped as "no response", so its slot goes to the next IP instead of being
+    # held for the whole per-IP limit (job de53e2fe: 192.168.0.195, all 65,535
+    # ports, 0% after 60 min). 0 = off.
+    from agent.scan_performance import silent_host_sec
+    silent_sec = silent_host_sec()
+    last_parallel_log = time.monotonic()
+
+    def _running_seconds(now_r: float | None = None) -> dict[int, int]:
+        """Seconds each in-flight IP's OpenVAS task has run (V1.9.7, for the Activity column)."""
+        now_r = time.monotonic() if now_r is None else now_r
+        return {i: int(now_r - ip_started_mono[i]) for i in list(in_flight) if i in ip_started_mono}
     ip_tail_reported: dict[int, int] = {}
-    log.info("Job %s speed profile=%s per-IP time limit=%ss fixed IP workers=%s",
-             job_id, job_profile, ip_deadline or "off", fixed_ip_workers() or "adaptive")
+    per_ip_checks = per_ip_check_concurrency(job_profile)
+    log.info(
+        "Job %s speed profile=%s | parallel: up to %s IP(s) at once, %d checks at once per IP | "
+        "per-IP time limit=%s (%s) | job limit=%s | per-check max=%s",
+        job_id, job_profile, min(fixed_ip_workers() or ip_workers, max(1, len(chunks))), per_ip_checks,
+        f"{ip_deadline}s" if ip_deadline else "off", ip_deadline_source,
+        f"{cfg.get('max_job_runtime_sec')}s" if cfg.get("max_job_runtime_sec") else "off",
+        f"{nvt_max_sec()}s" if nvt_max_sec() else "off",
+    )
     from agent.scan_performance import fixed_ip_workers as _fixed_workers
 
     slot_sem = AdaptiveIPSemaphore(
@@ -931,6 +987,14 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         host = str(chunks[idx][0]) if chunks[idx] else f"chunk-{idx}"
         emit_ip_event(job_id, host, "resumed", task_id=",".join(ids), chunk_index=idx)
     slot_sem.restore(len(in_flight))
+
+    # V1.9.3: IP starts run in parallel on their own threads. Starting one IP
+    # (pre-probe, config lookup, target/task creation) took 45-55 s and used to
+    # run on the polling thread, so IP 2 waited for IP 1's start and no IP was
+    # polled meanwhile. Permits are still taken here, so the IP limit holds.
+    start_pool = ThreadPoolExecutor(max_workers=max(1, slot_sem.max_permits), thread_name_prefix="aetheris-start")
+    starting: dict[int, Any] = {}
+    start_abort = threading.Event()
 
     def _ids_for(idx: int) -> list[str]:
         ids = [tid for tid in (lane_task_ids.get(idx) or []) if tid]
@@ -965,6 +1029,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         existing = task_ids[idx]
         if existing:
             return existing
+        if start_abort.is_set():
+            raise RuntimeError("job is stopping; IP not started")
         chunk = list(chunks[idx])
         host = str(chunk[0]) if chunk else f"chunk-{idx}"
         if not host_set(chunk) <= host_set(selected_targets):
@@ -1112,13 +1178,14 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             except Exception:
                 log.warning("Could not resolve the port range for %s; starting one OpenVAS task", host, exc_info=True)
                 planned = ""
-        from agent.service_lanes import lanes_for_port_range, service_parallelism
+        from agent.service_lanes import lanes_for_port_range
 
         # One OpenVAS task scans the whole Nexus catalog. Four tasks used to
         # split that list, and each task ended after hostname/OS/traceroute
         # whenever its slice had no open port, so SSH, TLS, and SMB checks
-        # never ran. In-IP parallelism is the service-check concurrency.
-        checks = service_parallelism()
+        # never ran. In-IP parallelism is the service-check concurrency
+        # (OpenVAS max_checks). V1.9.3: the value logged is the value used.
+        checks = per_ip_checks
         catalog = (
             lanes_for_port_range(planned, lanes=1)[0]
             if planned
@@ -1163,10 +1230,15 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             pass
         tid = openvas.start_scan(**start_args)
+        if start_abort.is_set():
+            # The job was stopped while this IP was starting: do not leave a task running.
+            try:
+                openvas.stop(tid)
+            except Exception:
+                log.warning("stop_task for late-started task %s failed", tid, exc_info=True)
+            raise RuntimeError("job stopped while this IP was starting")
         task_ids[idx] = tid
         lane_task_ids[idx] = [tid]
-        if getattr(openvas, "policy_snapshots", None):
-            _patch_job_best_effort(api, job_id, {"policy_snapshots": clip_policy_snapshots(openvas.policy_snapshots, selected_targets)})
         ip_started_mono[idx] = time.monotonic()
         emit_ip_event(
             job_id, host, "started", task_id=",".join(lane_task_ids.get(idx) or [tid]),
@@ -1197,29 +1269,63 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             )
 
     def _fill_slots(workers: int, *, admission_paused: bool = False) -> None:
-        if admission_paused:
+        if admission_paused or start_abort.is_set():
             return
         live_limit = max(0, int(workers))
         while pending:
             if not slot_sem.try_acquire(live_limit):
                 break
             idx = pending.pop(0)
+            starting[idx] = start_pool.submit(_start_chunk, idx)
+
+    def _collect_starts(wait_sec: float = 0.0) -> None:
+        """Move finished starts into in_flight (main thread only)."""
+        if not starting:
+            return
+        if wait_sec > 0 and not any(f.done() for f in starting.values()):
+            futures_wait(list(starting.values()), timeout=wait_sec, return_when=FIRST_COMPLETED)
+        started_any = False
+        for idx in [i for i, f in list(starting.items()) if f.done()]:
+            fut = starting.pop(idx)
             host = str(chunks[idx][0]) if chunks[idx] else f"chunk-{idx}"
             try:
-                tid = _start_chunk(idx)
+                tid = fut.result()
             except Exception as exc:
-                # Per-IP best effort: omit only this IP, release its permit, and
-                # immediately continue filling the same slot with the next IP.
+                # Per-IP best effort: omit only this IP, release its permit; the
+                # next _fill_slots gives the slot to the next IP.
                 slot_sem.release()
                 err = f"{exc.__class__.__name__}: {exc}"
                 _append_skipped(host, "start_error", err)
                 done_details[idx] = _skipped_ip_details(host, "start_error", error=err)
                 emit_ip_event(job_id, host, "start_error", error=err, chunk_index=idx)
-                log.warning("Skipping IP %s after OpenVAS start error; next IP may use the released slot", host, exc_info=True)
+                log.warning("Skipping IP %s after OpenVAS start error; next IP may use the released slot",
+                            host, exc_info=exc)
                 continue
             in_flight[idx] = tid
+            started_any = True
+        if started_any and getattr(openvas, "policy_snapshots", None):
+            _patch_job_best_effort(api, job_id, {"policy_snapshots": clip_policy_snapshots(
+                openvas.policy_snapshots, selected_targets)})
+
+    def _scanning_ips() -> dict[int, str]:
+        """IPs that hold a slot: started, or still starting (no task id yet)."""
+        return {**{i: "" for i in starting}, **in_flight}
+
+    def _abort_starts(timeout: float = 180.0) -> None:
+        """Stop starting new IPs; hand any task that did start to the caller's stop loop."""
+        start_abort.set()
+        for idx, fut in list(starting.items()):
+            try:
+                tid = fut.result(timeout=timeout)
+            except Exception:
+                tid = None
+            if tid:
+                in_flight[idx] = tid
+        starting.clear()
+        start_pool.shutdown(wait=False)
 
     _fill_slots(ip_workers, admission_paused=bool(capacity.get("admission_paused")))
+    _collect_starts()
 
     def _external_blob() -> str:
         ids: list[str] = []
@@ -1236,14 +1342,15 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             "status": "running",
             "progress_pct": 10,
             "message": (
-                f"OpenVAS running ({len(in_flight)}/{len(chunks)} chunk(s) in flight, "
-                f"{len(done_details)} done)"
+                f"OpenVAS running ({len(in_flight) + len(starting)}/{len(chunks)} IP(s) starting or "
+                f"in flight, {len(done_details)} done)"
             ),
             "external_scan_id": external_blob,
             "chunk_tasks": _chunk_tasks_blob(),
             "target_progress": target_snapshot(chunks=chunks,
-                in_flight=in_flight, done_details=done_details, skipped_hosts=skipped_hosts,
-                assessed_hosts=list(job.get("assessed_hosts") or [])),
+                in_flight=_scanning_ips(), done_details=done_details, skipped_hosts=skipped_hosts,
+                assessed_hosts=list(job.get("assessed_hosts") or []),
+                running_sec=_running_seconds(), slots=slot_sem.max_permits),
         },
     )
 
@@ -1257,10 +1364,15 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     high_progress_warn_sec = cfg["high_progress_warn_sec"]
     high_progress_stall_sec = int(cfg.get("high_progress_stall_sec") or 0)
     high_progress_stall_pct = int(cfg.get("high_progress_stall_pct") or 90)
-    max_scan_runtime_sec = cfg["max_scan_runtime_sec"]
+    # V1.9.3: whole-job cap is MAX_JOB_RUNTIME_SEC only (default off); the
+    # per-IP limit above is what bounds each IP.
+    max_job_runtime_sec = int(cfg.get("max_job_runtime_sec") or 0)
 
     while True:
         time.sleep(poll)
+        # V1.9.3: pick up IPs whose start finished. With nothing to poll yet,
+        # wait (bounded) for the first start instead of spinning.
+        _collect_starts(wait_sec=0.0 if in_flight else max(1.0, float(poll or 0)))
         if watch_lan:
             current_fp = capture_lan_fingerprint()
             left_lan = lan_changed(origin_fp, current_fp)
@@ -1280,6 +1392,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     origin_fp.get("gateway"),
                     current_fp.get("gateway"),
                 )
+                _abort_starts()
                 for tid in _all_inflight_ids():
                     try:
                         openvas.stop(tid)
@@ -1418,6 +1531,28 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                                     openvas.stop(one)
                                 except Exception:
                                     log.warning("stop_task at time limit failed for %s", one, exc_info=True)
+                    # --- V1.9.7 silent host: nothing answered, still port scanning -------
+                    if (st == "running" and silent_sec > 0 and progress_i <= 0
+                            and idx not in ip_deadline_hit and idx not in ip_stalled
+                            and host not in self_scan_by_host):
+                        probed = _silent_preprobe(preprobe_states_by_host.get(host))
+                        elapsed_s = now_w - ip_started_mono.get(idx, now_w)
+                        if probed and elapsed_s >= silent_sec:
+                            ip_deadline_hit[idx] = {"limit": int(elapsed_s), "progress": 0, "elapsed": int(elapsed_s),
+                                                    "kind": "no_response", "probed_ports": probed}
+                            log.warning(
+                                "Job %s IP %s: no response - none of %d probed TCP ports answered and OpenVAS "
+                                "found no open port in %d min of port scanning; stopping task %s and reporting "
+                                "the host as not assessed. Its slot goes to the next IP",
+                                job_id, host, probed, int(elapsed_s) // 60, tid,
+                            )
+                            emit_ip_event(job_id, host, "no_response", task_id=tid, after_sec=int(elapsed_s),
+                                          probed_ports=probed, chunk_index=idx)
+                            for one in _ids_for(idx):
+                                try:
+                                    openvas.stop(one)
+                                except Exception:
+                                    log.warning("stop_task for silent host failed for %s", one, exc_info=True)
                     # --- V1.6.7 what is OpenVAS doing at 90 %+? ------------------------
                     seen_t = ip_change_since.get(idx)
                     if (st == "running" and progress_i >= 90 and seen_t is not None
@@ -1563,6 +1698,21 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             )
                         except Exception:
                             log.debug("NVT hang statistics not recorded for %s", host, exc_info=True)
+                        # V1.9.5: name the check behind "completed with warnings".
+                        try:
+                            from agent.scan_performance import timed_out_check_notes
+
+                            ev_n = details.get("evidence") if isinstance(details.get("evidence"), dict) else {}
+                            cov_n = (ev_n.get("host_coverage") or {}).get(host)
+                            via = (self_scan_by_host.get(host) or {}).get("scanned_via") if host in self_scan_by_host else None
+                            extra = timed_out_check_notes(ev_n.get("plugin_error_details"), host,
+                                                          self_scan_via=str(via) if via else None)
+                            if extra and isinstance(cov_n, dict):
+                                cov_n["notes"] = (list(cov_n.get("notes") or []) + extra)[-20:]
+                                for note in extra:
+                                    log.warning("Job %s IP %s: %s", job_id, host, note)
+                        except Exception:
+                            log.debug("Timed-out check notes not added for %s", host, exc_info=True)
                     if st == "completed":
                         cov_p = ((details.get("evidence") or {}).get("host_coverage") or {}).get(host) or {}
                         if cov_p.get("verdict") == "discovery_not_alive":
@@ -1690,13 +1840,13 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
         # Keep running skip list in sync when merge eliminates more unreachable hosts.
         skipped_hosts = list((merged.get("evidence") or {}).get("skipped_hosts") or skipped_hosts)
         # Job is only terminal once every chunk has a terminal poll result.
-        all_terminal = len(done_details) == len(chunks) and not pending and not in_flight
+        all_terminal = len(done_details) == len(chunks) and not pending and not in_flight and not starting
         if not all_terminal:
             # Keep status running while waves remain, even if early chunks failed.
             if any(
                 str((done_details.get(i) or poll_results.get(i) or {}).get("status") or "") == "failed"
                 for i in range(len(chunks))
-            ) and not in_flight and not pending:
+            ) and not in_flight and not pending and not starting:
                 pass  # fall through with merged status
             else:
                 merged["status"] = "running"
@@ -1719,10 +1869,29 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             last_progress = progress
             last_change = now
 
+        # V1.9.7: one line every 5 min that shows the IP-level parallelism directly:
+        # which IPs OpenVAS is scanning right now, for how long, and how many wait.
+        if now - last_parallel_log >= 300 and (in_flight or pending or starting):
+            last_parallel_log = now
+            secs_now = _running_seconds(now)
+            parts = []
+            for i in sorted(in_flight):
+                host_i = chunks[i][0] if chunks[i] else "?"
+                pct_i = int(float((poll_results.get(i) or {}).get("progress") or 0))
+                mins_i = secs_now.get(i, 0) // 60
+                parts.append(f"{host_i} {'port scan' if pct_i <= 0 else f'{pct_i}%'} {mins_i}m")
+            log.info(
+                "Job %s parallel status: %d IP(s) scanning now [%s] | %d starting | %d waiting for a free slot "
+                "(up to %d at once) | %d finished of %d",
+                job_id, len(in_flight), ", ".join(parts) or "-", len(starting), len(pending),
+                slot_sem.max_permits, len(done_details), len(chunks),
+            )
+
         gmp_status = merged.get("gmp_status") or status
         target_progress = target_snapshot(chunks=chunks,
-            in_flight=in_flight, done_details=done_details, poll_results=poll_results,
-            skipped_hosts=skipped_hosts, assessed_hosts=list(job.get("assessed_hosts") or []))
+            in_flight=_scanning_ips(), done_details=done_details, poll_results=poll_results,
+            skipped_hosts=skipped_hosts, assessed_hosts=list(job.get("assessed_hosts") or []),
+            running_sec=_running_seconds(now), slots=slot_sem.max_permits)
         ip_rows = [{"ip": host, "status": state["status"], "progress": state["progress_pct"]}
                    for host, state in target_progress.items()]
         status_sig = tuple((row["ip"], row["status"], row["progress"]) for row in ip_rows)
@@ -1790,6 +1959,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     "Job %s is not on the central server for this scanner; stopping the local OpenVAS tasks",
                     job_id,
                 )
+                _abort_starts()
                 for tid in _all_inflight_ids():
                     openvas.stop(tid)
                 return
@@ -1853,12 +2023,13 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             _upload_results_reliably(api, job_id, payload)
             return
 
-        if max_scan_runtime_sec > 0 and (now - run_started) >= max_scan_runtime_sec:
+        if max_job_runtime_sec > 0 and (now - run_started) >= max_job_runtime_sec:
             log.error(
-                "Job %s exceeded MAX_SCAN_RUNTIME_SEC=%ss; stopping in-flight chunk task(s)",
+                "Job %s exceeded MAX_JOB_RUNTIME_SEC=%ss; stopping in-flight IP task(s)",
                 job_id,
-                max_scan_runtime_sec,
+                max_job_runtime_sec,
             )
+            _abort_starts()
             for tid in _all_inflight_ids():
                 openvas.stop(tid)
             time.sleep(3)
@@ -1914,7 +2085,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     cap_open_ports += len(_cov.get("open_tcp_ports") or []) + len(_cov.get("open_udp_ports") or [])
             has_usable_evidence = bool(cap_vulns) or cap_open_ports > 0 or int(cap_evidence.get("hosts_assessed") or 0) > 0
             cap_detail = (
-                f"maximum runtime {max_scan_runtime_sec}s exceeded while "
+                f"maximum job runtime {max_job_runtime_sec}s exceeded while "
                 f"status={merged.get('gmp_status')} progress={cap_progress:.0f}%"
             )
             if has_usable_evidence:
@@ -1942,7 +2113,7 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                     status="failed",
                     partial=True,
                     partial_reason=cap_detail,
-                    error=f"OpenVAS exceeded maximum runtime {max_scan_runtime_sec}s " + cap_detail,
+                    error=f"OpenVAS exceeded maximum job runtime {max_job_runtime_sec}s " + cap_detail,
                     skipped_hosts=list(cap_evidence.get("skipped_hosts") or skipped_hosts),
                 )
             _upload_results_reliably(api, job_id, payload)
@@ -1977,9 +2148,10 @@ def main() -> None:
     )
     log.info(
         "Progress policy: GMP task status is authoritative; no progress-based kill; "
-        "high-progress warning=%ss max-runtime=%ss",
+        "high-progress warning=%ss per-IP limit=%s job limit=%s",
         cfg["high_progress_warn_sec"],
-        cfg["max_scan_runtime_sec"],
+        cfg["max_scan_runtime_sec"] or os.environ.get("SCAN_IP_DEADLINE_SEC") or "off",
+        cfg.get("max_job_runtime_sec") or "off",
     )
     # V45.4: unmistakable build + effective scan profile, then a hard self-check.
     # A truncating profile (port scanner killed before it finishes) produces 3
@@ -2002,6 +2174,31 @@ def main() -> None:
         getattr(openvas, "max_checks", "?"),
         degraded_retry,
     )
+    # V1.9.3: start reading the feed for checks with long own timeouts now, in
+    # the background, so the first scan after a restart already gets the caps.
+    try:
+        from agent.nvt_timeouts import timeout_index
+        from agent.scan_performance import nvt_max_sec
+
+        if nvt_max_sec() > 0:
+            timeout_index().get()
+            log.info("NVT timeout index (SCAN_NVT_MAX_SEC=%ss): %s", nvt_max_sec(), timeout_index().status())
+        else:
+            log.info("NVT timeout index off (SCAN_NVT_MAX_SEC=0): checks keep their own timeouts")
+    except Exception:
+        log.warning("NVT timeout index could not start; static/learned caps still apply", exc_info=True)
+    # V1.9.5: say at startup if OpenVAS logging is set up wrongly (DEBUG level, no
+    # per-check lines), instead of first noticing it when a host waits at 98%.
+    def _check_openvas_logging() -> None:
+        try:
+            from agent import openvas_log
+
+            for warning in openvas_log.setup_warnings(openvas_log.log_health()):
+                log.warning("OPENVAS_LOG_SETUP %s", warning)
+        except Exception:
+            log.debug("OpenVAS log setup check skipped", exc_info=True)
+
+    threading.Thread(target=_check_openvas_logging, name="aetheris-openvas-log-check", daemon=True).start()
     allow_degraded = (os.environ.get("ALLOW_DEGRADED_SCAN") or "false").strip().lower() in {"1", "true", "yes", "on"}
     spt = int(getattr(openvas, "scanner_plugins_timeout", 0) or 0)
     pt = int(getattr(openvas, "plugins_timeout", 0) or 0)

@@ -146,6 +146,9 @@ class FastGmp:
         self.comment = comment
 
     def modify_scan_config_set_scanner_preference(self, cid, name, value=None):
+        if value is None:  # gvmd deletes a preference sent without a value
+            self.removed_prefs = getattr(self, "removed_prefs", []) + [name]
+            return
         self.scanner_prefs[name] = value
 
     def delete_scan_config(self, cid, ultimate=False):
@@ -234,8 +237,10 @@ def test_standard_profile_keeps_its_values_but_now_applies_them(monkeypatch):
     prefs = created["task"]["preferences"]
     assert prefs["checks_read_timeout"] == "10" and prefs["max_checks"] == "4"
     g = g_last["gmp"]
+    # V1.9.5: log_whole_attack is never sent (gvmd turns it into "1", which OpenVAS reads as off)
     assert g.scanner_prefs == {"plugins_timeout": "320", "checks_read_timeout": "10",
                                "optimize_test": "yes", "safe_checks": "yes"}
+    assert g.removed_prefs == ["log_whole_attack"]
     assert not any("Timing" in p[1] for p in g.prefs)  # no Nmap change in standard
     assert snap["performance"] == "standard"
 

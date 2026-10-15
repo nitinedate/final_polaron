@@ -26,13 +26,19 @@ def build_target_progress(
     skipped_hosts: list[dict[str, Any]] | None = None,
     assessed_hosts: list[str] | None = None,
     event_seq: int | None = None,
+    running_sec: dict[int, int] | None = None,
+    slots: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return every selected host, including waiting, skipped and failed hosts.
 
     Task completion is separate from coverage: a finished truncated assessment
     is incomplete, and a skipped host never receives a green completed state.
     """
-    states = {str(h): {"status": "pending", "activity": "Waiting", "progress_pct": 0}
+    # V1.9.7: say *why* an IP is at 0% - waiting for one of the parallel slots,
+    # or OpenVAS port scanning (it reports 0% until the port scan has finished).
+    waiting = (f"Waiting for a free scan slot ({int(slots)} IPs scan at once)"
+               if slots else "Waiting")
+    states = {str(h): {"status": "pending", "activity": waiting, "progress_pct": 0}
               for h in all_targets if str(h).strip()}
     for host in assessed_hosts or []:
         if host in states:
@@ -62,13 +68,23 @@ def build_target_progress(
                         state = {"status": "failed", "activity": "Failed: " + reason[:160], "progress_pct": 0}
                 elif str(details.get("status") or "").lower() in {"failed", "stopped"}:
                     state = {"status": "failed", "activity": "Failed", "progress_pct": progress_percent(details.get("progress"))}
+                elif str(cov.get("verdict") or "") == "no_response":
+                    state = {"status": "incomplete", "activity": "No response: " + str(cov.get("reason") or "")[:160],
+                             "progress_pct": 100}
                 elif str(cov.get("verdict") or "").startswith("degraded") or (details.get("evidence") or {}).get("assessment_complete") is False:
                     state = {"status": "incomplete", "activity": "Incomplete: " + str(cov.get("reason") or "assessment coverage not verified")[:160], "progress_pct": 100}
                 else:
                     state = {"status": "completed", "activity": "Completed", "progress_pct": 100}
             elif idx in in_flight:
                 pct = progress_percent(details.get("progress"))
-                state = {"status": "scanning", "activity": f"In progress ({pct}%)", "progress_pct": pct}
+                secs = (running_sec or {}).get(idx)
+                mins = f", {int(secs) // 60} min" if secs is not None else ""
+                if pct <= 0 and secs is not None and secs >= 60:
+                    activity = (f"Port scan running ({int(secs) // 60} min) - OpenVAS shows 0% "
+                                "until the port scan has finished")
+                else:
+                    activity = f"In progress ({pct}%{mins})"
+                state = {"status": "scanning", "activity": activity, "progress_pct": pct}
             else:
                 continue
             task_id = in_flight.get(idx) or details.get("task_id")

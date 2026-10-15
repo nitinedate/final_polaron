@@ -12,24 +12,52 @@ def test_feed_count_supports_info_count_schema():
     assert gmp_local._feed_count_from_xml(xml) == 54321
 
 
-def test_feed_health_prefers_extended_get_nvts(monkeypatch):
+def test_feed_health_never_requests_the_full_nvt_list(monkeypatch):
+    """V1.9.4: get_nvts(extended=True) is sent as a bare <get_nvts/> (filter dropped),
+    which made gvmd return all ~185k checks on every probe (~40 s each)."""
     class FakeGmp:
         def __init__(self):
-            self.extended = None
+            self.calls = []
 
         def get_feeds(self):
             return etree.fromstring(b"<get_feeds_response><feed><version>20261002</version></feed></get_feeds_response>")
 
         def get_nvts(self, **kwargs):
-            self.extended = kwargs.get("extended")
+            self.calls.append(kwargs)
             return etree.fromstring(
-                b"<get_nvts_response><nvt_count><filtered>50000</filtered><total>50000</total></nvt_count><nvt oid='1'/></get_nvts_response>"
+                b"<get_info_response><info id='1'/><info_count><filtered>185633</filtered>"
+                b"<page>1</page></info_count></get_info_response>"
             )
 
     gmp = FakeGmp()
     health = gmp_local._feed_health(gmp)
-    assert gmp.extended is True
-    assert health["nvt_count"] == 50000
+    assert gmp.calls == [{"filter_string": "rows=1 first=1"}]
+    assert not any(c.get("extended") for c in gmp.calls)
+    assert health["nvt_count"] == 185633
+
+
+def test_feed_health_falls_back_to_family_totals_not_the_full_list(monkeypatch):
+    class FakeGmp:
+        def __init__(self):
+            self.calls = []
+
+        def get_feeds(self):
+            return etree.fromstring(b"<get_feeds_response/>")
+
+        def get_nvts(self, **kwargs):
+            self.calls.append(kwargs)
+            return etree.fromstring(b"<get_info_response><info id='1'/></get_info_response>")  # no count
+
+        def get_nvt_families(self):
+            return etree.fromstring(
+                b"<r><families><family><name>A</name><max_nvt_count>100000</max_nvt_count></family>"
+                b"<family><name>B</name><max_nvt_count>85633</max_nvt_count></family></families></r>"
+            )
+
+    gmp = FakeGmp()
+    health = gmp_local._feed_health(gmp)
+    assert health["nvt_count"] == 185633
+    assert not any(c.get("extended") for c in gmp.calls)
 
 
 def test_unknown_total_with_feed_version_is_positive_inventory_evidence(monkeypatch):

@@ -1324,6 +1324,7 @@ def evaluate_edge_ingest_verdict(
     report_read_error: str | None,
     vulnerability_count: int,
     evidence_present: bool,
+    host_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Decide whether an edge upload is a verified assessment.
 
@@ -1361,6 +1362,24 @@ def evaluate_edge_ingest_verdict(
             normalized_assessed.add(host.casefold())
     missing_ip_targets = [t for t in literal_ip_targets if t not in normalized_assessed]
     target_identity_ok = not missing_ip_targets
+    # V1.9.7: a requested IP the agent scanned and then stopped at one of its own
+    # limits - the per-IP time limit before port scanning finished, or the
+    # silent-host rule ("no response") - is accounted for: its OpenVAS task ran,
+    # the agent says why it has no results. It still blocks a verified result;
+    # it only keeps a multi-IP job with real results on other IPs from turning
+    # red "failed" (job de53e2fe: 1 of 2 IPs assessed with 50 findings).
+    agent_stopped_verdicts = {"degraded_time_limit", "no_response"}
+    agent_stopped: dict[str, str] = {}
+    for raw_host, cov in (host_coverage or {}).items():
+        if not isinstance(cov, dict) or str(cov.get("verdict") or "") not in agent_stopped_verdicts:
+            continue
+        try:
+            key = str(ipaddress.ip_address(str(raw_host).strip()))
+        except ValueError:
+            key = str(raw_host).strip().casefold()
+        agent_stopped[key] = str(cov.get("verdict"))
+    missing_accounted = [t for t in missing_ip_targets if t in agent_stopped]
+    missing_unaccounted = [t for t in missing_ip_targets if t not in agent_stopped]
     coverage_ok = required_count > 0 and target_identity_ok
     scan_timestamps_ok = bool(scan_start and scan_end)
     plugin_health_ok = plugin_error_count == 0
@@ -1431,8 +1450,16 @@ def evaluate_edge_ingest_verdict(
         reasons.append(f"attempted {attempted} of {required_count} reachable target(s)")
     if required_count > 0 and assessed < required_count and not target_identity_ok:
         reasons.append(f"assessed {assessed} of {required_count} reachable target(s)")
-    if missing_ip_targets:
-        reasons.append("OpenVAS report has no assessment evidence for target(s): " + ", ".join(missing_ip_targets))
+    if missing_unaccounted:
+        reasons.append("OpenVAS report has no assessment evidence for target(s): " + ", ".join(missing_unaccounted))
+    no_response_hosts = [t for t in missing_accounted if agent_stopped.get(t) == "no_response"]
+    time_limited_hosts = [t for t in missing_accounted if agent_stopped.get(t) == "degraded_time_limit"]
+    if no_response_hosts:
+        reasons.append("no response, not assessed (host offline or all traffic dropped): "
+                       + ", ".join(no_response_hosts))
+    if time_limited_hosts:
+        reasons.append("stopped at the per-IP time limit before port scanning finished: "
+                       + ", ".join(time_limited_hosts))
     if skipped_details:
         reasons.append(
             "skipped unreachable: " + ", ".join(str(x.get("host")) for x in skipped_details[:20])
@@ -1460,6 +1487,10 @@ def evaluate_edge_ingest_verdict(
     # actually reached (no requested IP missing from the report, integrity ok).
     # A requested target that never appeared, or a result-count mismatch, still
     # fails — this is not a backdoor around those gates.
+    # V1.9.7: also when the only IPs without results are ones the agent stopped
+    # at its own limits (see agent_stopped) and at least one other IP was assessed.
+    # Then the job's merged task status may be "done" (finished IPs) or "stopped".
+    all_missing_accounted = bool(missing_ip_targets) and not missing_unaccounted
     partial_with_evidence = (
         not verified_complete
         and status_norm not in {"failed", "cancelled", "canceled"}
@@ -1468,10 +1499,11 @@ def evaluate_edge_ingest_verdict(
         and (vulnerability_count > 0 or hosts_assessed > 0)
         and bool(external_scan_id)
         and bool(effective_report_id)
-        and not missing_ip_targets
+        and (not missing_ip_targets or (all_missing_accounted and hosts_assessed > 0))
         and result_payload_ok
         and not report_read_error
-        and task_status_norm in {"stopped", "interrupted", "stop requested"}
+        and (task_status_norm in {"stopped", "interrupted", "stop requested"}
+             or (all_missing_accounted and task_ok))
     )
     if partial_with_evidence:
         final_status = "incomplete"
@@ -1502,6 +1534,7 @@ def evaluate_edge_ingest_verdict(
         "task_ok": task_ok,
         "target_identity_ok": target_identity_ok,
         "missing_ip_targets": missing_ip_targets,
+        "missing_agent_stopped": missing_accounted,
         "required_count": required_count,
         "scan_timestamps_ok": scan_timestamps_ok,
         "plugin_health_ok": plugin_health_ok,
@@ -1654,6 +1687,7 @@ def ingest_agent_results(
         report_read_error=report_read_error,
         vulnerability_count=len(vulnerabilities or []),
         evidence_present=evidence_present,
+        host_coverage=host_coverage if isinstance(host_coverage, dict) else None,
     )
     verified_complete = bool(verdict["verified_complete"])
     final_status = str(verdict["final_status"])

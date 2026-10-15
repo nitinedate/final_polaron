@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import logging
 import math
 import os
@@ -25,6 +26,21 @@ from agent.service_policy import (
 )
 
 log = logging.getLogger("scanner_agent.gmp")
+
+# V1.9.3: serialises scan-config lookup/creation across concurrent IP starts.
+_CONFIG_PREP_LOCK = threading.RLock()
+
+# V1.9.5: OpenVAS settings that must NOT be carried on a scan config. gvmd sends
+# every scan-config scanner preference to ospd with yes/no rewritten to "1"/"0"
+# (gvmd manage_osp.c); ospd turns "1" back into "yes" only for its own boolean
+# params (ospd_openvas/daemon.py OSPD_PARAMS), and these are not among them; OpenVAS
+# treats only the exact string "yes" as true (gvm-libs prefs_get_bool). A value
+# on the config therefore always reads as "off" and overrides openvas.conf.
+# V1.9.3 set log_whole_attack=yes this way and so switched per-check logging OFF.
+_OPENVAS_CONF_ONLY_PREFS = ("log_whole_attack",)
+
+# V1.9.6: next time the "Base config not present" note may be logged again.
+_BASE_CONFIG_NOTE_AT = 0.0
 
 FULL_AND_FAST_ID = "daba56c8-73ec-11df-a475-002264764cea"
 AETHERIS_SCAN_CONFIG = "Aetheris Full and fast"
@@ -344,21 +360,28 @@ def _feed_health(gmp: Any, config_id: str | None = None) -> dict[str, Any]:
         log.debug("Unable to read Greenbone feed metadata", exc_info=True)
 
     nvt_count: int | None = None
+    # V1.9.4: never request the full NVT list. python-gvm 27 sends
+    # get_nvts(extended=True) as a bare <get_nvts/> - the filter is dropped -
+    # so gvmd returned all ~185k checks on every readiness probe (each minute)
+    # and every IP start: ~40 s each (field job d1c55fbe). The get_info form
+    # keeps rows=1 and reports the total in <info_count>.
     try:
-        # Request the native NVT response first.  On python-gvm 26.x the
-        # non-extended call can be backed by GMP get_info, which may omit the
-        # nvt_count element that older readiness code expected.
-        try:
-            resp = gmp.get_nvts(filter_string="rows=1 first=1", extended=True)
-        except TypeError:
-            # Compatibility with older python-gvm implementations.
-            resp = gmp.get_nvts(filter_string="rows=1 first=1")
+        resp = gmp.get_nvts(filter_string="rows=1 first=1")
         nvt_count = _feed_count_from_xml(resp)
-        # If count metadata is absent, at least prove that one NVT exists.
-        if nvt_count is None and hasattr(resp, "xpath") and resp.xpath(".//nvt"):
+        if nvt_count is None and hasattr(resp, "xpath") and resp.xpath(".//info | .//nvt"):
             nvt_count = -1  # present, total unknown
     except Exception:
         log.debug("Unable to read Greenbone NVT inventory", exc_info=True)
+    if nvt_count is None or nvt_count == -1:
+        # Cheap second source: one row per family (~60), each with its total.
+        try:
+            families = gmp.get_nvt_families()
+            totals = [int(str(v).strip()) for v in families.xpath(".//family/max_nvt_count/text()")
+                      if str(v).strip().isdigit()]
+            if totals:
+                nvt_count = sum(totals)
+        except Exception:
+            log.debug("Unable to read Greenbone NVT families", exc_info=True)
 
     config_nvt_count: int | None = None
     if config_id:
@@ -469,11 +492,16 @@ def _find_config_id(gmp: Any, name: str = "Full and fast") -> str:
         for candidate in (AETHERIS_SCAN_CONFIG, "aetheris full and fast"):
             cid = by_name.get(candidate.strip().casefold())
             if cid:
-                log.info(
-                    "Base config 'Full and fast' not present; using '%s' instead. gvmd is not importing its "
-                    "predefined data objects: set the Feed Import Owner (scripts/Repair-Greenbone-Feed-v1.4.1.ps1)",
-                    AETHERIS_SCAN_CONFIG,
-                )
+                global _BASE_CONFIG_NOTE_AT
+                now = time.monotonic()
+                if now >= _BASE_CONFIG_NOTE_AT:
+                    # V1.9.6: once an hour (was on every readiness probe).
+                    _BASE_CONFIG_NOTE_AT = now + 3600.0
+                    log.info(
+                        "Base config 'Full and fast' not present; using '%s' instead. gvmd is not importing its "
+                        "predefined data objects: set the Feed Import Owner (scripts/Repair-Greenbone-Feed-v1.4.1.ps1)",
+                        AETHERIS_SCAN_CONFIG,
+                    )
                 return cid
     summary = ", ".join(available[:8]) if available else "none"
     raise RuntimeError(
@@ -1149,10 +1177,14 @@ def _ensure_profile_config(
 
     status: dict[str, Any] = {"nvt_timeout_caps": 0, "nmap_timing": "unchanged", "config": "base",
                               "scanner_preferences": {}}
+    scanner_prefs = {k: v for k, v in (scanner_prefs or {}).items() if k not in _OPENVAS_CONF_ONLY_PREFS}
     if not caps and not nmap_timing and not scanner_prefs:
         return base_config_id, status
+    # "conf_only" in the digest makes every older profile config (V1.9.3 ones carry
+    # log_whole_attack) be replaced once by a clone that has those prefs removed.
     digest = caps_digest(caps, json.dumps({"base": base_config_id, "timing": nmap_timing or "",
-                                           "prefs": scanner_prefs}, sort_keys=True))
+                                           "prefs": scanner_prefs,
+                                           "conf_only": list(_OPENVAS_CONF_ONLY_PREFS)}, sort_keys=True))
     name = f"Aetheris profile {digest}"
     try:
         resp = gmp.get_scan_configs(filter_string=f'name="{name}" rows=5')
@@ -1172,6 +1204,18 @@ def _ensure_profile_config(
         if not new_id:
             raise RuntimeError("clone returned no id")
         gmp.modify_scan_config_set_name(new_id, name)
+        # A preference without a value is deleted by gvmd (manage_set_config_preference)
+        # while no task uses the config - true for a fresh clone. Removing a missing
+        # one is a no-op. openvas.conf then decides these settings.
+        removed: list[str] = []
+        for conf_only in _OPENVAS_CONF_ONLY_PREFS:
+            try:
+                gmp.modify_scan_config_set_scanner_preference(new_id, conf_only)
+                removed.append(conf_only)
+            except Exception as exc:
+                log.warning("Could not remove scanner preference %s from %s (%s); OpenVAS may read it as off",
+                            conf_only, name, exc)
+        status["removed_scanner_prefs"] = removed
         applied_prefs: dict[str, str] = {}
         for pref_name, value in scanner_prefs.items():
             try:
@@ -2268,6 +2312,16 @@ def _task_port_range_with(gmp: Any, tid: str) -> str:
 
 
 class LocalOpenVAS:
+    # V1.9.3: IP starts run concurrently; the port-list note set while resolving
+    # one IP's range must not leak into another IP's policy snapshot.
+    @property
+    def _port_list_status(self) -> str:
+        return str(getattr(self.__dict__.setdefault("_thread_state", threading.local()), "port_list_status", ""))
+
+    @_port_list_status.setter
+    def _port_list_status(self, value: str) -> None:
+        self.__dict__.setdefault("_thread_state", threading.local()).port_list_status = value
+
     def __init__(self) -> None:
         self.socket_path = (os.environ.get("GVM_SOCKET_PATH") or "").strip() or None
         url = (os.environ.get("GVM_URL") or "").strip()
@@ -2362,6 +2416,28 @@ class LocalOpenVAS:
         self._terminal_task_ids: set[str] = set()
 
     def ready(self) -> bool:
+        # V1.9.6: a positive result is reused for READINESS_RECHECK_SEC (default 60 s).
+        # The dispatcher calls ready() on every pass (QUEUE_POLL_INTERVAL_SEC = 3 s).
+        # Until V1.9.4 one probe took ~40 s, which hid that; once it got fast,
+        # gvmd was probed - scanners, feeds, NVT count, every scan config, the full
+        # base config - every ~4 s, also during scans. Not-ready is still
+        # re-checked on every pass so a starting gvmd is picked up quickly.
+        now = time.monotonic()
+        if now < float(getattr(self, "_ready_until", 0.0) or 0.0):
+            return True
+        result = self._probe_ready()
+        try:
+            ttl = max(0, min(600, int(os.environ.get("READINESS_RECHECK_SEC") or 60)))
+        except ValueError:
+            ttl = 60
+        self._ready_until = (time.monotonic() + ttl) if result else 0.0
+        return result
+
+    def invalidate_readiness(self) -> None:
+        """Force the next ready() to probe gvmd again."""
+        self._ready_until = 0.0
+
+    def _probe_ready(self) -> bool:
         sock = (self.socket_path or "").strip()
         if sock and not os.path.exists(sock):
             self._log_not_ready("GMP socket not present yet (%s) — waiting for gvmd" % sock)
@@ -2536,8 +2612,26 @@ class LocalOpenVAS:
         # first run before the hang registry has learned them. Learned caps still
         # win where they are tighter.
         hang_caps = dict(static_caps())
+        cap_sources = {"static_ssl": len(hang_caps), "learned": len(learned_caps), "long_timeout": 0}
         for oid, secs in learned_caps.items():
             hang_caps[oid] = min(hang_caps.get(oid, secs), secs)
+        # V1.9.3: checks whose OWN script_timeout is above SCAN_NVT_MAX_SEC (or
+        # unbounded). OpenVAS uses that value instead of plugins_timeout, which
+        # is what holds a host at 98-99 % for 30-60 min (job 3c4f45e0).
+        from agent.nvt_timeouts import long_timeout_caps, timeout_index
+        from agent.scan_performance import nvt_max_sec
+
+        long_max = nvt_max_sec()
+        long_caps: dict[str, int] = {}
+        if long_max > 0:
+            try:
+                long_caps = long_timeout_caps(long_max)
+            except Exception:
+                log.warning("NVT timeout index unavailable; long-timeout caps not applied", exc_info=True)
+        for oid, secs in long_caps.items():
+            hang_caps[oid] = min(hang_caps.get(oid, secs), secs)
+        cap_sources["long_timeout"] = len(long_caps)
+        index_status = timeout_index().status() if long_max > 0 else "off (SCAN_NVT_MAX_SEC=0)"
         cap = getattr(self, "max_checks_cap", 128)
         lane_checks = self.max_checks if max_checks is None else max(1, min(cap, int(max_checks)))
         if perf_cfg["max_checks"]:
@@ -2556,32 +2650,40 @@ class LocalOpenVAS:
             username=self.username,
             password=self.password,
         ) as gmp:
-            try:
-                config_id = _ensure_portscan_config(gmp, base_config)
-            except Exception:
-                log.warning("Nmap SYN config unavailable; using %s", base_config, exc_info=True)
-                config_id = _find_config_id(gmp, base_config)
-            full_config = base_config.casefold() == "full and fast"
-            nvt_filter = snapshot.get("nvt_filter") if isinstance(snapshot.get("nvt_filter"), dict) else None
-            if families:
-                config_id, snapshot["family_scope_status"] = _ensure_family_config(
-                    gmp, config_id, families, require=bool(snapshot.get("require_families")))
-            elif full_config and nvt_filter:
-                config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(gmp, config_id, nvt_filter)
-            elif full_config and check_scope in {"vulnerability", "severity"}:
-                config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(
-                    gmp, config_id, mode=check_scope)
-            scanner_prefs = {
-                "plugins_timeout": str(int(perf_cfg["plugins_timeout"] or self.plugins_timeout)),
-                "checks_read_timeout": str(read_timeout),
-                "optimize_test": optimize_test,
-                "safe_checks": safe_checks,
-            }
-            config_id, perf_status = _ensure_profile_config(
-                gmp, config_id, scanner_prefs,
-                hang_caps if performance == "fast" else {},
-                perf_cfg["nmap_timing"] if performance == "fast" else None,
-            )
+            # V1.9.3: IPs start concurrently. Config lookup/creation is serialised so two
+            # starts never clone the same profile twice; target/task creation is not.
+            with _CONFIG_PREP_LOCK:
+                try:
+                    config_id = _ensure_portscan_config(gmp, base_config)
+                except Exception:
+                    log.warning("Nmap SYN config unavailable; using %s", base_config, exc_info=True)
+                    config_id = _find_config_id(gmp, base_config)
+                full_config = base_config.casefold() == "full and fast"
+                nvt_filter = snapshot.get("nvt_filter") if isinstance(snapshot.get("nvt_filter"), dict) else None
+                if families:
+                    config_id, snapshot["family_scope_status"] = _ensure_family_config(
+                        gmp, config_id, families, require=bool(snapshot.get("require_families")))
+                elif full_config and nvt_filter:
+                    config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(gmp, config_id, nvt_filter)
+                elif full_config and check_scope in {"vulnerability", "severity"}:
+                    config_id, snapshot["check_scope_status"] = _ensure_check_scope_config(
+                        gmp, config_id, mode=check_scope)
+                scanner_prefs = {
+                    "plugins_timeout": str(int(perf_cfg["plugins_timeout"] or self.plugins_timeout)),
+                    "checks_read_timeout": str(read_timeout),
+                    "optimize_test": optimize_test,
+                    "safe_checks": safe_checks,
+                }
+                # V1.9.5: per-check logging (log_whole_attack) is NOT set here any more:
+                # through a scan config it can only switch logging off (see
+                # _OPENVAS_CONF_ONLY_PREFS). It comes from openvas.conf, written by
+                # configure-openvas from OPENVAS_LOG_WHOLE_ATTACK.
+                # V1.9.3: caps and Nmap timing for every profile. Before, they were
+                # passed only when performance == "fast", so turbo and standard
+                # scans ran without even the static SSL caps.
+                config_id, perf_status = _ensure_profile_config(
+                    gmp, config_id, scanner_prefs, hang_caps, perf_cfg["nmap_timing"],
+                )
             # V1.9.1: record what the task's own config will run. A partial family
             # here is exactly the silent truncation that hid every Medium/Low.
             selection = effective_selection(gmp, config_id)
@@ -2596,11 +2698,32 @@ class LocalOpenVAS:
                     ", ".join(f"{k} {v}" for k, v in sorted(partial.items())) or "none",
                     ", ".join(selection.get("families_unselected") or []) or "none",
                 )
+            log.info(
+                "NVT timeout caps on %s: %d static SSL, %d long-timeout (own timeout above %ss or none; "
+                "index %s), %d learned; per-check logging comes from openvas.conf (checked in openvas.log)",
+                config_id, cap_sources["static_ssl"], cap_sources["long_timeout"], long_max or "off",
+                index_status, cap_sources["learned"],
+            )
             # The 10k-NVT config floor only applies to an unscoped Full-and-fast
             # config; Discovery or family-scoped configs are smaller by design.
             # The feed-wide NVT floor is always enforced.
             narrowed = str(snapshot.get("family_scope_status") or "").startswith("scoped") or bool(nvt_filter)
-            health = _assert_feed_quality(gmp, config_id if full_config and not narrowed else None)
+            floor_config = config_id if full_config and not narrowed else None
+            known_count = selection.get("nvt_count") if selection.get("available") else None
+            if floor_config and isinstance(known_count, int) and known_count >= 0:
+                # V1.9.3: the config's check count was just read (effective_selection).
+                # Reading the same config again with details cost 30-40 s per IP start
+                # on the 185k-check config; check the floor from the count we have.
+                health = dict(_assert_feed_quality(gmp, None) or {})
+                minimum = _minimum_nvt_count()
+                if known_count < minimum:
+                    raise RuntimeError(
+                        f"Greenbone config_nvt_count={known_count} is below required minimum {minimum}; "
+                        "feed/config import is incomplete, so the scanner will not claim the job"
+                    )
+                health["config_nvt_count"] = known_count
+            else:
+                health = _assert_feed_quality(gmp, floor_config)
             scanner_id = _find_scanner_id(gmp)
             bindings: dict[str, str] = {}
             credential_status: dict[str, str] = {}
@@ -2764,6 +2887,9 @@ class LocalOpenVAS:
                                  "applied": int(perf_status.get("nvt_timeout_caps") or 0),
                                  "cap_sec": max(hang_caps.values()) if hang_caps else None,
                                  "oids": sorted(hang_caps)[:20],
+                                 "sources": cap_sources,
+                                 "long_timeout_max_sec": long_max or None,
+                                 "timeout_index": index_status,
                              },
                              "preferences": applied_prefs,
                              "preference_status": preference_status, "credential_status": credential_status,

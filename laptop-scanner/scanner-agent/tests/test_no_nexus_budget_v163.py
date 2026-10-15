@@ -19,7 +19,9 @@ def test_v167_time_limit_is_explicit_not_a_hidden_completion():
     variable (SCAN_IP_DEADLINE_SEC, not the ignored SCAN_IP_BUDGET_SEC), a
     'time_limit' event, and time_limited/stopped_at_progress evidence."""
     source = inspect.getsource(main)
-    assert "ip_deadline_sec(" in source and '"time_limit"' in source
+    # V1.9.3: the per-IP limit is read through ip_runtime_limit() (SCAN_IP_DEADLINE_SEC,
+    # else MAX_SCAN_RUNTIME_SEC applied per IP).
+    assert "ip_runtime_limit()" in source and '"time_limit"' in source
     assert '"time_limited": True' in source and '"stopped_at_progress"' in source
 
 
@@ -29,7 +31,7 @@ def test_legacy_budget_600_no_longer_interrupts(monkeypatch):
     # _cfg is only for top-level configuration requiring credentials; the
     # obsolete setting has no scan lifecycle branches and default job ceiling is 0.
     assert '600' not in inspect.getsource(main._cfg)
-    assert AGENT_BUILD.startswith("1.9.2-")
+    assert AGENT_BUILD.startswith("1.9.7-")
 
 
 def test_full_profile_ports_and_service_audit_still_enabled():

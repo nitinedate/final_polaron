@@ -13,15 +13,20 @@ from typing import Any
 
 
 def service_parallelism() -> int:
-    """3 or 4 service tasks per IP. Explicit 1 keeps a single task."""
+    """Checks run at once against one IP (OpenVAS max_checks), 1-32.
+
+    V1.9.3: no longer clamped to 3-4. That band came from the old design that
+    split one IP into 3-4 port-slice tasks; since V1.7 one task scans the whole
+    catalog and this value is its per-IP check concurrency. The profile's own
+    value (FAST_MAX_CHECKS=5) still applies when it is higher, see
+    scan_performance.per_ip_check_concurrency().
+    """
     raw = (os.environ.get("SCAN_SERVICE_PARALLELISM") or "4").strip()
     try:
         count = int(raw)
     except (TypeError, ValueError):
         count = 4
-    if count <= 1:
-        return 1
-    return max(3, min(4, count))
+    return max(1, min(32, count))
 
 
 def _spans(token: str) -> tuple[str, list[tuple[int, int]]]:

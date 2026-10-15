@@ -312,6 +312,38 @@ def host_activity(host: str, *, max_lines: int = 15, **_legacy: Any) -> dict[str
     return out
 
 
+# V1.9.5: configure-openvas is a one-shot container; a plain "docker compose up -d"
+# does not re-run it once it has exited, so its files keep their old values.
+# OpenVAS starts a fresh process for every scan and reads both files then.
+_RERUN = "docker compose up -d --force-recreate configure-openvas (takes effect from the next scan)"
+FIX_WHOLE_ATTACK = f"Set OPENVAS_LOG_WHOLE_ATTACK=yes in .env, then: {_RERUN}."
+FIX_LOG_LEVEL = f"Set OPENVAS_LOG_LEVEL=127 in .env, then: {_RERUN}."
+
+
+def setup_warnings(health: dict[str, object]) -> list[str]:
+    """Problems in the OpenVAS logging setup, read from openvas.log itself (V1.9.5).
+
+    Both settings live in files written by configure-openvas; the agent cannot
+    read those files, but their effect is visible in the log.
+    """
+    out: list[str] = []
+    if not health.get("available"):
+        return out
+    lines = int(health.get("lines_read") or 0)
+    share = float(health.get("debug_share") or 0)
+    if lines >= 1000 and share >= 0.5:
+        out.append(f"openvas.log is {int(share * 100)}% DEBUG lines: OpenVAS still logs at DEBUG level, which "
+                   f"buries the lines the agent needs (and may log passwords). {FIX_LOG_LEVEL}")
+    if int(health.get("hosts_started") or 0) > 0 and not health.get("whole_attack_logging"):
+        out.append("OpenVAS scanned hosts but logged no check launches: per-check logging is off, so a host "
+                   f"waiting at 98-99% cannot be explained. {FIX_WHOLE_ATTACK} Scan configs made by agent "
+                   "1.9.3 also switched it off; 1.9.5 replaces them automatically.")
+    if out:
+        out.append("These checks read the scans already in openvas.log; after fixing, they clear once a "
+                   "new scan has run and the agent restarts.")
+    return out
+
+
 def log_health() -> dict[str, object]:
     """Whole-log facts for diagnostics: size, DEBUG share, whether check launches are logged."""
     path = _log_path()
@@ -343,12 +375,15 @@ def describe(activity: dict[str, object]) -> str:
                  for r in running[:5]]
         return f"{len(running)} check(s) still running in OpenVAS: " + "; ".join(parts)
     if activity.get("host_started_seen") and not activity.get("whole_attack_logging"):
-        return ("OpenVAS per-check logging is off: the host's scan is in openvas.log but no check launches "
-                "are logged (set OPENVAS_LOG_WHOLE_ATTACK=yes, then: docker compose up -d configure-openvas)")
+        msg = ("OpenVAS per-check logging is off: the host's scan is in openvas.log but no check launches "
+               f"are logged. {FIX_WHOLE_ATTACK}")
+        if float(activity.get("debug_share") or 0) >= 0.5:
+            msg += f" openvas.log is also {int(float(activity['debug_share']) * 100)}% DEBUG lines. {FIX_LOG_LEVEL}"
+        return msg
     if not activity.get("host_started_seen"):
         why = "this host's scan started before the part of openvas.log the agent has read"
         if float(activity.get("debug_share") or 0) >= 0.5:
-            why += (f" (openvas.log is {int(float(activity['debug_share']) * 100)}% DEBUG lines; "
-                    "set OPENVAS_LOG_LEVEL=127, then: docker compose up -d configure-openvas)")
+            why += (f" (openvas.log is {int(float(activity['debug_share']) * 100)}% DEBUG lines. "
+                    f"{FIX_LOG_LEVEL})")
         return f"Cannot see this host's running checks: {why}"
     return "OpenVAS shows no running checks and has not finished this host"

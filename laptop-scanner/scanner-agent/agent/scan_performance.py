@@ -128,9 +128,9 @@ def profile_settings(profile: str) -> dict[str, Any]:
 
 
 def ip_deadline_sec(profile: str) -> int:
-    """Optional hard per-IP time limit. V1.6.8: OFF (0) unless SCAN_IP_DEADLINE_SEC is set."""
+    """Per-IP time limit in seconds (0 = off). See ip_runtime_limit()."""
     del profile
-    return _int_env("SCAN_IP_DEADLINE_SEC", 0, 0, 86400)
+    return ip_runtime_limit()[0]
 
 
 # V1.9.1: "severity" is the opt-in static severity>0 selection (the V1.6.8
@@ -152,6 +152,70 @@ def resolve_check_scope(request: dict[str, Any] | None = None) -> str:
         if value in CHECK_SCOPES:
             return value
     return "vulnerability"
+
+
+def ip_runtime_limit() -> tuple[int, str]:
+    """Per-IP runtime limit in seconds and where it came from (V1.9.3).
+
+    Each IP is measured from its own OpenVAS task start, so a job with several
+    IPs no longer shares one clock. ``SCAN_IP_DEADLINE_SEC`` wins; otherwise
+    ``MAX_SCAN_RUNTIME_SEC`` - which used to be one clock for the whole job and
+    stopped every IP (and every IP still waiting) at once - now applies to
+    each IP separately. 0 = no per-IP limit.
+    """
+    own = _int_env("SCAN_IP_DEADLINE_SEC", 0, 0, 86400)
+    if own > 0:
+        return own, "SCAN_IP_DEADLINE_SEC"
+    legacy = _int_env("MAX_SCAN_RUNTIME_SEC", 0, 0, 7 * 86400)
+    if legacy > 0:
+        return legacy, "MAX_SCAN_RUNTIME_SEC (per IP since V1.9.3)"
+    return 0, "off"
+
+
+def job_runtime_limit_sec() -> int:
+    """Optional whole-job limit (MAX_JOB_RUNTIME_SEC, default 0 = off).
+
+    With a per-IP limit every IP ends on its own, so a job-wide clock is only
+    a last-resort safety net and is off unless set explicitly.
+    """
+    return _int_env("MAX_JOB_RUNTIME_SEC", 0, 0, 30 * 86400)
+
+
+def per_ip_check_concurrency(profile: str) -> int:
+    """How many checks (NVTs) OpenVAS runs at once against ONE IP (max_checks).
+
+    Single source for the log line and the task preference (V1.9.3): the
+    larger of SCAN_SERVICE_PARALLELISM and the profile's own value
+    (FAST_MAX_CHECKS / turbo), capped at 32.
+    """
+    from agent.service_lanes import service_parallelism
+
+    base = service_parallelism()
+    prof = int(profile_settings(profile).get("max_checks") or 0)
+    return max(1, min(32, max(base, prof)))
+
+
+def nvt_max_sec() -> int:
+    """Upper bound for any single check's own timeout (SCAN_NVT_MAX_SEC, V1.9.3).
+
+    OpenVAS uses an NVT's own ``script_timeout`` instead of plugins_timeout
+    (pluginlaunch.c: the NVT preference "timeout" is read first). Checks that
+    declare 30-60 min, or -1 (never killed), are what hold a host at 98-99%.
+    They are capped to this value. 0 = off.
+    """
+    raw = (os.environ.get("SCAN_NVT_MAX_SEC") or "").strip().lower()
+    if raw in {"off", "0", "false", "no"}:
+        return 0
+    return _int_env("SCAN_NVT_MAX_SEC", 900, 120, 86400)
+
+
+def silent_host_sec() -> int:
+    """V1.9.7: stop a host that answered nothing after this many seconds still at 0%.
+
+    SCAN_SILENT_HOST_SEC, default 900 (15 min), 0 = off. Applies only when the
+    agent's pre-probe got no answer on any port (no open port, no TCP reset).
+    """
+    return _int_env("SCAN_SILENT_HOST_SEC", 900, 0, 86400)
 
 
 def fixed_ip_workers() -> int:
@@ -226,6 +290,13 @@ class NvtHangRegistry:
             log.warning("NVT_TIMEOUT host=%s recorded %d timed-out NVT(s): %s", host, len(recorded), ", ".join(recorded))
         return recorded
 
+    def recent_events(self, oid: str, now: float | None = None) -> int:
+        """How many times ``oid`` timed out inside NVT_HANG_WINDOW_DAYS (V1.9.6)."""
+        window = _int_env("NVT_HANG_WINDOW_DAYS", 30, 1, 365) * 86400
+        now = time.time() if now is None else now
+        item = self._load()["nvts"].get(oid) or {}
+        return sum(1 for t in item.get("events", []) if isinstance(t, (int, float)) and now - t <= window)
+
     def caps(self, now: float | None = None) -> dict[str, int]:
         """OID -> timeout seconds for repeat offenders inside the window."""
         cap = _int_env("NVT_HANG_CAP_SEC", 60, 30, 600)
@@ -275,6 +346,66 @@ class NvtHangRegistry:
 
 
 _REGISTRY: NvtHangRegistry | None = None
+
+
+_SECONDS_RE = re.compile(r"after (\d+) ?s", re.I)
+
+
+def timed_out_check_notes(errors: list[dict[str, Any]] | None, host: str,
+                          self_scan_via: str | None = None) -> list[str]:
+    """Plain-language notes for checks OpenVAS stopped at their time limit (V1.9.5).
+
+    The central UI only says "plugin errors or timeouts"; these notes say which
+    check, how often it has timed out, and what the agent does about it.
+    V1.9.6: says "already limited" when this scan already used the learned
+    limit (the V1.9.5 text promised a limit that had just been applied), and
+    names the Docker loopback path when the host is the scanner laptop.
+    """
+    rows = [e for e in (errors or []) if isinstance(e, dict)
+            and _TIMEOUT_RE.search(str(e.get("description") or "")) and str(e.get("nvt_oid") or "").strip()
+            and (not e.get("host") or str(e.get("host")) == host)]
+    if not rows:
+        return []
+    min_events = _int_env("NVT_HANG_MIN_EVENTS", 2, 1, 50)
+    window_days = _int_env("NVT_HANG_WINDOW_DAYS", 30, 1, 365)
+    cap_sec = _int_env("NVT_HANG_CAP_SEC", 60, 30, 600)
+    try:
+        registry = hang_registry()
+        capped = registry.caps()
+    except Exception:
+        registry, capped = None, {}
+    notes: list[str] = []
+    seen: set[str] = set()
+    for err in rows:
+        oid = str(err["nvt_oid"]).strip()
+        if oid in seen:
+            continue
+        seen.add(oid)
+        name = str(err.get("nvt_name") or "").strip()
+        label = f"{name} ({oid})" if name else oid
+        m = _SECONDS_RE.search(str(err.get("description") or ""))
+        ran = int(m.group(1)) if m else None
+        after = f" after {ran} s" if ran is not None else ""
+        count = registry.recent_events(oid) if registry is not None else 0
+        history = f" It has timed out in {count} scans in the last {window_days} days." if count > 1 else ""
+        where = (f" This host is the scanner laptop, scanned through the Docker loopback ({self_scan_via})."
+                 if self_scan_via else "")
+        if not _is_cappable(oid, name):
+            nxt = " It is a discovery check, so the agent never shortens it."
+        elif oid in capped and ran is not None and ran <= capped[oid]:
+            nxt = f" The agent already limits it to {capped[oid]} s, so it no longer holds the scan up."
+        elif oid in capped:
+            nxt = f" From the next scan the agent limits it to {capped[oid]} s instead of waiting the full time."
+        else:
+            nxt = (f" If it times out {min_events} times in {window_days} days, the agent limits it to "
+                   f"{cap_sec} s.")
+        on_port = f" on {err['port']}" if err.get("port") else ""
+        notes.append(f"Check {label}{on_port} did not finish: OpenVAS stopped it at its time limit{after}. Every other "
+                     "check completed and the findings are valid; this one check is why the result is "
+                     f"'with warnings' rather than clean.{history}{where}{nxt}")
+        if len(notes) >= 5:
+            break
+    return notes
 
 
 def hang_registry() -> NvtHangRegistry:

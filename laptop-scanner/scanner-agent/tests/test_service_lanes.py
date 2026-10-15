@@ -18,14 +18,18 @@ def _tcp_spans(port_range: str) -> list[tuple[int, int]]:
     return spans
 
 
-def test_service_parallelism_stays_in_the_three_to_four_band(monkeypatch):
-    monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "4")
-    assert service_parallelism() == 4
+def test_service_parallelism_is_the_per_ip_check_concurrency(monkeypatch):
+    # V1.9.3: no 3-4 clamp (a leftover from the old port-slice lanes).
+    monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "8")
+    assert service_parallelism() == 8
     monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "2")
-    assert service_parallelism() == 3
+    assert service_parallelism() == 2
     monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "1")
     assert service_parallelism() == 1
-
+    monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "500")
+    assert service_parallelism() == 32
+    monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "junk")
+    assert service_parallelism() == 4
 
 def test_full_tcp_range_splits_into_four_lanes_that_cover_every_port():
     lanes = lanes_for_port_range("T:1-65535", lanes=4)
