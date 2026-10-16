@@ -82,6 +82,18 @@ function hasStoredIntake(data: GapIntake): boolean {
   return Boolean(data.has_saved_intake);
 }
 
+/** "2026-10-15" -> "15 Oct 2026" for messages (the date inputs show the browser's own format). */
+function displayYmd(ymd: string): string {
+  const [y, m, d] = ymd.split("-").map(Number);
+  if (!y || !m || !d) return ymd;
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
 function kolkataYmd(offsetDays = 0): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Kolkata",
@@ -140,8 +152,15 @@ export function ReportsExportPage() {
   const [savingIntake, setSavingIntake] = useState(false);
   const [pipeline, setPipeline] = useState<Array<{ engine: string; role: string }>>([]);
   const [mergeCaseIds, setMergeCaseIds] = useState<string[]>([]);
-  const [mergeFromDate, setMergeFromDate] = useState(() => kolkataYmd(-1));
-  const mergeToDate = kolkataYmd(0);
+  // V1.10.4: both dates are optional and editable. No dates = the latest 20 reports.
+  const [mergeFromDate, setMergeFromDate] = useState("");
+  const [mergeToDate, setMergeToDate] = useState("");
+  const [mergeMeta, setMergeMeta] = useState<{ totalMatching: number; hasMore: boolean; limit: number; filtered: boolean }>(
+    { totalMatching: 0, hasMore: false, limit: 20, filtered: false },
+  );
+  const [mergeLoading, setMergeLoading] = useState(false);
+  const mergeRequest = useRef(0);
+  const todayYmd = kolkataYmd(0);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const patchIntake = useCallback((patch: Partial<GapIntake>) => {
@@ -162,14 +181,29 @@ export function ReportsExportPage() {
   );
 
   const loadMergeCandidates = useCallback(async () => {
+    const seq = ++mergeRequest.current;
+    setMergeLoading(true);
     try {
-      const mergeRes = await vulnApi.listGapMergeCandidates({ from_date: mergeFromDate });
-      setMergeCandidates(mergeRes.items || []);
-      setMergeCaseIds((prev) => prev.filter((id) => (mergeRes.items || []).some((c) => c.id === id)));
+      const query: { from_date?: string; to_date?: string } = {};
+      if (mergeFromDate) query.from_date = mergeFromDate;
+      if (mergeToDate) query.to_date = mergeToDate;
+      const mergeRes = await vulnApi.listGapMergeCandidates(query);
+      if (seq !== mergeRequest.current) return; // a newer date choice is already loading
+      const items = mergeRes.items || [];
+      setMergeCandidates(items);
+      setMergeMeta({
+        totalMatching: mergeRes.total_matching ?? items.length,
+        hasMore: Boolean(mergeRes.has_more),
+        limit: mergeRes.limit ?? 20,
+        filtered: Boolean(mergeRes.filtered ?? (mergeFromDate || mergeToDate)),
+      });
+      setMergeCaseIds((prev) => prev.filter((id) => items.some((c) => c.id === id)));
     } catch {
-      setMergeCandidates([]);
+      if (seq === mergeRequest.current) setMergeCandidates([]);
+    } finally {
+      if (seq === mergeRequest.current) setMergeLoading(false);
     }
-  }, [mergeFromDate]);
+  }, [mergeFromDate, mergeToDate]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -796,32 +830,71 @@ export function ReportsExportPage() {
                 <section className="border-t border-ink-100 pt-6">
                   <SectionHeading>Merge gap reports</SectionHeading>
                   <p className="mt-2 max-w-3xl text-sm text-ink-600">
-                    Cases with a saved site overview in the selected date range appear here — today
-                    first. From defaults to yesterday and can go further back. To is always today.
-                    Identical findings are combined with IP addresses appended by comma; different
+                    Cases with a saved site overview appear here, newest first. Without dates the latest 20
+                    are listed; set From and/or To to search a date range (case creation date). Identical findings are combined with IP addresses appended by comma; different
                     findings stay separate in one merged PDF.
                   </p>
-                  <div className="mt-4 grid max-w-xl grid-cols-1 gap-3 sm:grid-cols-2">
-                    <Field label="From" hint="Editable. Go further back for older reports.">
+                  <div className="mt-4 grid max-w-3xl grid-cols-1 items-end gap-3 sm:grid-cols-[1fr_1fr_auto]">
+                    <Field label="From" hint="Optional">
                       <Input
                         type="date"
                         value={mergeFromDate}
-                        max={mergeToDate}
+                        max={mergeToDate || todayYmd}
                         onChange={(e) => {
-                          const next = e.target.value || kolkataYmd(-1);
-                          setMergeFromDate(next > mergeToDate ? mergeToDate : next);
+                          const next = e.target.value;
+                          setMergeFromDate(next);
+                          if (next && mergeToDate && next > mergeToDate) setMergeToDate(next);
                         }}
                       />
                     </Field>
-                    <Field label="To" hint="Always today. Cannot be changed.">
-                      <Input type="date" value={mergeToDate} disabled readOnly />
+                    <Field label="To" hint="Optional">
+                      <Input
+                        type="date"
+                        value={mergeToDate}
+                        min={mergeFromDate || undefined}
+                        max={todayYmd}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          setMergeToDate(next);
+                          if (next && mergeFromDate && next < mergeFromDate) setMergeFromDate(next);
+                        }}
+                      />
                     </Field>
+                    <div className="pb-6">
+                      <Button
+                        variant="ghost"
+                        disabled={!mergeFromDate && !mergeToDate}
+                        onClick={() => {
+                          setMergeFromDate("");
+                          setMergeToDate("");
+                        }}
+                      >
+                        Show latest 20
+                      </Button>
+                    </div>
                   </div>
+                  <p className="mt-3 text-sm text-ink-600">
+                    {mergeLoading
+                      ? "Loading…"
+                      : mergeMeta.filtered
+                        ? `${mergeCandidates.length} case${mergeCandidates.length === 1 ? "" : "s"} created ${
+                            mergeFromDate && mergeToDate
+                              ? `between ${displayYmd(mergeFromDate)} and ${displayYmd(mergeToDate)}`
+                              : mergeFromDate
+                                ? `on or after ${displayYmd(mergeFromDate)}`
+                                : `on or before ${displayYmd(mergeToDate)}`
+                          }${mergeMeta.hasMore ? ` (showing the newest ${mergeCandidates.length} of ${mergeMeta.totalMatching})` : ""}`
+                        : `Latest ${mergeCandidates.length} report${mergeCandidates.length === 1 ? "" : "s"}${
+                            mergeMeta.hasMore ? ` of ${mergeMeta.totalMatching}. Set From/To to find older ones.` : ""
+                          }`}
+                  </p>
                   <FieldGroupPanel className="mt-4">
-                    <div className="max-h-64 space-y-2 overflow-y-auto">
+                    <div className="max-h-96 space-y-2 overflow-y-auto">
                       {mergeCandidates.length === 0 ? (
                         <p className="text-sm text-ink-400">
-                          No merge candidates. Save a site overview on cases in the selected date range.
+                          {mergeMeta.filtered
+                            ? "No case with a saved site overview in this date range."
+                            : "No case has a saved site overview yet."}
                         </p>
                       ) : (
                         mergeCandidates.map((c) => {

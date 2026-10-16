@@ -380,8 +380,18 @@ export const vulnApi = {
 
   getCase: (caseId: string) => api.get<Case>(`/api/cases/${caseId}`, undefined, { service: "vuln" }),
 
-  listGapMergeCandidates: (query?: { from_date?: string }) =>
-    api.get<{ items: GapMergeCandidate[]; total: number; from_date?: string; to_date?: string }>(
+  listGapMergeCandidates: (query?: { from_date?: string; to_date?: string; limit?: number }) =>
+    api.get<{
+      items: GapMergeCandidate[];
+      total: number;
+      /** V1.10.4 */
+      total_matching?: number;
+      has_more?: boolean;
+      limit?: number;
+      filtered?: boolean;
+      from_date?: string | null;
+      to_date?: string | null;
+    }>(
       "/api/cases/gap-merge-candidates",
       query,
       { service: "vuln" },

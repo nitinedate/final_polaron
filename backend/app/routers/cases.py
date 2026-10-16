@@ -46,6 +46,39 @@ def gap_merge_date_window(from_date: str | None, *, today: date | None = None) -
     return start, end
 
 
+GAP_MERGE_DEFAULT_LIMIT = 20
+GAP_MERGE_MAX_LIMIT = 200
+
+
+def _parse_gap_merge_date(raw: str | None, field: str) -> date | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "invalid_date", "message": f"{field} must be YYYY-MM-DD"}},
+        ) from exc
+
+
+def gap_merge_filter_window(from_date: str | None, to_date: str | None) -> tuple[date | None, date | None]:
+    """V1.10.4: optional, independently editable From and To (Asia/Kolkata calendar).
+
+    No dates -> no date filter (the endpoint then lists the latest reports).
+    Only From -> From onwards; only To -> up to To; both -> inclusive range.
+    """
+    start = _parse_gap_merge_date(from_date, "from_date")
+    end = _parse_gap_merge_date(to_date, "to_date")
+    if start and end and start > end:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "invalid_date_range", "message": "from_date must be on or before to_date"}},
+        )
+    return start, end
+
+
 _MONTH_ABBR = (
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -209,7 +242,17 @@ def list_cases(
 def list_gap_merge_candidates(
     from_date: str | None = Query(
         default=None,
-        description="Inclusive start date YYYY-MM-DD (Asia/Kolkata). Defaults to yesterday. To is always today.",
+        description="Optional inclusive start date YYYY-MM-DD (Asia/Kolkata).",
+    ),
+    to_date: str | None = Query(
+        default=None,
+        description="Optional inclusive end date YYYY-MM-DD (Asia/Kolkata).",
+    ),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=GAP_MERGE_MAX_LIMIT,
+        description="Max cases returned. Defaults to 20 without dates, 200 with a date filter.",
     ),
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(_require_case_read),
@@ -217,33 +260,48 @@ def list_gap_merge_candidates(
     """
     Cases eligible for Gap Assessment merge:
     - gap_site_json is present and not empty
-    - created between from_date and today (Asia/Kolkata calendar)
-    - current-day cases listed first
+    - V1.10.4: without dates, the latest 20 such cases (newest first)
+    - with From and/or To, cases created in that window (Asia/Kolkata calendar)
     """
     from app.services.gap_assessment_report import ensure_gap_site_column, _parse_json_field
 
-    start, end = gap_merge_date_window(from_date)
+    start, end = gap_merge_filter_window(from_date, to_date)
+    filtered = bool(start or end)
+    lim = int(limit or (GAP_MERGE_MAX_LIMIT if filtered else GAP_MERGE_DEFAULT_LIMIT))
+    today = _ist_today()
     _ensure_default_workspace(db, current.schema_name)
     ensure_gap_site_column(db)
     apply_firm_search_path(db, current.schema_name)
 
+    where = [
+        "c.gap_site_json IS NOT NULL",
+        "jsonb_typeof(c.gap_site_json) = 'object'",
+        "c.gap_site_json <> '{}'::jsonb",
+    ]
+    params: dict[str, Any] = {}
+    if start:
+        where.append("(c.created_at AT TIME ZONE 'Asia/Kolkata')::date >= CAST(:from_d AS date)")
+        params["from_d"] = start.isoformat()
+    if end:
+        where.append("(c.created_at AT TIME ZONE 'Asia/Kolkata')::date <= CAST(:to_d AS date)")
+        params["to_d"] = end.isoformat()
+    where_sql = " AND ".join(where)
+    total_row = fetchone(db, f"SELECT COUNT(*) AS c FROM cases c WHERE {where_sql}", params)
+    total_matching = int((total_row or {}).get("c") or 0)
+    # Fetch a little more than the limit: rows whose site overview has only blank
+    # values are dropped below, and the list should still be full.
+    fetch_limit = min(lim * 2 + 20, 600)
     rows = fetchall(
         db,
-        """
+        f"""
         SELECT c.*,
-               (c.created_at AT TIME ZONE 'Asia/Kolkata')::date AS created_ist_date,
-               ((c.created_at AT TIME ZONE 'Asia/Kolkata')::date)
-                 = ((NOW() AT TIME ZONE 'Asia/Kolkata')::date) AS is_today
+               (c.created_at AT TIME ZONE 'Asia/Kolkata')::date AS created_ist_date
         FROM cases c
-        WHERE c.gap_site_json IS NOT NULL
-          AND jsonb_typeof(c.gap_site_json) = 'object'
-          AND c.gap_site_json <> '{}'::jsonb
-          AND (c.created_at AT TIME ZONE 'Asia/Kolkata')::date >= CAST(:from_d AS date)
-          AND (c.created_at AT TIME ZONE 'Asia/Kolkata')::date <= CAST(:to_d AS date)
-        ORDER BY is_today DESC, c.created_at DESC
-        LIMIT 200
+        WHERE {where_sql}
+        ORDER BY c.created_at DESC
+        LIMIT :fetch_lim
         """,
-        {"from_d": start.isoformat(), "to_d": end.isoformat()},
+        {**params, "fetch_lim": fetch_limit},
     )
 
     detail_keys = (
@@ -279,16 +337,22 @@ def list_gap_merge_candidates(
         items.append(
             {
                 **case,
-                "day_label": _gap_day_label(created_ist if isinstance(created_ist, date) else None, end),
+                "day_label": _gap_day_label(created_ist if isinstance(created_ist, date) else None, today),
                 "gap_details": details,
                 "has_gap_site": True,
             }
         )
+    items = items[:lim]
     return {
         "items": items,
         "total": len(items),
-        "from_date": start.isoformat(),
-        "to_date": end.isoformat(),
+        "total_matching": max(total_matching, len(items)),
+        # More matching cases exist than are listed (narrow the dates to see older ones).
+        "has_more": total_matching > len(items),
+        "limit": lim,
+        "filtered": filtered,
+        "from_date": start.isoformat() if start else None,
+        "to_date": end.isoformat() if end else None,
     }
 
 
