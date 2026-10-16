@@ -836,6 +836,9 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
   const toast = useToast();
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<ScanJobSeveritySummary | null>(null);
+  // V1.9.8: if the details request fails, say so instead of drawing an empty
+  // job ("No target IPs", 0 findings, NOT CLEAN) from missing data.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedSeverity, setSelectedSeverity] = useState<string | null>(null);
   const [showInfo, setShowInfo] = useState(false);
   const [ipsOpen, setIpsOpen] = useState(true);
@@ -846,6 +849,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
     let timer: number | undefined;
     setSelectedSeverity(null);
     setLoading(true);
+    setLoadError(null);
 
     const load = () =>
       vulnApi
@@ -853,13 +857,16 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
         .then((data) => {
           if (cancelled) return;
           setSummary(data);
+          setLoadError(null);
           if (!ACTIVE_STATUSES.has((data.status || "").toLowerCase()) && timer !== undefined) {
             window.clearInterval(timer);
             timer = undefined;
           }
         })
         .catch((e: unknown) => {
-          if (!cancelled && first) toast.error(e instanceof Error ? e.message : "Failed to load job details");
+          const message = e instanceof Error ? e.message : "Failed to load job details";
+          if (!cancelled) setLoadError(message);
+          if (!cancelled && first) toast.error(message);
         })
         .finally(() => {
           if (!cancelled) {
@@ -934,6 +941,15 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
     <Modal open onClose={onClose} title={`Scan details · ${job.id.slice(0, 8)}…`} size="lg">
       {loading && !summary ? (
         <Spinner />
+      ) : !summary && loadError ? (
+        <div className="space-y-2 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          <p className="font-medium">Could not load this job's details.</p>
+          <p className="break-words">{loadError}</p>
+          <p className="text-red-700">
+            The job itself is <span className="font-medium">{job.status}</span>; its IPs and findings are not shown
+            because the details request failed. Retrying every few seconds.
+          </p>
+        </div>
       ) : (
         <div className="space-y-5">
           <div className="flex flex-wrap items-center gap-4">
