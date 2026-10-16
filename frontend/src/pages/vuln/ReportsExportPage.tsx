@@ -10,14 +10,27 @@ import type { ScanJob } from "../../lib/types/vuln";
 /** V1.10.3: "" in the job selector means every job of the case. */
 const ALL_JOBS = "";
 
+/**
+ * The IP counts a V1.10.2+ server adds to each job. Declared here on purpose so
+ * this page compiles whether or not the V1.10.2 `ScanJob.ip_summary` type is
+ * installed; an older server simply omits the field and the label falls back
+ * to the target count.
+ */
+type JobIpCounts = { total?: number; assessed?: number };
+
+function jobIpCounts(job: ScanJob): JobIpCounts | null {
+  const raw = (job as ScanJob & { ip_summary?: JobIpCounts | null }).ip_summary;
+  return raw && typeof raw === "object" ? raw : null;
+}
+
 function jobOptionLabel(job: ScanJob): string {
   const when = job.started_at || job.created_at;
   const date = when
     ? new Date(when).toLocaleString(undefined, { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
     : "not started";
-  const s = job.ip_summary;
+  const s = jobIpCounts(job);
   const ips = s?.total
-    ? `${s.assessed} of ${s.total} IPs assessed`
+    ? `${s.assessed ?? 0} of ${s.total} IPs assessed`
     : `${job.targets?.length ?? 0} target${(job.targets?.length ?? 0) === 1 ? "" : "s"}`;
   return `${date} — ${job.status} — ${ips} (${job.id.slice(0, 8)})`;
 }
