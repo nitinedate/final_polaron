@@ -55,6 +55,15 @@ export type VulnDashboardLayer = {
   export?: Record<string, unknown>;
 };
 
+/** V1.10.3: query/filename helpers for per-job reports (empty = whole case). */
+function jobQuery(scanJobId?: string | null): Record<string, string> | undefined {
+  return scanJobId ? { scan_job_id: scanJobId } : undefined;
+}
+
+function jobSuffix(scanJobId?: string | null): string {
+  return scanJobId ? `-job-${scanJobId.slice(0, 8)}` : "";
+}
+
 export const vulnApi = {
   getOverview: () => api.get<VulnOverview>("/api/vuln/overview"),
 
@@ -289,30 +298,39 @@ export const vulnApi = {
       "/api/vuln/orchestrator/pipeline"
     ),
 
-  exportVulnReportCsv: (caseId: string) =>
-    api.download(`/api/cases/${caseId}/vuln-report.csv`, `vuln-report-${caseId.slice(0, 8)}.csv`),
+  /** V1.10.3: every report/export takes an optional scan job; omit it for the whole case. */
+  exportVulnReportCsv: (caseId: string, scanJobId?: string | null) =>
+    api.download(
+      `/api/cases/${caseId}/vuln-report.csv`,
+      `vuln-report-${caseId.slice(0, 8)}${jobSuffix(scanJobId)}.csv`,
+      jobQuery(scanJobId),
+    ),
 
-  exportVulnReportXlsx: (caseId: string) =>
-    api.download(`/api/cases/${caseId}/vuln-report.xlsx`, `Solution Set-${caseId.slice(0, 8)}.xlsx`),
+  exportVulnReportXlsx: (caseId: string, scanJobId?: string | null) =>
+    api.download(
+      `/api/cases/${caseId}/vuln-report.xlsx`,
+      `Solution Set-${caseId.slice(0, 8)}${jobSuffix(scanJobId)}.xlsx`,
+      jobQuery(scanJobId),
+    ),
 
   getGapIntake: (caseId: string) => api.get<Record<string, unknown>>(`/api/cases/${caseId}/gap-intake`),
 
   saveGapIntake: (caseId: string, payload: Record<string, unknown>) =>
     api.put<Record<string, unknown>>(`/api/cases/${caseId}/gap-intake`, payload),
 
-  exportGapReportPdf: (caseId: string, query?: { llm?: boolean }) =>
+  exportGapReportPdf: (caseId: string, query?: { llm?: boolean; scanJobId?: string | null }) =>
     api.download(
       `/api/cases/${caseId}/gap-report.pdf`,
-      `gap-assessment-${caseId.slice(0, 8)}.pdf`,
-      query?.llm ? { llm: "1" } : undefined,
+      `gap-assessment-${caseId.slice(0, 8)}${jobSuffix(query?.scanJobId)}.pdf`,
+      { ...(query?.llm ? { llm: "1" } : {}), ...jobQuery(query?.scanJobId) },
       180_000,
     ),
 
-  exportGapReportDocx: (caseId: string, query?: { llm?: boolean }) =>
+  exportGapReportDocx: (caseId: string, query?: { llm?: boolean; scanJobId?: string | null }) =>
     api.download(
       `/api/cases/${caseId}/gap-report.docx`,
-      `gap-assessment-${caseId.slice(0, 8)}.docx`,
-      query?.llm ? { llm: "1" } : undefined,
+      `gap-assessment-${caseId.slice(0, 8)}${jobSuffix(query?.scanJobId)}.docx`,
+      { ...(query?.llm ? { llm: "1" } : {}), ...jobQuery(query?.scanJobId) },
       180_000,
     ),
 
@@ -328,11 +346,15 @@ export const vulnApi = {
       240_000,
     ),
 
-  getVulnReportSummary: (caseId: string) =>
-    api.get<Record<string, unknown>>(`/api/cases/${caseId}/vuln-report/summary`),
+  getVulnReportSummary: (caseId: string, scanJobId?: string | null) =>
+    api.get<Record<string, unknown>>(`/api/cases/${caseId}/vuln-report/summary`, jobQuery(scanJobId)),
 
-  exportServiceCoverageCsv: (caseId: string) =>
-    api.download(`/api/cases/${caseId}/service-coverage.csv`, `service-coverage-${caseId.slice(0, 8)}.csv`),
+  exportServiceCoverageCsv: (caseId: string, scanJobId?: string | null) =>
+    api.download(
+      `/api/cases/${caseId}/service-coverage.csv`,
+      `service-coverage-${caseId.slice(0, 8)}${jobSuffix(scanJobId)}.csv`,
+      jobQuery(scanJobId),
+    ),
 
   importVulnReportCsv: (caseId: string, csvText: string) =>
     api.post<{ imported: number; case_id: string }>(`/api/cases/${caseId}/vuln-report/import`, {

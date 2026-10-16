@@ -117,27 +117,35 @@ def infer_central_scan_result(db, job: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def load_case_scan_assessment(db, case_id: str) -> dict[str, Any]:
+def load_case_scan_assessment(db, case_id: str, scan_job_id: str | None = None) -> dict[str, Any]:
     """Return the verification state of the latest scan for a case.
 
     This is intentionally strict: ``completed`` alone does not imply a verified
     clean assessment.  A durable ``vuln_scan_results`` row with target/host
     coverage is required.
+
+    V1.10.3: with ``scan_job_id`` the state of exactly that job (of this case)
+    is returned, for per-job reports.
     """
+    params: dict[str, Any] = {"cid": case_id}
+    job_sql = ""
+    if scan_job_id:
+        params["jid"] = str(scan_job_id)
+        job_sql = " AND j.id = CAST(:jid AS uuid)"
     job = fetchone(
         db,
-        """SELECT j.*,
+        f"""SELECT j.*,
                   (SELECT COUNT(*)::int FROM vuln_scan_targets t
                    WHERE t.scan_job_id = j.id) AS target_count,
                   (SELECT COUNT(*)::int FROM vuln_scan_targets t
                    WHERE t.scan_job_id = j.id AND NOT t.excluded) AS active_target_count
            FROM vuln_scan_jobs j
-           WHERE j.case_id = CAST(:cid AS uuid)
+           WHERE j.case_id = CAST(:cid AS uuid){job_sql}
            ORDER BY
              CASE WHEN j.status = 'running' THEN 0 ELSE 1 END,
              j.created_at DESC
            LIMIT 1""",
-        {"cid": case_id},
+        params,
     )
     if not job:
         return {

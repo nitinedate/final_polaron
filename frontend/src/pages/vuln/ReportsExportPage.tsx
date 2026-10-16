@@ -5,6 +5,22 @@ import { Badge, Button, Card, Field, Input, PageHeader, Select, Spinner } from "
 import { vulnApi } from "../../lib/vulnApi";
 import { useToast } from "../../lib/toast";
 import type { Case, GapMergeCandidate } from "../../lib/types/forensic";
+import type { ScanJob } from "../../lib/types/vuln";
+
+/** V1.10.3: "" in the job selector means every job of the case. */
+const ALL_JOBS = "";
+
+function jobOptionLabel(job: ScanJob): string {
+  const when = job.started_at || job.created_at;
+  const date = when
+    ? new Date(when).toLocaleString(undefined, { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "not started";
+  const s = job.ip_summary;
+  const ips = s?.total
+    ? `${s.assessed} of ${s.total} IPs assessed`
+    : `${job.targets?.length ?? 0} target${(job.targets?.length ?? 0) === 1 ? "" : "s"}`;
+  return `${date} — ${job.status} — ${ips} (${job.id.slice(0, 8)})`;
+}
 
 type GapFirewall = {
   make_model?: string;
@@ -97,6 +113,9 @@ export function ReportsExportPage() {
   const [cases, setCases] = useState<Case[]>([]);
   const [mergeCandidates, setMergeCandidates] = useState<GapMergeCandidate[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState("");
+  const [jobs, setJobs] = useState<ScanJob[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(true);
+  const [selectedJobId, setSelectedJobId] = useState<string>(ALL_JOBS);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
   const [gapIntake, setGapIntake] = useState<GapIntake>({});
   const [intakeLoaded, setIntakeLoaded] = useState(false);
@@ -157,14 +176,54 @@ export function ReportsExportPage() {
     }
   }, [toast]);
 
-  const loadSummary = useCallback(async () => {
-    if (!selectedCaseId) return;
-    try {
-      setSummary(await vulnApi.getVulnReportSummary(selectedCaseId));
-    } catch {
-      setSummary(null);
+  // V1.10.3: the jobs of the selected case; the newest job is selected by default.
+  useEffect(() => {
+    let cancelled = false;
+    setJobs([]);
+    setSelectedJobId(ALL_JOBS);
+    if (!selectedCaseId) {
+      setJobsLoading(false);
+      return;
     }
+    setJobsLoading(true);
+    vulnApi
+      .listScanJobs(selectedCaseId)
+      .then((items) => {
+        if (cancelled) return;
+        const list = Array.isArray(items) ? items : [];
+        setJobs(list);
+        setSelectedJobId(list[0]?.id ?? ALL_JOBS);
+      })
+      .catch(() => {
+        if (!cancelled) setJobs([]);
+      })
+      .finally(() => {
+        if (!cancelled) setJobsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedCaseId]);
+
+  const selectedJob = jobs.find((j) => j.id === selectedJobId) ?? null;
+  const scopeLabel = selectedJob ? `job ${selectedJob.id.slice(0, 8)}` : "whole case";
+
+  // Only the newest request may set the summary: switching job/case quickly must
+  // never leave the counts of the previously selected scope on screen.
+  const summaryRequest = useRef(0);
+  const loadSummary = useCallback(async () => {
+    const seq = ++summaryRequest.current;
+    if (!selectedCaseId || jobsLoading) {
+      setSummary(null);
+      return;
+    }
+    try {
+      const data = await vulnApi.getVulnReportSummary(selectedCaseId, selectedJobId || null);
+      if (seq === summaryRequest.current) setSummary(data);
+    } catch {
+      if (seq === summaryRequest.current) setSummary(null);
+    }
+  }, [selectedCaseId, selectedJobId, jobsLoading]);
 
   const loadGapIntake = useCallback(async () => {
     if (!selectedCaseId) return;
@@ -198,8 +257,8 @@ export function ReportsExportPage() {
     if (!selectedCaseId) return;
     setExporting(true);
     try {
-      await vulnApi.exportVulnReportCsv(selectedCaseId);
-      toast.success("Solution-set CSV downloaded");
+      await vulnApi.exportVulnReportCsv(selectedCaseId, selectedJobId || null);
+      toast.success(`Solution-set CSV downloaded (${scopeLabel})`);
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "Export failed");
     } finally {
@@ -211,8 +270,8 @@ export function ReportsExportPage() {
     if (!selectedCaseId) return;
     setExporting(true);
     try {
-      await vulnApi.exportVulnReportXlsx(selectedCaseId);
-      toast.success("Solution Set Excel downloaded");
+      await vulnApi.exportVulnReportXlsx(selectedCaseId, selectedJobId || null);
+      toast.success(`Solution Set Excel downloaded (${scopeLabel})`);
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "Export failed");
     } finally {
@@ -224,8 +283,8 @@ export function ReportsExportPage() {
     if (!selectedCaseId) return;
     setExporting(true);
     try {
-      await vulnApi.exportServiceCoverageCsv(selectedCaseId);
-      toast.success("Service coverage CSV downloaded");
+      await vulnApi.exportServiceCoverageCsv(selectedCaseId, selectedJobId || null);
+      toast.success(`Service coverage CSV downloaded (${scopeLabel})`);
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "Coverage export failed");
     } finally {
@@ -275,10 +334,11 @@ export function ReportsExportPage() {
     try {
       const { has_saved_intake: _ignored, ...payload } = gapIntake;
       await vulnApi.saveGapIntake(selectedCaseId, payload);
-      if (fmt === "pdf") await vulnApi.exportGapReportPdf(selectedCaseId);
-      else await vulnApi.exportGapReportDocx(selectedCaseId);
-      await vulnApi.exportVulnReportXlsx(selectedCaseId);
-      toast.success(`Gap Assessment Report (${fmt.toUpperCase()}) and Solution Set Excel downloaded`);
+      const scanJobId = selectedJobId || null;
+      if (fmt === "pdf") await vulnApi.exportGapReportPdf(selectedCaseId, { scanJobId });
+      else await vulnApi.exportGapReportDocx(selectedCaseId, { scanJobId });
+      await vulnApi.exportVulnReportXlsx(selectedCaseId, scanJobId);
+      toast.success(`Gap Assessment Report (${fmt.toUpperCase()}) and Solution Set Excel downloaded (${scopeLabel})`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Gap report export failed";
       toast.error(msg.includes("timeout") ? "Report generation timed out — try again or disable LLM enrichment." : msg);
@@ -319,7 +379,7 @@ export function ReportsExportPage() {
     <div>
       <PageHeader
         title="Reports & export"
-        subtitle="Export vulnerability findings as a Solution Set Excel (Risk, Host, Protocol, Port, Name) or Polaron Gap Assessment Report (PDF/DOCX) per case. Creating a gap report also downloads the Excel."
+        subtitle="Export vulnerability findings as a Solution Set Excel (Risk, Host, Protocol, Port, Name) or Polaron Gap Assessment Report (PDF/DOCX) for one scan job or the whole case. Creating a gap report also downloads the Excel."
       />
 
       {loading ? (
@@ -327,16 +387,43 @@ export function ReportsExportPage() {
       ) : (
         <>
           <Card className="mb-6 p-4">
-            <Field label="Case" hint="Reports are generated per case from open vuln findings.">
-              <Select value={selectedCaseId} onChange={(e) => setSelectedCaseId(e.target.value)}>
-                <option value="">Select case…</option>
-                {cases.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.title || c.number || c.id.slice(0, 8)}
-                  </option>
-                ))}
-              </Select>
-            </Field>
+            <div className="grid gap-4 md:grid-cols-2">
+              <Field label="Case" hint="The site overview for the gap report is saved per case.">
+                <Select value={selectedCaseId} onChange={(e) => setSelectedCaseId(e.target.value)}>
+                  <option value="">Select case…</option>
+                  {cases.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.title || c.number || c.id.slice(0, 8)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field
+                label="Scan job"
+                hint={
+                  jobsLoading
+                    ? "Loading the scan jobs of this case…"
+                    : jobs.length === 0
+                      ? "This case has no scan jobs yet; exports cover the whole case."
+                      : selectedJob
+                        ? "Excel, CSV, coverage and the gap report use only this job's findings."
+                        : "Exports combine the open findings of every job in this case."
+                }
+              >
+                <Select
+                  value={selectedJobId}
+                  onChange={(e) => setSelectedJobId(e.target.value)}
+                  disabled={!selectedCaseId || jobsLoading}
+                >
+                  {jobs.map((j) => (
+                    <option key={j.id} value={j.id}>
+                      {jobOptionLabel(j)}
+                    </option>
+                  ))}
+                  <option value={ALL_JOBS}>All jobs in this case</option>
+                </Select>
+              </Field>
+            </div>
           </Card>
 
           <div className="grid gap-6 lg:grid-cols-2">
@@ -356,13 +443,13 @@ export function ReportsExportPage() {
                     ))}
                   </div>
                 </div>
-                <Button variant="brand" loading={exporting} onClick={exportXlsx} disabled={!selectedCaseId}>
+                <Button variant="brand" loading={exporting} onClick={exportXlsx} disabled={!selectedCaseId || jobsLoading}>
                   <Download className="h-4 w-4" /> Export solution-set Excel
                 </Button>
-                <Button variant="ghost" loading={exporting} onClick={exportCsv} disabled={!selectedCaseId}>
+                <Button variant="ghost" loading={exporting} onClick={exportCsv} disabled={!selectedCaseId || jobsLoading}>
                   <Download className="h-4 w-4" /> Export solution-set CSV
                 </Button>
-                <Button variant="ghost" loading={exporting} onClick={exportCoverage} disabled={!selectedCaseId}>
+                <Button variant="ghost" loading={exporting} onClick={exportCoverage} disabled={!selectedCaseId || jobsLoading}>
                   <Download className="h-4 w-4" /> Service coverage CSV
                 </Button>
                 <input
@@ -381,14 +468,20 @@ export function ReportsExportPage() {
                   loading={importing}
                   disabled={!selectedCaseId}
                   onClick={() => fileRef.current?.click()}
+                  title="Imported findings belong to the case, not to a scan job. They appear when All jobs in this case is selected."
                 >
-                  <Upload className="h-4 w-4" /> Import CSV
+                  <Upload className="h-4 w-4" /> Import CSV into case
                 </Button>
               </div>
             </Card>
 
             <Card className="p-6">
               <h3 className="font-bold text-ink-900">Finding summary</h3>
+              {selectedCaseId ? (
+                <p className="mt-1 text-xs text-ink-500">
+                  {selectedJob ? `Scan job ${selectedJob.id.slice(0, 8)} (${selectedJob.status})` : "All jobs in this case"}
+                </p>
+              ) : null}
               {!summary ? (
                 <p className="mt-4 text-sm text-ink-400">Select a case to view finding counts.</p>
               ) : (
@@ -431,8 +524,14 @@ export function ReportsExportPage() {
                 </div>
                 <p className="max-w-3xl text-sm text-ink-600">
                   Enter site overview and infrastructure details for the PDF. Data is saved per case and auto-loaded
-                  when you switch cases.
+                  when you switch cases. Findings, endpoint count and scan verification come from the scan job
+                  selected at the top.
                 </p>
+                {selectedCaseId ? (
+                  <p className="mt-2 text-sm font-medium text-ink-800">
+                    Report scope: {selectedJob ? `scan job ${selectedJob.id.slice(0, 8)} (${selectedJob.status})` : "all jobs in this case"}
+                  </p>
+                ) : null}
               </div>
               {intakeHasData && intakeLoaded && <Badge tone="green">Saved for this case</Badge>}
             </div>
@@ -666,7 +765,7 @@ export function ReportsExportPage() {
                   <Button
                     variant="brand"
                     loading={gapExporting === "pdf"}
-                    disabled={!selectedCaseId}
+                    disabled={!selectedCaseId || jobsLoading}
                     onClick={() => void exportGap("pdf")}
                   >
                     <Download className="h-4 w-4" /> Download PDF
@@ -674,7 +773,7 @@ export function ReportsExportPage() {
                   <Button
                     variant="outline"
                     loading={gapExporting === "docx"}
-                    disabled={!selectedCaseId}
+                    disabled={!selectedCaseId || jobsLoading}
                     onClick={() => void exportGap("docx")}
                   >
                     <Download className="h-4 w-4" /> Download DOCX

@@ -43,20 +43,40 @@ _SEV_TO_RISK = {
 }
 
 
+def job_kw(scan_job_id: str | None) -> dict[str, str]:
+    """``{"scan_job_id": id}`` when a job is selected, else ``{}`` (V1.10.3).
+
+    Passing the filter only when it is set keeps every existing case-level
+    caller (and its call signature) unchanged.
+    """
+    jid = str(scan_job_id or "").strip()
+    return {"scan_job_id": jid} if jid else {}
+
+
+def _job_clause(scan_job_id: str | None, params: dict[str, Any], *, column: str = "f.scan_job_id") -> str:
+    jid = str(scan_job_id or "").strip()
+    if not jid:
+        return ""
+    params["jid"] = jid
+    return f" AND {column} = CAST(:jid AS uuid)"
+
+
 def _risk_label(severity: str | None, cvss: float | None, synopsis: str = "") -> str:
     sev, _ = classify_severity(cvss=float(cvss or 0), synopsis=synopsis, raw_severity=severity)
     return _SEV_TO_RISK.get(sev, "Info")
 
 
-def _open_finding_rows(db, *, case_id: str) -> list[dict[str, Any]]:
+def _open_finding_rows(db, *, case_id: str, scan_job_id: str | None = None) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"cid": case_id}
+    job_sql = _job_clause(scan_job_id, params)
     return fetchall(
         db,
-        """SELECT f.severity, f.cvss, f.synopsis, f.description, f.remediation, f.port, f.protocol,
+        f"""SELECT f.severity, f.cvss, f.synopsis, f.description, f.remediation, f.port, f.protocol,
                   f.scan_engine, f.cve, f.correlation_key,
                   COALESCE(a.primary_ip, a.hostname, '') AS host
            FROM vuln_findings f
            LEFT JOIN vuln_assets a ON a.id = f.asset_id
-           WHERE f.case_id = CAST(:cid AS uuid) AND f.status = 'open'
+           WHERE f.case_id = CAST(:cid AS uuid) AND f.status = 'open'{job_sql}
            ORDER BY
              CASE LOWER(COALESCE(f.severity, ''))
                WHEN 'critical' THEN 1
@@ -69,7 +89,7 @@ def _open_finding_rows(db, *, case_id: str) -> list[dict[str, Any]]:
              COALESCE(a.primary_ip, a.hostname, ''),
              COALESCE(f.port, 0),
              COALESCE(f.synopsis, '')""",
-        {"cid": case_id},
+        params,
     )
 
 
@@ -91,16 +111,16 @@ def _solution_row(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def export_case_csv(db, *, case_id: str) -> str:
+def export_case_csv(db, *, case_id: str, scan_job_id: str | None = None) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, lineterminator="\n")
     writer.writeheader()
-    for r in _open_finding_rows(db, case_id=case_id):
+    for r in _open_finding_rows(db, case_id=case_id, **job_kw(scan_job_id)):
         writer.writerow(_solution_row(r))
     return buf.getvalue()
 
 
-def export_case_xlsx(db, *, case_id: str) -> bytes:
+def export_case_xlsx(db, *, case_id: str, scan_job_id: str | None = None) -> bytes:
     """Write the approved Solution Set workbook with 8 columns and matching layout."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -125,7 +145,7 @@ def export_case_xlsx(db, *, case_id: str) -> bytes:
         cell.font = header_font
         cell.border = thin
         cell.fill = PatternFill(fill_type="solid", fgColor="FFFFFFFF")
-    for r_idx, raw in enumerate(_open_finding_rows(db, case_id=case_id), start=2):
+    for r_idx, raw in enumerate(_open_finding_rows(db, case_id=case_id, **job_kw(scan_job_id)), start=2):
         row = _solution_row(raw)
         for col_idx, key in enumerate(XLSX_COLUMNS, start=1):
             cell = ws.cell(row=r_idx, column=col_idx, value=row[key])
@@ -145,42 +165,62 @@ def export_case_xlsx(db, *, case_id: str) -> bytes:
     return buf.getvalue()
 
 
-def export_case_summary(db, *, case_id: str) -> dict[str, Any]:
+def export_case_summary(db, *, case_id: str, scan_job_id: str | None = None) -> dict[str, Any]:
+    params: dict[str, Any] = {"cid": case_id}
+    job_sql = _job_clause(scan_job_id, params, column="scan_job_id")
     rows = fetchall(
         db,
         f"""SELECT {aetheris_severity_sql('')} AS severity, COUNT(*) AS c FROM vuln_findings
-           WHERE case_id = CAST(:cid AS uuid) AND status = 'open'
+           WHERE case_id = CAST(:cid AS uuid) AND status = 'open'{job_sql}
            GROUP BY 1""",
-        {"cid": case_id},
+        params,
     )
     by_sev = {str(r["severity"]): int(r["c"]) for r in rows}
     engines = fetchall(
         db,
-        """SELECT scan_engine, COUNT(*) AS c FROM vuln_findings
-           WHERE case_id = CAST(:cid AS uuid) AND status = 'open' AND scan_engine IS NOT NULL
+        f"""SELECT scan_engine, COUNT(*) AS c FROM vuln_findings
+           WHERE case_id = CAST(:cid AS uuid) AND status = 'open' AND scan_engine IS NOT NULL{job_sql}
            GROUP BY scan_engine ORDER BY c DESC""",
-        {"cid": case_id},
+        params,
     )
-    corr = fetchone(
-        db,
-        """SELECT COUNT(*) AS total, SUM(CASE WHEN engine_count > 1 THEN 1 ELSE 0 END) AS multi
-           FROM vuln_finding_correlations WHERE case_id = CAST(:cid AS uuid)""",
-        {"cid": case_id},
-    )
+    if scan_job_id:
+        # Correlation groups are built across the whole case; count only groups
+        # that contain at least one open finding of this job.
+        corr = fetchone(
+            db,
+            """SELECT COUNT(*) AS total, SUM(CASE WHEN c.engine_count > 1 THEN 1 ELSE 0 END) AS multi
+               FROM vuln_finding_correlations c
+               WHERE c.case_id = CAST(:cid AS uuid)
+                 AND EXISTS (SELECT 1 FROM vuln_findings f
+                             WHERE f.case_id = c.case_id AND f.status = 'open'
+                               AND f.correlation_key = c.correlation_key
+                               AND f.scan_job_id = CAST(:jid AS uuid))""",
+            params,
+        )
+    else:
+        corr = fetchone(
+            db,
+            """SELECT COUNT(*) AS total, SUM(CASE WHEN engine_count > 1 THEN 1 ELSE 0 END) AS multi
+               FROM vuln_finding_correlations WHERE case_id = CAST(:cid AS uuid)""",
+            {"cid": case_id},
+        )
     return {
         "case_id": case_id,
+        "scan_job_id": str(scan_job_id) if scan_job_id else None,
         "findings_by_severity": by_sev,
         "findings_by_engine": {str(r["scan_engine"]): int(r["c"]) for r in engines},
         "correlation_groups": int((corr or {}).get("total") or 0),
         "multi_engine_groups": int((corr or {}).get("multi") or 0),
-        "service_coverage": load_service_coverage(db, case_id=case_id),
+        "service_coverage": load_service_coverage(db, case_id=case_id, **job_kw(scan_job_id)),
     }
 
 
-def load_service_coverage(db, *, case_id: str) -> list[dict[str, Any]]:
+def load_service_coverage(db, *, case_id: str, scan_job_id: str | None = None) -> list[dict[str, Any]]:
     """Export durable engine/family evidence separately from vulnerability rows."""
-    rows = fetchall(db, """SELECT id, status, orchestration_json FROM vuln_scan_jobs
-        WHERE case_id = CAST(:cid AS uuid) ORDER BY created_at""", {"cid": case_id})
+    params: dict[str, Any] = {"cid": case_id}
+    job_sql = _job_clause(scan_job_id, params, column="id")
+    rows = fetchall(db, f"""SELECT id, status, orchestration_json FROM vuln_scan_jobs
+        WHERE case_id = CAST(:cid AS uuid){job_sql} ORDER BY created_at""", params)
     out = []
     for row in rows:
         orch = row.get("orchestration_json") or {}
@@ -198,11 +238,11 @@ def load_service_coverage(db, *, case_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def export_service_coverage_csv(db, *, case_id: str) -> str:
+def export_service_coverage_csv(db, *, case_id: str, scan_job_id: str | None = None) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
     writer.writerow(["Job", "Host", "Service ID", "Service", "Evidence state", "Reason", "Source result IDs", "Credentialed coverage"])
-    for job in load_service_coverage(db, case_id=case_id):
+    for job in load_service_coverage(db, case_id=case_id, **job_kw(scan_job_id)):
         for host, evidence in job["service_coverage"].items():
             for service in evidence.get("services") or []:
                 writer.writerow([job["job_id"], host, service.get("service_id"), service.get("name"),

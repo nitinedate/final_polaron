@@ -13,7 +13,7 @@ from app.db.sql_helpers import fetchall, fetchone
 from app.services.gap_report_llm import enrich_gap_findings
 from app.services.gap_report_template import build_styled_gap_report_html
 from app.services.scan_assessment_evidence import load_case_scan_assessment, merge_scan_assessments
-from app.services.vuln_report_export import _risk_label, load_service_coverage
+from app.services.vuln_report_export import _risk_label, job_kw, load_service_coverage
 
 _RISK_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
 
@@ -164,6 +164,32 @@ def _site_value_missing(value: Any) -> bool:
     return str(value or "").strip().lower() in _MISSING_SITE_VALUES
 
 
+def _derive_job_endpoint_count(db, case_id: str, scan_job_id: str) -> int | None:
+    """In-scope endpoints of ONE scan job (V1.10.3): its host-like, non-excluded targets.
+
+    Assets are shared by every job of a case, so a per-job report counts the
+    job's own targets instead.
+    """
+    row = fetchone(
+        db,
+        """SELECT COUNT(DISTINCT LOWER(BTRIM(t.target))) AS endpoint_count
+           FROM vuln_scan_targets t
+           JOIN vuln_scan_jobs j ON j.id = t.scan_job_id
+           WHERE j.case_id = CAST(:cid AS uuid)
+             AND j.id = CAST(:jid AS uuid)
+             AND COALESCE(t.excluded, FALSE) = FALSE
+             AND BTRIM(COALESCE(t.target, '')) <> ''
+             AND LOWER(BTRIM(COALESCE(t.target_type, 'host')))
+                 IN ('host', 'hostname', 'ip', 'ipv4', 'ipv6', 'endpoint')""",
+        {"cid": case_id, "jid": scan_job_id},
+    )
+    try:
+        count = int((row or {}).get("endpoint_count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return count if count > 0 else None
+
+
 def _derive_case_endpoint_count(db, case_id: str) -> int | None:
     """Derive the number of in-scope endpoints from real vulnerability data.
 
@@ -209,10 +235,16 @@ def _derive_case_endpoint_count(db, case_id: str) -> int | None:
     return target_count if target_count > 0 else None
 
 
-def _apply_derived_site_facts(db, case_id: str, site: dict[str, Any]) -> dict[str, Any]:
+def _apply_derived_site_facts(
+    db, case_id: str, site: dict[str, Any], scan_job_id: str | None = None,
+) -> dict[str, Any]:
     """Fill report facts from scan data without overwriting examiner-entered intake."""
     if _site_value_missing(site.get("num_endpoints")):
-        endpoint_count = _derive_case_endpoint_count(db, case_id)
+        endpoint_count = (
+            _derive_job_endpoint_count(db, case_id, scan_job_id)
+            if scan_job_id
+            else _derive_case_endpoint_count(db, case_id)
+        )
         if endpoint_count is not None:
             site["num_endpoints"] = str(endpoint_count)
     return site
@@ -254,18 +286,23 @@ def save_gap_site(db, case_id: str, site: dict[str, Any]) -> dict[str, Any]:
     return load_gap_site(db, case_id)
 
 
-def _load_open_finding_rows(db, case_id: str) -> list[dict[str, Any]]:
+def _load_open_finding_rows(db, case_id: str, scan_job_id: str | None = None) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"cid": case_id}
+    job_sql = ""
+    if scan_job_id:
+        params["jid"] = str(scan_job_id)
+        job_sql = " AND f.scan_job_id = CAST(:jid AS uuid)"
     rows = fetchall(
         db,
-        """SELECT f.id, f.plugin_id, f.plugin_family, f.cve, f.severity, f.cvss,
+        f"""SELECT f.id, f.plugin_id, f.plugin_family, f.cve, f.severity, f.cvss,
                   f.port, f.protocol, f.service, f.synopsis, f.description, f.remediation,
                   f.risk_factors_json,
                   COALESCE(a.primary_ip, a.hostname, '') AS host
            FROM vuln_findings f
            LEFT JOIN vuln_assets a ON a.id = f.asset_id
-           WHERE f.case_id = CAST(:cid AS uuid) AND f.status = 'open'
+           WHERE f.case_id = CAST(:cid AS uuid) AND f.status = 'open'{job_sql}
            ORDER BY f.enterprise_risk_score DESC NULLS LAST, f.severity, f.synopsis, f.port""",
-        {"cid": case_id},
+        params,
     )
     return [dict(r) for r in rows]
 
@@ -311,8 +348,8 @@ def _finding_inventory_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def load_gap_finding_inventory(db, case_id: str) -> dict[str, Any]:
-    return _finding_inventory_from_rows(_load_open_finding_rows(db, case_id))
+def load_gap_finding_inventory(db, case_id: str, scan_job_id: str | None = None) -> dict[str, Any]:
+    return _finding_inventory_from_rows(_load_open_finding_rows(db, case_id, scan_job_id))
 
 
 def load_grouped_findings(db, case_id: str) -> list[dict[str, Any]]:
@@ -470,22 +507,43 @@ def _finding_mitigation_paragraph(f: dict[str, Any]) -> str:
     return _page_text(_build_mitigation_text(name, risk, bullets), max_len=520)
 
 
+def load_scan_job_row(db, case_id: str, scan_job_id: str) -> dict[str, Any] | None:
+    """The scan job, only if it belongs to this case (V1.10.3)."""
+    row = fetchone(
+        db,
+        """SELECT id, case_id, status, started_at, completed_at, created_at
+           FROM vuln_scan_jobs
+           WHERE id = CAST(:jid AS uuid) AND case_id = CAST(:cid AS uuid)""",
+        {"jid": scan_job_id, "cid": case_id},
+    )
+    return dict(row) if row else None
+
+
 def build_gap_report_context(
     db,
     case_id: str,
     *,
     site_override: dict[str, Any] | None = None,
     use_llm: bool | None = None,
+    scan_job_id: str | None = None,
 ) -> dict[str, Any]:
     case_row = load_case_row(db, case_id)
     if not case_row:
         raise ValueError("Case not found")
+    scan_job = None
+    if scan_job_id:
+        scan_job = load_scan_job_row(db, case_id, scan_job_id)
+        if not scan_job:
+            raise ValueError("Scan job not found in this case")
     site = load_gap_site(db, case_id)
     stored_site = dict(site)
     if site_override:
         site = {**site, **{k: v for k, v in site_override.items() if v is not None and k != "has_saved_intake"}}
-    _apply_derived_site_facts(db, case_id, site)
-    inventory = load_gap_finding_inventory(db, case_id)
+    if scan_job_id:
+        _apply_derived_site_facts(db, case_id, site, scan_job_id)
+    else:
+        _apply_derived_site_facts(db, case_id, site)
+    inventory = load_gap_finding_inventory(db, case_id, **job_kw(scan_job_id))
     findings = inventory["findings"]
     client = site.get("client_name") or case_row.get("title") or "Client"
     if findings:
@@ -508,9 +566,11 @@ def build_gap_report_context(
                     save_gap_site(db, case_id, stored_site)
                 except Exception:
                     pass
-    assessment = load_case_scan_assessment(db, case_id)
+    assessment = load_case_scan_assessment(db, case_id, **job_kw(scan_job_id))
     return {
         "case_id": case_id,
+        "scan_job_id": str(scan_job_id) if scan_job_id else None,
+        "scan_job": scan_job,
         "case": case_row,
         "site": site,
         "client": client,
@@ -519,7 +579,7 @@ def build_gap_report_context(
         "informational_findings": inventory["informational_findings"],
         "finding_summary": inventory["finding_summary"],
         "assessment": assessment,
-        "service_coverage_jobs": load_service_coverage(db, case_id=case_id),
+        "service_coverage_jobs": load_service_coverage(db, case_id=case_id, **job_kw(scan_job_id)),
         "intro": site.get("introduction") or DEFAULT_GAP_INTRO,
     }
 
@@ -719,14 +779,19 @@ def export_gap_report(
     fmt: str = "pdf",
     site_override: dict[str, Any] | None = None,
     use_llm: bool | None = None,
+    scan_job_id: str | None = None,
 ) -> tuple[bytes, str, str]:
     from app.config import get_settings
 
     settings = get_settings()
     if use_llm is None:
         use_llm = bool(settings.gap_report_llm_enabled)
-    ctx = build_gap_report_context(db, case_id, site_override=site_override, use_llm=use_llm)
+    ctx = build_gap_report_context(db, case_id, site_override=site_override, use_llm=use_llm,
+                                   **job_kw(scan_job_id))
     client_slug = re.sub(r"[^\w\-]+", "-", ctx["client"])[:40].strip("-") or "client"
+    if scan_job_id:
+        # V1.10.3: per-job reports are distinguishable on disk.
+        client_slug = f"{client_slug}-job-{str(scan_job_id)[:8]}"
     if fmt == "docx":
         data = render_gap_docx(ctx)
         return data, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", f"gap-assessment-{client_slug}.docx"

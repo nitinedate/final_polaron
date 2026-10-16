@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db.sql_helpers import fetchall
+from app.db.sql_helpers import fetchall, fetchone
 from app.deps import CurrentUser, firm_db, require_firm_permission
 from app.services.scan_orchestrator import DEFAULT_PIPELINE
 from app.services.gap_assessment_report import export_gap_report, export_merged_gap_report
@@ -30,6 +32,37 @@ def _require_vuln_module() -> None:
         raise HTTPException(status_code=404, detail={"error": {"code": "vuln_disabled", "message": "Vulnerability module is disabled"}})
 
 
+# V1.10.3: every report/export below takes an optional ``scan_job_id``. Without
+# it the whole case is exported (previous behaviour); with it only that job's
+# findings, coverage and scan assessment are used.
+JOB_QUERY = Query(None, description="Optional scan job UUID of this case; omit to export the whole case.")
+
+
+def _job_or_none(db: Session, case_id: str, scan_job_id: str | None) -> str | None:
+    """Validate that the job belongs to the case. Returns the canonical id or None."""
+    raw = str(scan_job_id or "").strip()
+    if not raw or raw.lower() in {"all", "none", "null"}:
+        return None
+    try:
+        jid = str(uuid.UUID(raw))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": {
+            "code": "invalid_scan_job_id", "message": "scan_job_id must be a UUID"}}) from exc
+    row = fetchone(
+        db,
+        "SELECT id FROM vuln_scan_jobs WHERE id = CAST(:jid AS uuid) AND case_id = CAST(:cid AS uuid)",
+        {"jid": jid, "cid": case_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail={"error": {
+            "code": "scan_job_not_found", "message": "Scan job not found in this case"}})
+    return jid
+
+
+def _job_suffix(jid: str | None) -> str:
+    return f"-job-{jid[:8]}" if jid else ""
+
+
 @router.get("/api/vuln/orchestrator/pipeline")
 def get_default_pipeline(current: CurrentUser = Depends(require_firm_permission("scan:read"))):
     _require_vuln_module()
@@ -39,56 +72,66 @@ def get_default_pipeline(current: CurrentUser = Depends(require_firm_permission(
 @router.get("/api/cases/{case_id}/vuln-report.csv")
 def export_vuln_report_csv(
     case_id: str,
+    scan_job_id: str | None = JOB_QUERY,
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("vuln:read")),
 ):
     _require_vuln_module()
-    csv_text = export_case_csv(db, case_id=case_id)
+    jid = _job_or_none(db, case_id, scan_job_id)
+    csv_text = export_case_csv(db, case_id=case_id, scan_job_id=jid)
     return PlainTextResponse(
         content=csv_text,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="vuln-report-{case_id[:8]}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="vuln-report-{case_id[:8]}{_job_suffix(jid)}.csv"'},
     )
 
 
 @router.get("/api/cases/{case_id}/vuln-report.xlsx")
 def export_vuln_report_xlsx(
     case_id: str,
+    scan_job_id: str | None = JOB_QUERY,
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("vuln:read")),
 ):
     _require_vuln_module()
-    data = export_case_xlsx(db, case_id=case_id)
+    jid = _job_or_none(db, case_id, scan_job_id)
+    data = export_case_xlsx(db, case_id=case_id, scan_job_id=jid)
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="Solution Set-{case_id[:8]}.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="Solution Set-{case_id[:8]}{_job_suffix(jid)}.xlsx"'},
     )
 
 
 @router.get("/api/cases/{case_id}/vuln-report/summary")
 def vuln_report_summary(
     case_id: str,
+    scan_job_id: str | None = JOB_QUERY,
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("vuln:read")),
 ):
     _require_vuln_module()
-    return export_case_summary(db, case_id=case_id)
+    jid = _job_or_none(db, case_id, scan_job_id)
+    return export_case_summary(db, case_id=case_id, scan_job_id=jid)
 
 
 @router.get("/api/cases/{case_id}/service-coverage.csv")
-def service_coverage_csv(case_id: str, db: Session = Depends(firm_db),
+def service_coverage_csv(case_id: str, scan_job_id: str | None = JOB_QUERY, db: Session = Depends(firm_db),
                          current: CurrentUser = Depends(require_firm_permission("vuln:read"))):
     _require_vuln_module()
-    return PlainTextResponse(export_service_coverage_csv(db, case_id=case_id), media_type="text/csv",
-                             headers={"Content-Disposition": f'attachment; filename="service-coverage-{case_id[:8]}.csv"'})
+    jid = _job_or_none(db, case_id, scan_job_id)
+    return PlainTextResponse(
+        export_service_coverage_csv(db, case_id=case_id, scan_job_id=jid), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="service-coverage-{case_id[:8]}{_job_suffix(jid)}.csv"'})
 
 
 @router.get("/api/cases/{case_id}/service-coverage")
-def service_coverage_json(case_id: str, db: Session = Depends(firm_db),
+def service_coverage_json(case_id: str, scan_job_id: str | None = JOB_QUERY, db: Session = Depends(firm_db),
                          current: CurrentUser = Depends(require_firm_permission("vuln:read"))):
     _require_vuln_module()
-    return {"case_id": case_id, "jobs": load_service_coverage(db, case_id=case_id)}
+    jid = _job_or_none(db, case_id, scan_job_id)
+    return {"case_id": case_id, "scan_job_id": jid,
+            "jobs": load_service_coverage(db, case_id=case_id, scan_job_id=jid)}
 
 
 class CsvImportBody(BaseModel):
@@ -195,13 +238,15 @@ def export_merged_gap_report_pdf(
 def export_gap_report_pdf(
     case_id: str,
     llm: str | None = None,
+    scan_job_id: str | None = JOB_QUERY,
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("vuln:read")),
 ):
     _require_vuln_module()
+    jid = _job_or_none(db, case_id, scan_job_id)
     use_llm = str(llm or "").strip().lower() in {"1", "true", "yes", "on"}
     try:
-        data, media_type, filename = export_gap_report(db, case_id, fmt="pdf", use_llm=use_llm)
+        data, media_type, filename = export_gap_report(db, case_id, fmt="pdf", use_llm=use_llm, scan_job_id=jid)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(exc)}}) from exc
     except Exception as exc:
@@ -220,13 +265,15 @@ def export_gap_report_pdf(
 def export_gap_report_docx(
     case_id: str,
     llm: str | None = None,
+    scan_job_id: str | None = JOB_QUERY,
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("vuln:read")),
 ):
     _require_vuln_module()
+    jid = _job_or_none(db, case_id, scan_job_id)
     use_llm = str(llm or "").strip().lower() in {"1", "true", "yes", "on"}
     try:
-        data, media_type, filename = export_gap_report(db, case_id, fmt="docx", use_llm=use_llm)
+        data, media_type, filename = export_gap_report(db, case_id, fmt="docx", use_llm=use_llm, scan_job_id=jid)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(exc)}}) from exc
     except Exception as exc:
