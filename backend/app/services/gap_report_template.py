@@ -3,12 +3,37 @@
 from __future__ import annotations
 
 import base64
+import re
 import html
 import mimetypes
 from pathlib import Path
 from typing import Any
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static" / "gap_report"
+
+# V1.10.7 branding: Polaron Technologies Pvt Ltd and its logo on every gap report.
+REPORT_COMPANY = "Polaron Technologies Pvt Ltd"
+REPORT_LOGO_FILE = "polaron_logo.png"
+# "AETHERIS TECHNOLOGIES PVT LTD." / "Aetheris Technologies Pvt. Ltd" in any case.
+# A dot after "Ltd" is dropped only mid-sentence (followed by a lowercase word),
+# so a sentence-ending period stays.
+_OLD_COMPANY_RE = re.compile(
+    r"aetheris\s+technologies\s+pvt\.?\s*ltd(?:\.(?=\s+(?-i:[a-z])))?",
+    re.IGNORECASE,
+)
+
+
+def rebrand_company(text: Any) -> Any:
+    """Replace the former company name with REPORT_COMPANY in report text (V1.10.7).
+
+    Applied when a report is rendered, so site overviews saved earlier (company
+    name, introduction) show the new name without editing stored data.
+    """
+    if not isinstance(text, str) or "aetheris" not in text.lower():
+        return text
+    if re.fullmatch(r"\s*" + _OLD_COMPANY_RE.pattern + r"\.?\s*", text, re.IGNORECASE):
+        return REPORT_COMPANY  # the whole value is the company name, e.g. "AETHERIS TECHNOLOGIES PVT. LTD."
+    return _OLD_COMPANY_RE.sub(REPORT_COMPANY, text)
 
 # Colors extracted from reference PDF (Gap Analysis Report december 2025 lilavati.pdf)
 COLOR_GAP_RED = "#ff0000"
@@ -757,10 +782,10 @@ def _risk_cell(risk: str) -> str:
 
 def _cover_page(client: str, company: str, report_date: str = "") -> str:
     _ensure_cover_ornament_assets()
-    logo = _asset_data_uri("aetheris_logo.png")
+    logo = _asset_data_uri(REPORT_LOGO_FILE)
     ornament_top = _asset_data_uri("cover_ornament_top.png")
     ornament_mid = _asset_data_uri("cover_ornament_bottom.png")
-    logo_html = f'<img class="cover-logo" src="{logo}" alt="Aetheris Technologies" />' if logo else ""
+    logo_html = f'<img class="cover-logo" src="{logo}" alt="{_esc(REPORT_COMPANY)}" />' if logo else ""
     top_html = f'<img class="cover-ornament-top" src="{ornament_top}" alt="" />' if ornament_top else ""
     mid_html = f'<img class="cover-ornament-mid" src="{ornament_mid}" alt="" />' if ornament_mid else ""
     date_line = f"<p class='cover-date'>{_esc(report_date)}</p>" if report_date else ""
@@ -977,8 +1002,6 @@ def _toc_page(page_no: int, page_map: dict[str, Any]) -> str:
         "<tr><td class='toc-title-cell' colspan='3'>TABLE OF CONTENTS</td></tr>",
     ]
     items = list(TOC_ITEMS)
-    if page_map.get("service_coverage"):
-        items.append(("Service Coverage and Limitations", "service_coverage"))
     for idx, (title, key) in enumerate(items, start=1):
         rows.append(
             f"<tr>{_toc_row_html(idx, title, _format_toc_pagenum(key, page_map))}</tr>"
@@ -1244,7 +1267,7 @@ def _finding_title_class(risk: str) -> str:
 
 def render_gap_cover_pdf(
     client: str,
-    company: str = "Aetheris Technologies Pvt Ltd",
+    company: str = REPORT_COMPANY,
     report_date: str = "",
 ) -> bytes | None:
     """Render page-1 cover matching the Fundfox GAP ANALYSIS REPORT layout."""
@@ -1329,10 +1352,11 @@ def render_gap_cover_pdf(
     draw.text((cx - ctw // 2, y), client_text, fill=client_blue, font=client_font)
     y += (cb[3] - cb[1]) + 40
 
-    logo_path = _cover_asset_path("aetheris_logo.png")
+    logo_path = _cover_asset_path(REPORT_LOGO_FILE)
     if logo_path:
         logo = Image.open(logo_path).convert("RGBA")
-        max_w, max_h = 520, 180
+        # The Polaron logo is wide (about 2.7:1), so allow more width than height.
+        max_w, max_h = 620, 230
         ratio = min(max_w / logo.width, max_h / logo.height, 1.0)
         logo = logo.resize((int(logo.width * ratio), int(logo.height * ratio)), Image.Resampling.LANCZOS)
         bg = Image.new("RGBA", logo.size, (255, 255, 255, 255))
@@ -1347,7 +1371,7 @@ def render_gap_cover_pdf(
         draw.text((cx - dtw // 2, y), report_date, fill=(0, 0, 0), font=footer_font)
         y += (db[3] - db[1]) + 18
 
-    company_text = (company or "Aetheris Technologies Pvt Ltd").strip()
+    company_text = str(rebrand_company(company or REPORT_COMPANY)).strip()
     cob = draw.textbbox((0, 0), company_text, font=footer_font)
     cotw = cob[2] - cob[0]
     draw.text((cx - cotw // 2, y), company_text, fill=(0, 0, 0), font=footer_font)
@@ -1633,34 +1657,7 @@ def _compute_toc_page_map(*, findings_count: int, findings: list[dict[str, Any]]
         "summary": summary,
         "vuln_observation": vuln_observation,
         "contacts": contacts,
-        "service_coverage": contacts + 1 if ctx.get("service_coverage_jobs") else None,
     }
-
-
-def _service_coverage_pages(ctx: dict[str, Any]) -> list[str]:
-    jobs = ctx.get("service_coverage_jobs") or []
-    if not jobs:
-        return []
-    intro = "<p class='body-text'>Native engine completion does not prove every service rule passed. Missing credentials, fingerprint evidence and network-scoped collectors remain coverage gaps. The companion Service coverage CSV lists all 52 service families and IP forwarding per host.</p>"
-    blocks = []
-    for job in jobs:
-        job_label = f"Job {_esc(job.get('job_id') or '')} ({_esc(job.get('status') or 'unknown')})"
-        for host, evidence in (job.get("service_coverage") or {}).items():
-            counts = evidence.get("counts") or {}
-            blocks.append(f"<p class='body-text'><strong>{job_label} / {_esc(host)}</strong><br/>"
-                          f"Families with findings: {int(counts.get('finding') or 0)}; observed: {int(counts.get('observation') or 0)}; "
-                          f"not tested: {int(counts.get('not-tested') or 0)}; unsupported: {int(counts.get('unsupported') or 0)}.<br/>"
-                          f"{_esc(evidence.get('limitation') or job.get('limitation') or '')}</p>")
-        for task, policy in (job.get("policy_snapshots") or {}).items():
-            # The full exact port range is also retained in the JSON API.
-            blocks.append(f"<p class='body-text'><strong>{job_label} / task {_esc(task)}</strong><br/>"
-                          f"Policy: {_esc(policy.get('policy_version') or 'unknown')}; {_esc(policy.get('snapshot_status') or 'unknown')}. "
-                          f"TCP ports: {_esc(policy.get('tcp_port_count', 'unknown'))}; UDP ports: {_esc(policy.get('udp_port_count', 'unknown'))}.<br/>"
-                          f"Configuration SHA-256: {_esc(policy.get('configuration_sha256') or 'not captured')}.<br/>"
-                          f"Credential binding: {_esc(str(policy.get('credential_status') or 'not supplied'))}.</p>")
-        if not job.get("service_coverage"):
-            blocks.append(f"<p class='body-text'><strong>{job_label}</strong><br/>Service-family evidence was not captured by this scan. No guide-wide pass conclusion is established.</p>")
-    return [intro + "".join(blocks[i:i + 4]) for i in range(0, len(blocks), 4)]
 
 
 def build_styled_gap_report_html(ctx: dict[str, Any], *, include_cover: bool = True) -> str:
@@ -1669,7 +1666,7 @@ def build_styled_gap_report_html(ctx: dict[str, Any], *, include_cover: bool = T
     findings = ctx["findings"]
     author = str(site.get("author") or "").strip()
     version = site.get("document_version", "1.0")
-    company = site.get("company_name", "AETHERIS TECHNOLOGIES PVT LTD")
+    company = rebrand_company(site.get("company_name") or REPORT_COMPANY)
     intro = ctx.get("intro") or ""
     report_date = ctx.get("report_date") or ""
 
@@ -1740,9 +1737,9 @@ def build_styled_gap_report_html(ctx: dict[str, Any], *, include_cover: bool = T
     )
     page_no += 1
 
-    for body in _service_coverage_pages(ctx):
-        pages.append(_page_wrap(body, page_no, section_bars=["7. SERVICE COVERAGE AND LIMITATIONS"]))
-        page_no += 1
+    # V1.10.7: the "Service Coverage and Limitations" section is no longer part of
+    # the report; per-host service coverage stays available as the separate
+    # "Service coverage CSV" export on the Reports page.
 
     toc_html = _toc_page(toc_page_no, _compute_toc_page_map(findings_count=len(findings), findings=findings, ctx=ctx))
     pages.insert(1 if not include_cover else 2, toc_html)

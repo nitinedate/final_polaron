@@ -11,7 +11,12 @@ from typing import Any
 
 from app.db.sql_helpers import fetchall, fetchone
 from app.services.gap_report_llm import enrich_gap_findings
-from app.services.gap_report_template import build_styled_gap_report_html
+from app.services.gap_report_template import (
+    REPORT_COMPANY,
+    REPORT_LOGO_FILE,
+    build_styled_gap_report_html,
+    rebrand_company,
+)
 from app.services.scan_assessment_evidence import load_case_scan_assessment, merge_scan_assessments
 from app.services.vuln_report_export import _risk_label, job_kw, load_service_coverage
 
@@ -123,7 +128,7 @@ def _resolved_key_contacts(contacts: list[dict[str, Any]] | None) -> list[dict[s
         return DEFAULT_KEY_CONTACTS
     return contacts
 
-DEFAULT_GAP_INTRO = """This report presents the results of the Vulnerability Assessment conducted by AETHERIS TECHNOLOGIES PVT LTD. on IP's as per project scope.
+DEFAULT_GAP_INTRO = """This report presents the results of the Vulnerability Assessment conducted by Polaron Technologies Pvt Ltd on IP's as per project scope.
 
 The purpose of this assessment was to…
 
@@ -265,7 +270,11 @@ def load_gap_site(db, case_id: str) -> dict[str, Any]:
         site["author"] = ""
     site.setdefault("author", "")
     site.setdefault("document_version", "1.0")
-    site.setdefault("company_name", "Aetheris Technologies Pvt Ltd")
+    site.setdefault("company_name", REPORT_COMPANY)
+    # V1.10.7: overviews saved before the rename still carry the old company
+    # name (company field, introduction text); show the new one everywhere.
+    for key, value in list(site.items()):
+        site[key] = rebrand_company(value)
     site["has_saved_intake"] = bool(raw)
     return site
 
@@ -638,7 +647,7 @@ def render_gap_pdf(
 
         cover_pdf = render_gap_cover_pdf(
             client,
-            company or "Aetheris Technologies Pvt Ltd",
+            rebrand_company(company or REPORT_COMPANY),
             report_date or "",
         )
         if not cover_pdf:
@@ -673,11 +682,22 @@ def render_gap_docx(ctx: dict[str, Any]) -> bytes:
     run = cover.add_run("GAP ANALYSIS REPORT\n")
     run.bold = True
     cover.add_run(f"\n{client}\n\n")
-    cover.add_run(site.get("company_name", "Aetheris Technologies Pvt Ltd"))
+    from app.services.gap_report_template import _cover_asset_path
+
+    logo_path = _cover_asset_path(REPORT_LOGO_FILE)
+    if logo_path:
+        from docx.shared import Inches
+
+        logo_par = doc.add_paragraph()
+        logo_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        logo_par.add_run().add_picture(str(logo_path), width=Inches(3.6))
+    company_par = doc.add_paragraph()
+    company_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    company_par.add_run(str(rebrand_company(site.get("company_name") or REPORT_COMPANY)))
     doc.add_page_break()
 
     doc.add_heading("1. Introduction", level=1)
-    doc.add_paragraph(ctx["intro"])
+    doc.add_paragraph(str(rebrand_company(ctx["intro"])))
 
     doc.add_heading("2. Site Overview / Site Infrastructure", level=1)
     for label, key in (
@@ -741,32 +761,7 @@ def render_gap_docx(ctx: dict[str, Any]) -> bytes:
         name_line = f"{c.get('name')}  - {title}" if title else c.get("name", "")
         doc.add_paragraph(f"• {name_line}\n{c.get('email')}", style="List Number")
 
-    if ctx.get("service_coverage_jobs"):
-        doc.add_page_break()
-        doc.add_heading("7. Service Coverage and Limitations", level=1)
-        doc.add_paragraph("A native engine assessment does not prove every service rule passed. Missing credentials, fingerprint evidence and network-scoped collectors remain coverage gaps. The companion Service coverage CSV contains all 52 families and IP forwarding per host.")
-        for job in ctx["service_coverage_jobs"]:
-            doc.add_heading(f"Job {job['job_id']} ({job.get('status') or 'unknown'})", level=2)
-            for host, evidence in job["service_coverage"].items():
-                counts = evidence.get("counts") or {}
-                doc.add_paragraph(
-                    f"{host}: {counts.get('finding', 0)} families with findings; {counts.get('observation', 0)} observed; "
-                    f"{counts.get('not-tested', 0)} not tested; {counts.get('closed', 0)} closed; "
-                    f"{counts.get('filtered', 0)} not answering; {counts.get('not-observed', 0)} not observed in the scanned "
-                    f"port range; {counts.get('not-in-scope', 0)} outside the scanned port range; "
-                    f"{counts.get('unsupported', 0)} unsupported."
-                )
-                host_level = evidence.get("host_level") or {}
-                if host_level.get("source_result_ids"):
-                    sev = host_level.get("severity_counts") or {}
-                    doc.add_paragraph(
-                        f"{host}: host-level results (OS, ICMP/TCP stack): "
-                        + ", ".join(f"{k} {v}" for k, v in sev.items() if v)
-                    )
-                doc.add_paragraph(evidence.get("limitation") or job["limitation"])
-            for task, policy in job["policy_snapshots"].items():
-                doc.add_paragraph(f"Task {task}: {policy.get('snapshot_status', 'unknown')}; ports {policy.get('port_range') or 'not captured'}; configuration SHA-256 {policy.get('configuration_sha256') or 'not captured'}")
-
+    # V1.10.7: no Service Coverage and Limitations section (see the Service coverage CSV export).
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()

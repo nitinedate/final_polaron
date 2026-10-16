@@ -14,7 +14,7 @@ log = logging.getLogger("gap_report_llm")
 
 _CHUNK_SIZE = 8
 
-_SYSTEM_PROMPT = """You write Gap Assessment report content for Aetheris Technologies clients
+_SYSTEM_PROMPT = """You write Gap Assessment report content for Polaron Technologies Pvt Ltd clients
 (hospitals, enterprises). Use simple English a non-technical client can understand.
 Write like a professional security assessment report — never paste scanner labels or stub text.
 

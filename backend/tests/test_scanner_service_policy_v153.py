@@ -111,7 +111,8 @@ def test_coverage_export_has_every_family_and_forwarding_with_no_fake_pass(monke
     assert len({r['Service ID'] for r in rows}) == 53
 
 
-def test_gap_html_has_coverage_appendix_and_toc_with_escaped_evidence():
+def test_gap_html_has_no_service_coverage_section_even_with_coverage_data():
+    """V1.10.7: the section was removed from the report on request; the CSV export keeps the data."""
     from app.services.gap_assessment_report import build_gap_report_html
     evidence = analyze_services([], host='10.0.0.1')
     ctx = {'client': 'Test', 'site': {}, 'findings': [], 'intro': 'Assessment',
@@ -120,13 +121,10 @@ def test_gap_html_has_coverage_appendix_and_toc_with_escaped_evidence():
                    'policy_version': 'aetheris-services-2.1', 'snapshot_status': 'captured_at_task_start',
                    'tcp_port_count': 65535, 'udp_port_count': 35, 'configuration_sha256': 'a' * 64,
                    'credential_status': {'ssh': 'not-tested'}}}}]}
-    result = build_gap_report_html(ctx)
-    assert '7. SERVICE COVERAGE AND LIMITATIONS' in result
-    assert result.replace(chr(160), ' ').count('SERVICE COVERAGE AND LIMITATIONS') >= 2
-    assert '&lt;job&gt;' in result and '<job>' not in result
-    assert 'not tested: 51' in result
-    assert 'TCP ports: 65535' in result
-    assert 'companion Service coverage CSV' in result
+    result = build_gap_report_html(ctx).replace(chr(160), ' ')
+    assert 'SERVICE COVERAGE AND LIMITATIONS' not in result.upper()
+    assert 'aetheris-services-2.1' not in result and 'companion Service coverage CSV' not in result
+    assert '6. KEY CONTACTS' in result  # the report now ends with Key Contacts
 
 
 def test_native_missing_score_survives_central_normalization_without_losing_context():
