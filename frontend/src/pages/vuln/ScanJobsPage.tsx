@@ -955,7 +955,9 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
               {completedWithWarnings ? (
                 <div className="mt-2 max-w-xl text-sm text-amber-800">
                   <p className="font-medium">
-                    The network scan finished for every host. Findings are valid; a clean result is not claimed because:
+                    {summary?.assessment?.not_assessed?.length
+                      ? `${(summary?.assessment?.target_count ?? 0) - summary.assessment.not_assessed.length} of ${summary?.assessment?.target_count ?? 0} IPs were assessed and their findings are valid; a clean result is not claimed because:`
+                      : "The network scan finished for every host. Findings are valid; a clean result is not claimed because:"}
                   </p>
                   <ul className="mt-1 list-disc pl-5">
                     {(assessmentWarnings?.length ? assessmentWarnings : cleanBlockers.length ? cleanBlockers : ["Service checks are not verified per family"]).map((reason) => (

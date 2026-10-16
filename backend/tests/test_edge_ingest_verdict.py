@@ -32,14 +32,18 @@ def _verdict(**overrides):
     return evaluate_edge_ingest_verdict(**base)
 
 
-def test_done_one_alive_one_skipped_is_incomplete():
+def test_done_one_alive_one_skipped_completes_with_warning():
+    # V1.9.8 (was "failed"): the agent skipped 192.168.0.103 with a stated reason and
+    # 192.168.0.163 was assessed, so the job completes - never clean, the IP named.
     v = _verdict()
-    assert v["coverage_ok"] is False
-    assert v["verified_complete"] is False
-    assert v["final_status"] == "failed"
-    assert v["err_text"] is not None
+    assert v["coverage_ok"] is True
+    assert v["verified_complete"] is True
+    assert v["final_status"] == "completed"
+    assert v["err_text"] is None
     assert v["clean_eligible"] is False
     assert v["missing_ip_targets"] == ["192.168.0.103"]
+    assert v["not_assessed_hosts"] == ["192.168.0.103"]
+    assert v["warnings"] == ["1 of 2 IP(s) not assessed: 192.168.0.103 (unreachable)"]
     assert v["required_count"] == 2
 
 
@@ -141,8 +145,9 @@ def test_runtime_cap_partial_without_evidence_still_fails():
 
 
 def test_missing_target_is_still_failed_even_with_findings():
-    # Regression: the incomplete path must NOT rescue a scan where a requested
-    # IP never appeared in the report.
-    v = _verdict(task_status="stopped")
+    # Regression: nothing may rescue a scan where a requested IP never appeared in
+    # the report and the agent gave no reason for it (V1.9.8: an IP the agent
+    # skipped with a reason is accounted for - see the test above).
+    v = _verdict(task_status="stopped", skipped_details=[], skipped_set=set())
     assert v["final_status"] == "failed"
     assert v["missing_ip_targets"] == ["192.168.0.103"]

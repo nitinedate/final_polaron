@@ -3,9 +3,10 @@
 Field job de53e2fe: 192.168.0.163 assessed (50 results); 192.168.0.195 answered
 nothing and was stopped at the per-IP time limit before its port scan finished, so
 the OpenVAS report has no host record for it. The whole job turned red "failed".
-It is now amber "incomplete" (findings kept, never verified/clean) - but only when
-the agent accounts for every IP without results. An IP that simply never appears
-in the report still fails the job.
+V1.9.7 made such jobs amber "incomplete"; V1.9.8 completes them "with warnings"
+(findings kept, never clean, the IP named) - but only when the agent accounts for
+every IP without results. An IP that simply never appears in the report still
+fails the job.
 """
 from app.services.scanner_agent_jobs import evaluate_edge_ingest_verdict
 
@@ -45,27 +46,28 @@ def _verdict(**overrides):
     return evaluate_edge_ingest_verdict(**base)
 
 
-def test_field_job_with_time_limited_silent_ip_is_incomplete_not_failed():
+def test_field_job_with_time_limited_silent_ip_completes_with_a_warning():
     v = _verdict()
-    assert v["final_status"] == "incomplete"
-    assert v["verified_complete"] is False and v["clean_eligible"] is False
+    assert v["final_status"] == "completed"
+    assert v["verified_complete"] is True and v["clean_eligible"] is False
+    assert v["err_text"] is None
     assert v["missing_ip_targets"] == [SILENT]
-    assert v["missing_agent_stopped"] == [SILENT]
-    assert "stopped at the per-IP time limit before port scanning finished: 192.168.0.195" in v["err_text"]
-    assert "has no assessment evidence" not in v["err_text"]
+    assert v["not_assessed_hosts"] == [SILENT]
+    assert v["warnings"] == ["1 of 2 IP(s) not assessed: 192.168.0.195 "
+                             "(time limit reached before port scanning finished)"]
 
 
 def test_no_response_ip_is_named_as_such():
     v = _verdict(host_coverage={LIVE: {"verdict": "observed_unverified"}, SILENT: {"verdict": "no_response"}})
-    assert v["final_status"] == "incomplete"
-    assert "no response, not assessed (host offline or all traffic dropped): 192.168.0.195" in v["err_text"]
+    assert v["final_status"] == "completed"
+    assert "192.168.0.195 (no response (host offline or all traffic dropped))" in v["warnings"][0]
 
 
-def test_finished_ips_reporting_done_still_allow_incomplete():
+def test_finished_ips_reporting_done_also_complete():
     """In a 40-IP job the merged task status can be "done" (finished IPs)."""
     v = _verdict(task_status="done",
                  host_coverage={LIVE: {"verdict": "observed_unverified"}, SILENT: {"verdict": "no_response"}})
-    assert v["final_status"] == "incomplete"
+    assert v["final_status"] == "completed"
 
 
 def test_ip_missing_without_an_agent_explanation_still_fails():

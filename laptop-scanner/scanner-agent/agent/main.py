@@ -1752,6 +1752,16 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         preserved = list(details.get("vulnerabilities") or [])
                         normalized = _skipped_ip_details(host, f"scan_{st}", error=err, task_id=tid)
                         normalized["vulnerabilities"] = preserved
+                        # V1.9.8: the kept rows must be declared too. The synthetic
+                        # skip sets report_result_count=0, so the job uploaded more
+                        # rows than it declared and the central integrity check
+                        # failed the whole job (fcbb90c0: 241 declared, 291 rows -
+                        # the 50 partial findings of the failed IP). Keep the count
+                        # OpenVAS declared for this IP's report; if none was read,
+                        # declare the rows actually kept.
+                        if preserved:
+                            declared = int(ev.get("report_result_count") or 0)
+                            normalized["evidence"]["report_result_count"] = declared or len(preserved)
                         poll_results[idx] = normalized
                         done_details[idx] = normalized
                         finished_idxs.append(idx)

@@ -332,6 +332,8 @@ export interface ScanJobSeveritySummary {
     network_scan_complete?: boolean;
     network_complete_hosts?: string[];
     degraded_hosts?: string[];
+    /** V1.9.8: IPs the agent could not assess; the job still completed with warnings */
+    not_assessed?: string[];
     clean_blockers?: string[];
     /** V1.8.0: real problems that make the job amber */
     warnings?: string[];

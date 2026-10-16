@@ -1819,6 +1819,8 @@ def get_scan_job_severity_summary(
             "network_scan_complete": network_done,
             "network_complete_hosts": network_complete_hosts,
             "degraded_hosts": degraded_hosts,
+            # V1.9.8: IPs the agent could not assess; the job still completed.
+            "not_assessed": list(orch_obj.get("not_assessed_hosts") or []),
             "clean_blockers": [
                 reason for reason, active in (
                     ("Scanner reported plugin errors or timeouts", plugin_error_count > 0),
@@ -1829,13 +1831,14 @@ def get_scan_job_severity_summary(
             ],
             # V1.8.0: real problems (amber) vs. scope notes (neutral). An
             # unauthenticated scan that finished is "Completed", with a note.
-            "warnings": [
+            "warnings": list(orch_obj.get("assessment_warnings") or []) + [
                 reason for reason, active in (
                     ("Scanner reported plugin errors or timeouts", plugin_error_count > 0),
-                    ("Some targets were skipped", skipped_count > 0),
+                    ("Some targets were skipped", skipped_count > 0 and not orch_obj.get("not_assessed_hosts")),
                     ("At least one host's network scan did not finish", bool(degraded_hosts)),
                     ("Some checks reported warnings", bool(orch_obj.get("completed_with_warnings"))
-                     and plugin_error_count == 0 and skipped_count == 0 and not degraded_hosts),
+                     and plugin_error_count == 0 and skipped_count == 0 and not degraded_hosts
+                     and not orch_obj.get("not_assessed_hosts")),
                 ) if active
             ],
             "notes": _assessment_notes(orch_obj, is_edge=is_edge, service_verified=service_verified),

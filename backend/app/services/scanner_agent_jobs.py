@@ -1378,9 +1378,34 @@ def evaluate_edge_ingest_verdict(
         except ValueError:
             key = str(raw_host).strip().casefold()
         agent_stopped[key] = str(cov.get("verdict"))
+    # V1.9.8: an IP the agent explicitly skipped (its scan failed, stalled or was
+    # stopped, with the reason in skipped_hosts) is accounted for as well.
+    skip_reason_by_host: dict[str, str] = {}
+    for item in skipped_details or []:
+        if isinstance(item, dict) and item.get("host"):
+            try:
+                key = str(ipaddress.ip_address(str(item["host"]).strip()))
+            except ValueError:
+                key = str(item["host"]).strip().casefold()
+            skip_reason_by_host[key] = str(item.get("reason") or "skipped")
+    for raw_host in skipped_set or set():
+        try:
+            key = str(ipaddress.ip_address(str(raw_host).strip()))
+        except ValueError:
+            key = str(raw_host).strip().casefold()
+        agent_stopped.setdefault(key, "skipped")
+    for key in skip_reason_by_host:
+        agent_stopped.setdefault(key, "skipped")
     missing_accounted = [t for t in missing_ip_targets if t in agent_stopped]
     missing_unaccounted = [t for t in missing_ip_targets if t not in agent_stopped]
-    coverage_ok = required_count > 0 and target_identity_ok
+    # V1.9.8: one IP that could not be assessed must not fail the other IPs. When
+    # at least one requested IP was assessed and every IP without results is
+    # explained by the agent, the job counts as complete - with a warning that
+    # names those IPs, never clean. Unexplained gaps still fail the job.
+    assessed_requested = [t for t in literal_ip_targets if t in normalized_assessed]
+    accounted_gap_ok = bool(missing_ip_targets) and not missing_unaccounted and bool(assessed_requested)
+    coverage_ok = required_count > 0 and (target_identity_ok or accounted_gap_ok)
+    task_ok = task_ok or (accounted_gap_ok and task_status_norm in {"stopped", "interrupted", "stop requested"})
     scan_timestamps_ok = bool(scan_start and scan_end)
     plugin_health_ok = plugin_error_count == 0
     # With the edge agent requesting rows=-1/min_qod=0, the raw Greenbone
@@ -1446,9 +1471,9 @@ def evaluate_edge_ingest_verdict(
         reasons.append(f"OpenVAS task status is {task_status}")
     if target_count <= 0:
         reasons.append("scan has no active targets")
-    elif required_count > 0 and attempted < required_count and not target_identity_ok:
+    elif required_count > 0 and attempted < required_count and not coverage_ok:
         reasons.append(f"attempted {attempted} of {required_count} reachable target(s)")
-    if required_count > 0 and assessed < required_count and not target_identity_ok:
+    if required_count > 0 and assessed < required_count and not coverage_ok:
         reasons.append(f"assessed {assessed} of {required_count} reachable target(s)")
     if missing_unaccounted:
         reasons.append("OpenVAS report has no assessment evidence for target(s): " + ", ".join(missing_unaccounted))
@@ -1476,6 +1501,17 @@ def evaluate_edge_ingest_verdict(
     if report_read_error:
         reasons.append(f"report read error: {report_read_error}")
 
+    not_assessed_labels = {
+        "no_response": "no response (host offline or all traffic dropped)",
+        "degraded_time_limit": "time limit reached before port scanning finished",
+    }
+    warnings: list[str] = []
+    if missing_accounted:
+        details_txt = ", ".join(
+            f"{t} ({not_assessed_labels.get(agent_stopped.get(t, ''), skip_reason_by_host.get(t, 'skipped by the agent'))})"
+            for t in missing_accounted[:20]
+        )
+        warnings.append(f"{len(missing_accounted)} of {required_count} IP(s) not assessed: {details_txt}")
     final_status = "completed" if verified_complete else "failed"
     # V1.9.0: a partial scan that genuinely collected evidence (the agent hit the
     # runtime cap at ~98% and kept its results) is "incomplete", not "failed".
@@ -1535,6 +1571,8 @@ def evaluate_edge_ingest_verdict(
         "target_identity_ok": target_identity_ok,
         "missing_ip_targets": missing_ip_targets,
         "missing_agent_stopped": missing_accounted,
+        "not_assessed_hosts": missing_accounted,
+        "warnings": warnings,
         "required_count": required_count,
         "scan_timestamps_ok": scan_timestamps_ok,
         "plugin_health_ok": plugin_health_ok,
@@ -1723,7 +1761,8 @@ def ingest_agent_results(
         # but it is not eligible for a "clean/no vulnerabilities" conclusion
         # over the full requested scope.
         "clean_eligible": False,  # No automatic clean verdict from engine state alone.
-        "completed_with_warnings": bool(verified_complete and (plugin_errors > 0 or bool(skipped_details))),
+        "completed_with_warnings": bool(verified_complete and (plugin_errors > 0 or bool(skipped_details)
+                                                                or bool(verdict.get("not_assessed_hosts")))),
         "result_payload_ok": result_payload_ok,
         "report_result_count": result_count,
         "plugin_error_count": plugin_errors,
@@ -1831,9 +1870,15 @@ def ingest_agent_results(
         "message": progress_message,
     }
     orch["assessment_complete"] = verified_complete
-    orch["clean_eligible"] = bool(verified_complete and plugin_health_ok and result_payload_ok and not skipped_details and service_scope_verified)
+    not_assessed = list(verdict.get("not_assessed_hosts") or [])
+    orch["clean_eligible"] = bool(verified_complete and plugin_health_ok and result_payload_ok and not skipped_details
+                                  and not not_assessed and service_scope_verified)
     orch["service_scope_verified"] = service_scope_verified
-    orch["completed_with_warnings"] = bool(verified_complete and (plugin_errors > 0 or bool(skipped_details)))
+    orch["completed_with_warnings"] = bool(verified_complete and (plugin_errors > 0 or bool(skipped_details)
+                                                                  or bool(not_assessed)))
+    # V1.9.8: IPs the agent explained but could not assess (job still completes).
+    orch["not_assessed_hosts"] = not_assessed
+    orch["assessment_warnings"] = list(verdict.get("warnings") or [])
     orch["hosts_attempted"] = attempted
     orch["hosts_assessed"] = assessed
     orch["report_id"] = effective_report_id
