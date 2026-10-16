@@ -290,6 +290,9 @@ services:
     environment:
       CENTRAL_API_URL: ${CENTRAL_API_URL}
       TENANT_SLUG: ${TENANT_SLUG}
+      # V1.10.0: Windows computer name, sent to the central server so each laptop
+      # gets its own scanner record (AGENT_COMPUTER_NAME in .env is the fallback).
+      HOST_COMPUTERNAME: ${COMPUTERNAME:-}
 
       AGENT_TOKEN_FILE: ${AGENT_TOKEN_FILE:-/run/aetheris-agent/agent-token}
       AGENT_INSTANCE_FILE: ${AGENT_INSTANCE_FILE:-/run/aetheris-agent/agent-instance-id}
@@ -368,7 +371,7 @@ services:
       CENTRAL_API_CONNECT_TIMEOUT_SEC: ${CENTRAL_API_CONNECT_TIMEOUT_SEC:-4}
       CENTRAL_RESULT_TIMEOUT_SEC: ${CENTRAL_RESULT_TIMEOUT_SEC:-120}
       PROGRESS_REPORT_INTERVAL_SEC: ${PROGRESS_REPORT_INTERVAL_SEC:-45}
-      AGENT_VERSION: ${AGENT_VERSION:-1.9.8}
+      AGENT_VERSION: ${AGENT_VERSION:-1.10.1}
       # V1.6.6 speed and hang handling (see RELEASE_V1_6_6_FAST_SCAN_AND_HANG_HANDLING.md)
       SCAN_PERFORMANCE: ${SCAN_PERFORMANCE:-fast}
       FAST_CHECKS_READ_TIMEOUT: ${FAST_CHECKS_READ_TIMEOUT:-5}

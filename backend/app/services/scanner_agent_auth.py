@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +15,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal, apply_firm_search_path, bind_firm_schema
-from app.db.sql_helpers import execute, fetchone
+from app.db.sql_helpers import execute, fetchall, fetchone
 from app.models.platform import Firm
 
 bearer = HTTPBearer(auto_error=False)
@@ -59,7 +61,9 @@ def ensure_edge_agent_recovery_columns(db: Session) -> None:
             """ALTER TABLE vuln_scanners
                ADD COLUMN IF NOT EXISTS agent_recovery_token_hash TEXT,
                ADD COLUMN IF NOT EXISTS agent_previous_token_hash TEXT,
-               ADD COLUMN IF NOT EXISTS agent_previous_token_valid_until TIMESTAMPTZ""",
+               ADD COLUMN IF NOT EXISTS agent_previous_token_valid_until TIMESTAMPTZ,
+               ADD COLUMN IF NOT EXISTS agent_computer_name TEXT,
+               ADD COLUMN IF NOT EXISTS agent_instance_id TEXT""",
         )
         db.flush()
     except Exception:
@@ -77,6 +81,207 @@ def is_edge_agent_scanner(row: dict[str, Any] | None) -> bool:
         return True
     url = str(row.get("url") or "").strip().lower()
     return url.startswith("agent://")
+
+
+_log = logging.getLogger(__name__)
+
+
+# --- V1.10.0: which laptop is calling ------------------------------------------
+# The emailed access token identifies a USER, not a laptop: every laptop of that
+# user binds the same token. Agent requests were resolved with "token hash ...
+# LIMIT 1", so all of a user's laptops landed on one scanner record (heartbeats,
+# job claims) and the others stayed "offline" (Laptop-DESKTOP-J19GUGP vs
+# Laptop-NITIN). The agent now also sends its Windows computer name and its
+# per-install instance id; together with the token they pick (or register) the
+# laptop's own scanner record.
+
+def normalize_computer_name(value: Any) -> str:
+    """Windows computer name as sent by the laptop, reduced to safe characters."""
+    return re.sub(r"[^A-Za-z0-9._-]", "", str(value or "").strip())[:63]
+
+
+def _fold(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _names_for(computer: str, wanted_name: str) -> set[str]:
+    names = {_fold(wanted_name)} if _fold(wanted_name) else set()
+    if computer:
+        names.add(_fold(f"Laptop-{computer}"))
+    return names
+
+
+def _another_laptops_auto_name(name: Any, own_names: set[str]) -> bool:
+    """True for "Laptop-<other computer>": that record belongs to a different laptop."""
+    folded = _fold(name)
+    return folded.startswith("laptop-") and folded not in own_names
+
+
+def _legacy_order(row: dict[str, Any]) -> tuple:
+    hb = row.get("last_heartbeat_at")
+    try:
+        ts = -hb.timestamp() if hb is not None else 0.0
+    except AttributeError:
+        ts = 0.0
+    return (0 if hb is not None else 1, ts, _fold(row.get("name")), str(row.get("id")))
+
+
+def pick_laptop_scanner(
+    rows: list[dict[str, Any]],
+    *,
+    computer: str,
+    instance: str,
+    wanted_name: str = "",
+    preferred_id: str = "",
+) -> tuple[dict[str, Any] | None, bool]:
+    """Pick the scanner record of the calling laptop among ``rows``.
+
+    Returns ``(row, claim)``; ``claim`` means the row's laptop identity
+    (computer name / instance id) should be stored. ``(None, False)`` means no
+    record belongs to this laptop yet. Never returns a record already bound to a
+    different computer, nor one named after another laptop ("Laptop-<other>").
+    Without a computer name (agent older than V1.10.0) the previous behaviour is
+    kept, made deterministic: the instance id if known, else the most recently
+    seen record.
+    """
+    if not rows:
+        return None, False
+    comp = _fold(normalize_computer_name(computer))
+    inst = str(instance or "").strip()
+    if not comp:
+        if inst:
+            for row in rows:
+                if str(row.get("agent_instance_id") or "") == inst:
+                    return row, False
+        if preferred_id:
+            for row in rows:
+                if str(row.get("id")) == preferred_id:
+                    return row, False
+        return sorted(rows, key=_legacy_order)[0], False
+
+    own = _names_for(normalize_computer_name(computer), wanted_name)
+    same_computer = [r for r in rows if _fold(r.get("agent_computer_name")) == comp]
+    if same_computer:
+        for row in same_computer:
+            if inst and str(row.get("agent_instance_id") or "") == inst:
+                return row, False
+        row = same_computer[0]
+        return row, bool(inst and str(row.get("agent_instance_id") or "") != inst)
+
+    unbound = [r for r in rows if not _fold(r.get("agent_computer_name"))]
+    if preferred_id:
+        for row in unbound:
+            if str(row.get("id")) == preferred_id and not _another_laptops_auto_name(row.get("name"), own):
+                return row, True
+    for row in unbound:
+        if _fold(row.get("name")) in own:
+            return row, True
+    if inst:
+        for row in unbound:
+            if str(row.get("agent_instance_id") or "") == inst and not _another_laptops_auto_name(row.get("name"), own):
+                return row, True
+    if len(rows) == 1 and unbound and not _another_laptops_auto_name(unbound[0].get("name"), own):
+        # One laptop before V1.10.0, possibly renamed in the UI: keep its record.
+        return unbound[0], True
+    return None, False
+
+
+_TOKEN_MATCH_SQL = """(agent_token_hash = :th
+                      OR agent_recovery_token_hash = :th
+                      OR (agent_previous_token_hash = :th
+                          AND agent_previous_token_valid_until IS NOT NULL
+                          AND agent_previous_token_valid_until > NOW()))"""
+
+
+def resolve_edge_scanner(
+    db: Session,
+    token_hash: str,
+    *,
+    computer: str = "",
+    instance: str = "",
+    wanted_name: str = "",
+) -> dict[str, Any] | None:
+    """Scanner record of the laptop presenting ``token_hash`` (V1.10.0)."""
+    rows = fetchall(
+        db,
+        f"""SELECT * FROM vuln_scanners
+           WHERE {_TOKEN_MATCH_SQL}
+             AND lower(coalesce(connection_mode, 'gmp')) = :mode
+             AND lower(status) = 'active'""",
+        {"th": token_hash, "mode": CONNECTION_MODE_EDGE},
+    )
+    if not rows:
+        return None
+    comp = normalize_computer_name(computer)
+    inst = str(instance or "").strip()[:128]
+    row, claim = pick_laptop_scanner(rows, computer=comp, instance=inst, wanted_name=wanted_name)
+    if row is not None:
+        if claim and comp:
+            execute(
+                db,
+                """UPDATE vuln_scanners
+                      SET agent_computer_name = :comp,
+                          agent_instance_id = COALESCE(NULLIF(:inst, ''), agent_instance_id),
+                          updated_at = NOW()
+                    WHERE id = CAST(:id AS uuid)""",
+                {"comp": comp, "inst": inst, "id": str(row["id"])},
+            )
+            db.commit()
+            row = dict(row, agent_computer_name=comp, agent_instance_id=inst or row.get("agent_instance_id"))
+            _log.info("Edge scanner %s (%s) linked to laptop %s", row.get("name"), row.get("id"), comp)
+        return row
+
+    # A laptop of this token's user that has no scanner record yet: register it
+    # under its own name instead of borrowing another laptop's record. The token
+    # was bound by a signed-in user (bind-client-token), so the laptop holding it
+    # carries that user's authorization, as before.
+    name = (str(wanted_name or "").strip() or f"Laptop-{comp}")[:120]
+    template = rows[0]
+    reuse = fetchone(
+        db,
+        """SELECT * FROM vuln_scanners
+            WHERE lower(name) = lower(:name)
+              AND lower(coalesce(connection_mode, 'gmp')) = :mode
+              AND (coalesce(agent_computer_name, '') = '' OR lower(agent_computer_name) = lower(:comp))
+            ORDER BY created_at
+            LIMIT 1""",
+        {"name": name, "mode": CONNECTION_MODE_EDGE, "comp": comp},
+    )
+    if reuse:
+        execute(
+            db,
+            """UPDATE vuln_scanners
+                  SET agent_token_hash = :th,
+                      agent_token_hint = :hint,
+                      agent_computer_name = :comp,
+                      agent_instance_id = NULLIF(:inst, ''),
+                      status = 'active',
+                      updated_at = NOW()
+                WHERE id = CAST(:id AS uuid)""",
+            {"th": token_hash, "hint": template.get("agent_token_hint"), "comp": comp, "inst": inst,
+             "id": str(reuse["id"])},
+        )
+        db.commit()
+        _log.info("Edge scanner %s (%s) re-linked to laptop %s", reuse.get("name"), reuse.get("id"), comp)
+        return fetchone(db, "SELECT * FROM vuln_scanners WHERE id = CAST(:id AS uuid)", {"id": str(reuse["id"])})
+    from app.services.scanner_credentials import ensure_scanner_role_column
+
+    ensure_scanner_role_column(db)
+    created = fetchone(
+        db,
+        """INSERT INTO vuln_scanners
+             (name, url, edition, api_key_ref, connection_mode, scanner_role,
+              agent_token_hash, agent_token_hint, agent_computer_name, agent_instance_id)
+           VALUES (:name, :url, 'openvas', NULL, :mode, :role, :th, :hint, :comp, NULLIF(:inst, ''))
+           RETURNING *""",
+        {"name": name, "url": EDGE_AGENT_URL, "mode": CONNECTION_MODE_EDGE,
+         "role": str(template.get("scanner_role") or "portable"), "th": token_hash,
+         "hint": template.get("agent_token_hint"), "comp": comp, "inst": inst},
+    )
+    db.commit()
+    _log.warning("Registered new laptop scanner %s for computer %s (same access token as %s)",
+                 name, comp, template.get("name"))
+    return created
 
 
 @dataclass
@@ -117,6 +322,9 @@ def resolve_firm_schema(db: Session, tenant_slug: str) -> tuple[str, str]:
 def get_edge_agent(
     creds: HTTPAuthorizationCredentials | None = Depends(bearer),
     x_tenant: str | None = Header(default=None, alias="X-Tenant"),
+    x_agent_instance: str | None = Header(default=None, alias="X-Aetheris-Agent-Instance"),
+    x_agent_computer: str | None = Header(default=None, alias="X-Aetheris-Agent-Computer"),
+    x_agent_name: str | None = Header(default=None, alias="X-Aetheris-Agent-Name"),
 ) -> EdgeAgentContext:
     if not creds or not creds.credentials:
         raise HTTPException(
@@ -132,18 +340,14 @@ def get_edge_agent(
         ensure_edge_agent_recovery_columns(db)
         apply_firm_search_path(db, schema_name)
         token_hash = hash_agent_token(creds.credentials)
-        row = fetchone(
+        # V1.10.0: the same emailed token may be bound on several laptops of one
+        # user; pick the calling laptop's own record (or register it).
+        row = resolve_edge_scanner(
             db,
-            """SELECT * FROM vuln_scanners
-               WHERE (agent_token_hash = :th
-                      OR agent_recovery_token_hash = :th
-                      OR (agent_previous_token_hash = :th
-                          AND agent_previous_token_valid_until IS NOT NULL
-                          AND agent_previous_token_valid_until > NOW()))
-                 AND lower(coalesce(connection_mode, 'gmp')) = :mode
-                 AND lower(status) = 'active'
-               LIMIT 1""",
-            {"th": token_hash, "mode": CONNECTION_MODE_EDGE},
+            token_hash,
+            computer=x_agent_computer or "",
+            instance=x_agent_instance or "",
+            wanted_name=x_agent_name or "",
         )
         if not row:
             raise HTTPException(

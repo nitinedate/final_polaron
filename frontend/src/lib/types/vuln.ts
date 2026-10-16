@@ -11,6 +11,8 @@ export interface Scanner {
   agent_status_detail?: string | null;
   openvas_ready_at?: string | null;
   agent_token_hint?: string | null;
+  /** V1.10.0: Windows computer name of the laptop this scanner record belongs to */
+  agent_computer_name?: string | null;
   last_heartbeat_at?: string | null;
   plugin_feed_updated_at: string | null;
   created_at: string;

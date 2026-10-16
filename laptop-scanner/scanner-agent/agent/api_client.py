@@ -269,6 +269,12 @@ class CentralApi:
             "X-Aetheris-Agent-Instance": self.agent_instance_id,
             "Content-Type": "application/json",
         }
+        # V1.10.0: tell the central server which laptop this is (computer name,
+        # configured scanner name), so laptops sharing one emailed token get
+        # their own scanner records.
+        from agent.laptop_identity import identity_headers
+
+        self.headers.update(identity_headers(self.agent_instance_id))
         self._token = token
         self.verify = verify_tls
         # WAN / Nginx gateway links often need a longer read window than LAN.

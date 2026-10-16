@@ -720,6 +720,32 @@ function Get-BootstrapComposeFile([string]$Root) {
 
 $script:AetherisBootstrapImageReady = $false
 
+function Get-AgentInstanceId {
+    # V1.10.0: the agent's per-install id (same file the agent container uses via
+    # ./scanner-agent/runtime). A folder copied from another PC carries that PC's
+    # id; it is replaced so the central server never confuses the two laptops.
+    param([string]$Root, [string]$Computer)
+    $dir = Join-Path $Root 'scanner-agent\runtime'
+    $idFile = Join-Path $dir 'agent-instance-id'
+    $ownerFile = Join-Path $dir 'agent-instance-computer'
+    $id = ''
+    if (Test-Path -LiteralPath $idFile) { $id = ([string](Get-Content -LiteralPath $idFile -Raw -ErrorAction SilentlyContinue)).Trim() }
+    $owner = ''
+    if (Test-Path -LiteralPath $ownerFile) { $owner = ([string](Get-Content -LiteralPath $ownerFile -Raw -ErrorAction SilentlyContinue)).Trim() }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    if ($id -and $owner -and $Computer -and ($owner -ne $Computer)) {
+        Write-Host ("[INFO] This folder was set up on {0}; creating a new agent id for {1}." -f $owner, $Computer) -ForegroundColor Yellow
+        $id = ''
+    }
+    if (-not $id) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $id = [guid]::NewGuid().ToString()
+        [IO.File]::WriteAllText($idFile, $id + "`n", $utf8)
+    }
+    if ($Computer -and ($owner -ne $Computer)) { [IO.File]::WriteAllText($ownerFile, $Computer + "`n", $utf8) }
+    return $id
+}
+
 function Invoke-DockerBootstrapJson {
     param(
         [string]$Root,
@@ -730,6 +756,8 @@ function Invoke-DockerBootstrapJson {
         [string]$ScannerName = '',
         [string]$ScannerRole = 'portable',
         [string]$ScannerId = '',
+        [string]$ComputerName = '',
+        [string]$AgentInstanceId = '',
         [string]$InputSecret = ''
     )
     $compose = Get-BootstrapComposeFile $Root
@@ -761,6 +789,8 @@ function Invoke-DockerBootstrapJson {
     if ($Mode -eq 'bind') {
         $args += @('--scanner-name',$ScannerName,'--scanner-role',$ScannerRole)
         if (-not [string]::IsNullOrWhiteSpace($ScannerId)) { $args += @('--scanner-id',$ScannerId) }
+        if (-not [string]::IsNullOrWhiteSpace($ComputerName)) { $args += @('--computer-name',$ComputerName) }
+        if (-not [string]::IsNullOrWhiteSpace($AgentInstanceId)) { $args += @('--agent-instance-id',$AgentInstanceId) }
     }
 
     $old = $ErrorActionPreference
@@ -873,9 +903,13 @@ function Sync-LaptopAgentToken {
     $name = ([string]$EnvMap['SCANNER_NAME']).Trim()
     if (-not $name) { $name = "Laptop-$computer" }
     $sid = ([string]$EnvMap['SCANNER_ID']).Trim()
+    # V1.10.0: identify this laptop to the central server (computer name + agent id).
+    $instanceId = Get-AgentInstanceId -Root $Root -Computer $computer
+    Set-DotEnvValue -Path $EnvPath -Key 'AGENT_COMPUTER_NAME' -Value $computer
+    $EnvMap['AGENT_COMPUTER_NAME'] = $computer
 
-    Write-Host ("[INFO] Signing in and binding scanner '{0}' using Docker/OpenSSL." -f $name)
-    $bound = Invoke-DockerBootstrapJson -Root $Root -Mode 'bind' -Base $central -Tenant $tenant -VerifyTls $verifyTls -ScannerName $name -ScannerRole $role -ScannerId $sid -InputSecret $clientToken
+    Write-Host ("[INFO] Signing in and binding scanner '{0}' for computer {1} using Docker/OpenSSL." -f $name, $computer)
+    $bound = Invoke-DockerBootstrapJson -Root $Root -Mode 'bind' -Base $central -Tenant $tenant -VerifyTls $verifyTls -ScannerName $name -ScannerRole $role -ScannerId $sid -ComputerName $computer -AgentInstanceId $instanceId -InputSecret $clientToken
     $clientToken = $null
     if (-not [bool]$bound.ok) {
         $detail = Format-BootstrapFailure $bound

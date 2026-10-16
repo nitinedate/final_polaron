@@ -89,9 +89,12 @@ def _request_json(
     bearer: str | None = None,
     body: dict[str, Any] | None = None,
     follow_redirects: bool = False,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, str, dict[str, Any] | None, str]:
+    headers = _headers(tenant, bearer)
+    headers.update(extra_headers or {})
     with _client(verify_tls, follow_redirects) as client:
-        response = client.request(method, url, headers=_headers(tenant, bearer), json=body)
+        response = client.request(method, url, headers=headers, json=body)
         text = response.text
         data: dict[str, Any] | None = None
         if text:
@@ -313,6 +316,8 @@ def bind(
     scanner_role: str,
     scanner_id: str,
     verify_tls: bool,
+    computer_name: str = "",
+    agent_instance_id: str = "",
 ) -> dict[str, Any]:
     if not client_token.strip():
         return {"ok": False, "stage": "input", "error": "Access token was empty"}
@@ -357,6 +362,16 @@ def bind(
     }
     if scanner_id:
         body["scanner_id"] = scanner_id
+    # V1.10.0: identify this laptop so the central server binds its own record.
+    from agent.laptop_identity import clean_computer_name, identity_headers
+
+    computer = clean_computer_name(computer_name)
+    instance = str(agent_instance_id or "").strip()[:128]
+    if computer:
+        body["computer_name"] = computer
+    if instance:
+        body["agent_instance_id"] = instance
+    laptop_headers = identity_headers(instance, scanner_name=scanner_name, computer=computer)
     try:
         status, text, data, _ = _request_json(
             "POST",
@@ -398,6 +413,7 @@ def bind(
             bearer=agent_token,
             body={},
             follow_redirects=False,
+            extra_headers=laptop_headers,
         )
     except Exception as exc:
         return {"ok": False, "stage": "heartbeat", "error": _exception_text(exc), "canonical_url": canonical}
@@ -512,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     p_bind.add_argument("--scanner-name", required=True)
     p_bind.add_argument("--scanner-role", default="portable")
     p_bind.add_argument("--scanner-id", default="")
+    p_bind.add_argument("--computer-name", default="")
+    p_bind.add_argument("--agent-instance-id", default="")
 
     args = parser.parse_args(argv)
     verify = _parse_bool(args.verify_tls)
@@ -530,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.scanner_role,
                 args.scanner_id,
                 verify,
+                computer_name=args.computer_name,
+                agent_instance_id=args.agent_instance_id,
             )
         return _emit(payload, 0 if payload.get("ok") else 2)
     except Exception as exc:

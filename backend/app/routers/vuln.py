@@ -97,6 +97,9 @@ class BindClientTokenIn(BaseModel):
     name: str | None = None
     scanner_role: str | None = None
     scanner_id: str | None = None
+    # V1.10.0: which laptop is binding (Windows computer name, agent install id)
+    computer_name: str | None = None
+    agent_instance_id: str | None = None
 
 
 class PolicyCreate(BaseModel):
@@ -582,6 +585,8 @@ def bind_scanner_client_token(
         EDGE_AGENT_URL,
         ensure_edge_agent_recovery_columns,
         hash_agent_token,
+        normalize_computer_name,
+        pick_laptop_scanner,
         token_hint,
     )
     from app.services.scanner_credentials import (
@@ -609,18 +614,31 @@ def bind_scanner_client_token(
     token_hash = hash_agent_token(token)
     hint = token_hint(token)
     role = (body.scanner_role or "").strip().lower() or SCANNER_ROLE_PORTABLE
-    name = (body.name or "").strip() or "Laptop"
+    computer = normalize_computer_name(body.computer_name)
+    instance = (body.agent_instance_id or "").strip()[:128]
+    name = (body.name or "").strip() or (f"Laptop-{computer}" if computer else "Laptop")
     rows = fetchall(db, "SELECT * FROM vuln_scanners ORDER BY name")
     chosen = None
     want_id = (body.scanner_id or "").strip()
-    if want_id:
-        chosen = next((r for r in rows if str(r.get("id")) == want_id), None)
-    if chosen is None:
-        chosen = next((r for r in rows if str(r.get("name") or "") == name), None)
-    if chosen is None:
-        edge = [r for r in rows if is_edge_agent_scanner(r)]
-        if len(edge) == 1:
-            chosen = edge[0]
+    if computer:
+        # V1.10.0: bind this laptop's own record. A SCANNER_ID copied from another
+        # laptop's .env, or the only existing laptop record, is no longer taken
+        # over when it belongs to a different computer.
+        candidates = [r for r in rows if is_edge_agent_scanner(r)]
+        if want_id and not any(str(r.get("id")) == want_id for r in candidates):
+            candidates += [r for r in rows if str(r.get("id")) == want_id]
+        chosen, _claim = pick_laptop_scanner(
+            candidates, computer=computer, instance=instance, wanted_name=name, preferred_id=want_id
+        )
+    else:
+        if want_id:
+            chosen = next((r for r in rows if str(r.get("id")) == want_id), None)
+        if chosen is None:
+            chosen = next((r for r in rows if str(r.get("name") or "") == name), None)
+        if chosen is None:
+            edge = [r for r in rows if is_edge_agent_scanner(r)]
+            if len(edge) == 1:
+                chosen = edge[0]
     if chosen is not None:
         execute(
             db,
@@ -629,6 +647,8 @@ def bind_scanner_client_token(
                    url = :url,
                    agent_token_hash = :th,
                    agent_token_hint = :hint,
+                   agent_computer_name = COALESCE(NULLIF(:comp, ''), agent_computer_name),
+                   agent_instance_id = COALESCE(NULLIF(:inst, ''), agent_instance_id),
                    updated_at = NOW()
                WHERE id = CAST(:id AS uuid)""",
             {
@@ -636,6 +656,8 @@ def bind_scanner_client_token(
                 "url": EDGE_AGENT_URL,
                 "th": token_hash,
                 "hint": hint,
+                "comp": computer,
+                "inst": instance,
                 "id": str(chosen["id"]),
             },
         )
@@ -659,8 +681,9 @@ def bind_scanner_client_token(
     row = fetchone(
         db,
         """INSERT INTO vuln_scanners
-           (name, url, edition, api_key_ref, connection_mode, scanner_role, agent_token_hash, agent_token_hint)
-           VALUES (:name, :url, 'openvas', NULL, :mode, :role, :th, :hint)
+           (name, url, edition, api_key_ref, connection_mode, scanner_role, agent_token_hash, agent_token_hint,
+            agent_computer_name, agent_instance_id)
+           VALUES (:name, :url, 'openvas', NULL, :mode, :role, :th, :hint, NULLIF(:comp, ''), NULLIF(:inst, ''))
            RETURNING *""",
         {
             "name": name,
@@ -669,6 +692,8 @@ def bind_scanner_client_token(
             "role": role,
             "th": token_hash,
             "hint": hint,
+            "comp": computer,
+            "inst": instance,
         },
     )
     db.commit()

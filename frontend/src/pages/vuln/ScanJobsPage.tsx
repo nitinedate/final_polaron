@@ -1724,7 +1724,11 @@ function LaunchModal({
               const stale = scannerIsOffline(s);
               return (
                 <option key={s.id} value={s.id}>
-                  {s.name} [{ROLE_SHORT[role] || role}
+                  {s.name}
+                  {s.agent_computer_name && !s.name.toLowerCase().includes(s.agent_computer_name.toLowerCase())
+                    ? ` (${s.agent_computer_name})`
+                    : ""}{" "}
+                  [{ROLE_SHORT[role] || role}
                   {stale ? ", offline" : isEdgeAgentScanner(s) ? ", online" : ""}
                   ] — {s.edition || "openvas"}
                 </option>

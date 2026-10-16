@@ -86,6 +86,8 @@ def row_scanner(r: dict[str, Any]) -> dict[str, Any]:
         "scanner_role": role,
         "online": online,
         "agent_token_hint": r.get("agent_token_hint"),
+        # V1.10.0: the laptop this scanner record belongs to (Windows computer name)
+        "agent_computer_name": r.get("agent_computer_name"),
         "openvas_ready": r.get("openvas_ready"),
         "agent_status_detail": r.get("agent_status_detail"),
         "openvas_ready_at": str(r.get("openvas_ready_at")) if r.get("openvas_ready_at") else None,

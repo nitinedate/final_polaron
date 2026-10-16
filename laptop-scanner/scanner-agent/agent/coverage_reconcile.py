@@ -64,9 +64,12 @@ def reconcile_host_observations(
             # V1.8.0: an observation, not a scan failure. It no longer turns the
             # job amber; the UI shows it as a note next to the verdict.
             notes = list(coverage.get("notes") or [])
+            # V1.10.1: only the policy's ports were probed; say so, and that
+            # credentials need SMB/SSH reachable first.
             notes.append(
-                "No TCP port answered at all: a firewall dropped every probe or the host is offline. "
-                "To assess it, allow the scanner through the host firewall or add credentials"
+                f"None of the {total} TCP ports in this policy's port list answered (a firewall dropped them, "
+                "or the host is offline). Ports outside the list were not probed: an all-ports policy "
+                "(Advanced) may find services there. Credentials need SMB 445 / SSH 22 reachable first"
             )
             coverage["notes"] = notes[-20:]
         return details

@@ -1673,6 +1673,36 @@ def ingest_agent_results(
     result_count = _nonneg_int(report_result_count)
     assessed_list = sorted({str(x).strip() for x in (assessed_hosts or []) if str(x).strip()})
 
+    # V1.9.9: a Resume rescans only the IPs the earlier attempt did not assess (the
+    # claim sends them as assessed_hosts), so this upload covers only the rest.
+    # Count the earlier attempt's assessed IPs (and keep their per-IP coverage)
+    # instead of calling them "missing" - field job fcbb90c0 was failed with
+    # "assessed 1 of 10" after Resume although the first attempt had assessed 9.
+    # Their findings are already stored (findings are upserted, never deleted).
+    # A fresh-OpenVAS retry clears assessed_hosts first, so nothing carries over.
+    prior_orch = _orch(job)
+    earlier_assessed: list[str] = []
+    if prior_orch.get("edge_resume_requested"):
+        target_lookup = {str(t).strip() for t in target_list}
+        current = set(assessed_list)
+        for raw in prior_orch.get("assessed_hosts") or []:
+            host = str(raw or "").strip()
+            if host and host in target_lookup and host not in current:
+                earlier_assessed.append(host)
+        if earlier_assessed:
+            assessed_list = sorted(current | set(earlier_assessed))
+            assessed = max(assessed, len(assessed_list))
+            attempted = max(attempted, assessed)
+            prior_cov = prior_orch.get("host_coverage") if isinstance(prior_orch.get("host_coverage"), dict) else {}
+            host_coverage = dict(host_coverage or {})
+            for host in earlier_assessed:
+                if host not in host_coverage and isinstance(prior_cov.get(host), dict):
+                    host_coverage[host] = prior_cov[host]
+            log.info(
+                "Edge job %s resumed: counting %d IP(s) assessed by the earlier attempt (%s)",
+                job_id, len(earlier_assessed), ", ".join(earlier_assessed[:10]),
+            )
+
     skipped_details: list[dict[str, Any]] = []
     skipped_set: set[str] = set()
     for item in skipped_hosts or []:

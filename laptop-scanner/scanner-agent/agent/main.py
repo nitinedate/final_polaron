@@ -255,6 +255,21 @@ def _result_payload(
     skipped_hosts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     evidence = dict(details.get("evidence") or {})
+    if status == "completed":
+        # V1.10.1: every target silent and none on this laptop's network means the
+        # laptop could not reach them - fail with the reason instead of "completed".
+        from agent.reach_guard import unreachable_network_error
+
+        try:
+            from agent.lan_fingerprint import capture_lan_fingerprint
+
+            lan_fp = capture_lan_fingerprint()
+        except Exception:
+            lan_fp = {}
+        unreachable = unreachable_network_error(evidence, lan_fp)
+        if unreachable:
+            log.error("Job result marked failed: %s", unreachable)
+            status, error, partial, partial_reason = "failed", unreachable, False, None
     raw_task = str(
         evidence.get("task_status") or details.get("gmp_status") or ""
     ).strip().lower()
@@ -328,14 +343,24 @@ def _merge_chunk_details(
     *,
     all_targets: list[str],
     skipped_hosts: list[dict[str, Any]] | None = None,
+    prior_assessed: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Merge per-chunk OpenVAS poll payloads into one upload-shaped details dict."""
+    """Merge per-chunk OpenVAS poll payloads into one upload-shaped details dict.
+
+    ``prior_assessed`` (V1.9.9): IPs of this job that an earlier attempt already
+    assessed. A Resume scans only the remaining IPs, so without them a resumed
+    job reported "assessed 1 of 10" and the nine finished IPs as missing
+    (field job fcbb90c0). Their findings were uploaded by that earlier attempt.
+    """
     import ipaddress
 
     vulns: list[dict[str, Any]] = []
     seen: set[str] = set()
     seen_report_ids: set[str] = set()
     assessed: set[str] = set()
+    target_set = {str(t).strip() for t in all_targets}
+    prior_kept = sorted({str(h).strip() for h in (prior_assessed or []) if str(h).strip() in target_set})
+    assessed.update(prior_kept)
     plugin_errors: list[Any] = []
     host_coverage: dict[str, dict[str, Any]] = {}
     service_coverage: dict[str, Any] = {}
@@ -499,6 +524,7 @@ def _merge_chunk_details(
             "hosts_attempted": len(all_targets),
             "hosts_assessed": len(normalized_assessed) if normalized_assessed else 0,
             "assessed_hosts": sorted(assessed),
+            "assessed_in_earlier_attempt": prior_kept,
             "skipped_hosts": skipped,
             "missing_ip_targets": missing,
             "report_result_count": result_count,
@@ -1845,7 +1871,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                 live.append((chunk, {"status": "running", "progress": 0, "vulnerabilities": [], "evidence": {}}))
 
         merged = _merge_chunk_details(
-            live, all_targets=selected_targets, skipped_hosts=skipped_hosts
+            live, all_targets=selected_targets, skipped_hosts=skipped_hosts,
+                prior_assessed=list(job.get("assessed_hosts") or []),
         )
         # Keep running skip list in sync when merge eliminates more unreachable hosts.
         skipped_hosts = list((merged.get("evidence") or {}).get("skipped_hosts") or skipped_hosts)
@@ -1978,7 +2005,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             # Re-merge only finished chunks for upload.
             final_live = [(chunks[i], done_details[i]) for i in range(len(chunks))]
             merged = _merge_chunk_details(
-                final_live, all_targets=selected_targets, skipped_hosts=skipped_hosts
+                final_live, all_targets=selected_targets, skipped_hosts=skipped_hosts,
+                prior_assessed=list(job.get("assessed_hosts") or []),
             )
             skipped_hosts = list((merged.get("evidence") or {}).get("skipped_hosts") or skipped_hosts)
             status = merged["status"]
@@ -2078,7 +2106,8 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                         )
                     )
             merged = _merge_chunk_details(
-                final_live, all_targets=selected_targets, skipped_hosts=skipped_hosts
+                final_live, all_targets=selected_targets, skipped_hosts=skipped_hosts,
+                prior_assessed=list(job.get("assessed_hosts") or []),
             )
             # V1.9.0: the runtime cap often fires at 98% on a nearly-finished task
             # that OpenVAS left in "stopped" (a slow NVT at the tail, or the
