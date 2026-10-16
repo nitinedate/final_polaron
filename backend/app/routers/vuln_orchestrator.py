@@ -202,21 +202,66 @@ async def import_vuln_report_file(
     return import_solution_csv(db, case_id=case_id, csv_text=text)
 
 
+@router.get("/api/vuln/gap-merge/jobs")
+def list_gap_merge_jobs(
+    from_date: str | None = Query(None, description="Optional YYYY-MM-DD (Asia/Kolkata), scan start day."),
+    to_date: str | None = Query(None, description="Optional YYYY-MM-DD (Asia/Kolkata), scan start day."),
+    limit: int | None = Query(None, ge=1, le=200, description="Default 20 without dates, 200 with dates."),
+    db: Session = Depends(firm_db),
+    current: CurrentUser = Depends(require_firm_permission("vuln:read")),
+):
+    """V1.10.6: finished scan jobs that can be merged into one gap report."""
+    _require_vuln_module()
+    from app.services.gap_assessment_report import ensure_gap_site_column
+    from app.services.gap_merge_jobs import MergeDateError, list_merge_job_candidates
+
+    ensure_gap_site_column(db)
+    try:
+        return list_merge_job_candidates(db, from_date=from_date, to_date=to_date, limit=limit)
+    except MergeDateError as exc:
+        raise HTTPException(status_code=400, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+
+def _uuid_list(raw: str | None, label: str) -> list[str]:
+    out: list[str] = []
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(str(uuid.UUID(part)))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": {
+                "code": "merge_invalid", "message": f"{label} must be UUIDs"}}) from exc
+    return out
+
+
 @router.get("/api/cases/gap-report/merged.pdf")
 def export_merged_gap_report_pdf(
-    case_ids: str = Query(
-        ...,
+    case_ids: str | None = Query(
+        None,
         description="Comma-separated case UUIDs (2+). Same findings append IPs; different findings stay separate.",
+    ),
+    job_ids: str | None = Query(
+        None,
+        description="V1.10.6: comma-separated scan job UUIDs (2+), from one case or several. Used instead of case_ids.",
     ),
     llm: str | None = None,
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("vuln:read")),
 ):
     _require_vuln_module()
-    ids = [p.strip() for p in case_ids.split(",") if p.strip()]
+    jobs = _uuid_list(job_ids, "job_ids")
+    ids = [p.strip() for p in (case_ids or "").split(",") if p.strip()]
+    if not jobs and not ids:
+        raise HTTPException(status_code=400, detail={"error": {
+            "code": "merge_invalid", "message": "Pass job_ids (or case_ids) with at least two entries"}})
     use_llm = str(llm or "").strip().lower() in {"1", "true", "yes", "on"}
     try:
-        data, media_type, filename = export_merged_gap_report(db, ids, fmt="pdf", use_llm=use_llm)
+        if jobs:
+            data, media_type, filename = export_merged_gap_report(db, fmt="pdf", use_llm=use_llm, job_ids=jobs)
+        else:
+            data, media_type, filename = export_merged_gap_report(db, ids, fmt="pdf", use_llm=use_llm)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,

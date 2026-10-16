@@ -55,6 +55,31 @@ export type VulnDashboardLayer = {
   export?: Record<string, unknown>;
 };
 
+/** V1.10.6: one finished scan job that can be merged into a gap report. */
+export interface GapMergeJobCandidate {
+  job_id: string;
+  case_id: string;
+  case_title?: string | null;
+  case_number?: string | null;
+  status: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at?: string | null;
+  target_count: number;
+  severity_counts: { critical: number; high: number; medium: number; low: number; info: number };
+  day_label: string;
+  gap_details?: {
+    client_name?: string | null;
+    branch_locations?: string | null;
+    contact_person?: string | null;
+    date_of_visit?: string | null;
+    author?: string | null;
+    document_version?: string | null;
+    num_endpoints?: string | null;
+    geographic_locations?: string | null;
+  };
+}
+
 /** V1.10.3: query/filename helpers for per-job reports (empty = whole case). */
 function jobQuery(scanJobId?: string | null): Record<string, string> | undefined {
   return scanJobId ? { scan_job_id: scanJobId } : undefined;
@@ -335,6 +360,31 @@ export const vulnApi = {
     ),
 
   /** Merge 2+ case gap reports: identical findings append IPs; different findings stay separate. */
+  /** V1.10.6: finished scan jobs (any case with a saved site overview), newest first. */
+  listGapMergeJobCandidates: (query?: { from_date?: string; to_date?: string; limit?: number }) =>
+    api.get<{
+      items: GapMergeJobCandidate[];
+      total: number;
+      total_matching?: number;
+      has_more?: boolean;
+      limit?: number;
+      filtered?: boolean;
+      from_date?: string | null;
+      to_date?: string | null;
+    }>("/api/vuln/gap-merge/jobs", query),
+
+  /** V1.10.6: merge the gap reports of 2+ scan jobs (one case or several). */
+  exportMergedJobsGapReportPdf: (jobIds: string[], query?: { llm?: boolean }) =>
+    api.download(
+      `/api/cases/gap-report/merged.pdf`,
+      `gap-assessment-merged-${jobIds.length}-jobs.pdf`,
+      {
+        job_ids: jobIds.join(","),
+        ...(query?.llm ? { llm: "1" } : {}),
+      },
+      240_000,
+    ),
+
   exportMergedGapReportPdf: (caseIds: string[], query?: { llm?: boolean }) =>
     api.download(
       `/api/cases/gap-report/merged.pdf`,

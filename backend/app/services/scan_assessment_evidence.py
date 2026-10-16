@@ -348,7 +348,7 @@ def load_case_scan_assessment(db, case_id: str, scan_job_id: str | None = None) 
     }
 
 
-def merge_scan_assessments(items: list[dict[str, Any]]) -> dict[str, Any]:
+def merge_scan_assessments(items: list[dict[str, Any]], *, unit: str = "case") -> dict[str, Any]:
     if not items:
         return {
             "state": "unverified",
@@ -369,7 +369,7 @@ def merge_scan_assessments(items: list[dict[str, Any]]) -> dict[str, Any]:
             "verified": False,
             "clean_eligible": False,
             "message": (
-                f"Merged assessment contains {len(bad)} unverified/incomplete case(s); "
+                f"Merged assessment contains {len(bad)} unverified/incomplete {unit}(s); "
                 "a clean conclusion is not permitted."
             ),
             "target_count": target_count,
@@ -390,7 +390,7 @@ def merge_scan_assessments(items: list[dict[str, Any]]) -> dict[str, Any]:
             "verified": True,
             "clean_eligible": False,
             "message": (
-                f"Assessment coverage verified across all cases - {assessed} host(s) assessed, "
+                f"Assessment coverage verified across all {unit}s - {assessed} host(s) assessed, "
                 f"with {warning_count} plugin/scanner warning(s). A clean zero-finding conclusion is not permitted."
             ),
             "target_count": target_count,
@@ -404,7 +404,7 @@ def merge_scan_assessments(items: list[dict[str, Any]]) -> dict[str, Any]:
         "state": "verified",
         "verified": True,
         "clean_eligible": True,
-        "message": f"Assessment evidence verified across all cases - {assessed} host(s) assessed.",
+        "message": f"Assessment evidence verified across all {unit}s - {assessed} host(s) assessed.",
         "target_count": target_count,
         "hosts_attempted": attempted,
         "hosts_assessed": assessed,

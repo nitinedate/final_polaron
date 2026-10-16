@@ -4,7 +4,8 @@ import clsx from "clsx";
 import { Badge, Button, Card, Field, Input, PageHeader, Select, Spinner } from "../../components/ui";
 import { vulnApi } from "../../lib/vulnApi";
 import { useToast } from "../../lib/toast";
-import type { Case, GapMergeCandidate } from "../../lib/types/forensic";
+import type { Case } from "../../lib/types/forensic";
+import type { GapMergeJobCandidate } from "../../lib/vulnApi";
 import type { ScanJob } from "../../lib/types/vuln";
 
 /** V1.10.3: "" in the job selector means every job of the case. */
@@ -136,7 +137,8 @@ function FieldGroupPanel({ children, className }: { children: ReactNode; classNa
 export function ReportsExportPage() {
   const toast = useToast();
   const [cases, setCases] = useState<Case[]>([]);
-  const [mergeCandidates, setMergeCandidates] = useState<GapMergeCandidate[]>([]);
+  // V1.10.6: the merge picks scan jobs (one case can hold several), not cases.
+  const [mergeCandidates, setMergeCandidates] = useState<GapMergeJobCandidate[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState("");
   const [jobs, setJobs] = useState<ScanJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
@@ -151,7 +153,7 @@ export function ReportsExportPage() {
   const [gapExporting, setGapExporting] = useState<"pdf" | "docx" | "merged" | null>(null);
   const [savingIntake, setSavingIntake] = useState(false);
   const [pipeline, setPipeline] = useState<Array<{ engine: string; role: string }>>([]);
-  const [mergeCaseIds, setMergeCaseIds] = useState<string[]>([]);
+  const [mergeJobIds, setMergeJobIds] = useState<string[]>([]);
   // V1.10.4: both dates are optional and editable. No dates = the latest 20 reports.
   const [mergeFromDate, setMergeFromDate] = useState("");
   const [mergeToDate, setMergeToDate] = useState("");
@@ -187,7 +189,7 @@ export function ReportsExportPage() {
       const query: { from_date?: string; to_date?: string } = {};
       if (mergeFromDate) query.from_date = mergeFromDate;
       if (mergeToDate) query.to_date = mergeToDate;
-      const mergeRes = await vulnApi.listGapMergeCandidates(query);
+      const mergeRes = await vulnApi.listGapMergeJobCandidates(query);
       if (seq !== mergeRequest.current) return; // a newer date choice is already loading
       const items = mergeRes.items || [];
       setMergeCandidates(items);
@@ -197,7 +199,7 @@ export function ReportsExportPage() {
         limit: mergeRes.limit ?? 20,
         filtered: Boolean(mergeRes.filtered ?? (mergeFromDate || mergeToDate)),
       });
-      setMergeCaseIds((prev) => prev.filter((id) => items.some((c) => c.id === id)));
+      setMergeJobIds((prev) => prev.filter((id) => items.some((c) => c.job_id === id)));
     } catch {
       if (seq === mergeRequest.current) setMergeCandidates([]);
     } finally {
@@ -394,22 +396,22 @@ export function ReportsExportPage() {
     }
   }
 
-  function toggleMergeCase(caseId: string) {
-    setMergeCaseIds((prev) =>
-      prev.includes(caseId) ? prev.filter((id) => id !== caseId) : [...prev, caseId],
+  function toggleMergeJob(jobId: string) {
+    setMergeJobIds((prev) =>
+      prev.includes(jobId) ? prev.filter((id) => id !== jobId) : [...prev, jobId],
     );
   }
 
   async function exportMergedGap() {
-    const ids = Array.from(new Set(mergeCaseIds));
+    const ids = Array.from(new Set(mergeJobIds));
     if (ids.length < 2) {
-      toast.error("Select at least two cases to merge");
+      toast.error("Select at least two scan jobs to merge");
       return;
     }
     setGapExporting("merged");
     try {
-      await vulnApi.exportMergedGapReportPdf(ids);
-      toast.success("Merged Gap Assessment Report downloaded");
+      await vulnApi.exportMergedJobsGapReportPdf(ids);
+      toast.success(`Merged Gap Assessment Report downloaded (${ids.length} scan jobs)`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Merged gap report export failed";
       toast.error(msg.includes("timeout") ? "Merge timed out — try again or disable LLM enrichment." : msg);
@@ -830,8 +832,10 @@ export function ReportsExportPage() {
                 <section className="border-t border-ink-100 pt-6">
                   <SectionHeading>Merge gap reports</SectionHeading>
                   <p className="mt-2 max-w-3xl text-sm text-ink-600">
-                    Cases with a saved site overview appear here, newest first. Without dates the latest 20
-                    are listed; set From and/or To to search a date range (case creation date). Identical findings are combined with IP addresses appended by comma; different
+                    Finished scan jobs appear here, newest first, from every case with a saved site overview.
+                    Pick two or more: several jobs of one case (re-scans, other network segments) or jobs from
+                    different cases. Without dates the latest 20 jobs are listed; set From and/or To to search by
+                    scan date. Identical findings are combined with IP addresses appended by comma; different
                     findings stay separate in one merged PDF.
                   </p>
                   <div className="mt-4 grid max-w-3xl grid-cols-1 items-end gap-3 sm:grid-cols-[1fr_1fr_auto]">
@@ -877,14 +881,14 @@ export function ReportsExportPage() {
                     {mergeLoading
                       ? "Loading…"
                       : mergeMeta.filtered
-                        ? `${mergeCandidates.length} case${mergeCandidates.length === 1 ? "" : "s"} created ${
+                        ? `${mergeCandidates.length} scan job${mergeCandidates.length === 1 ? "" : "s"} run ${
                             mergeFromDate && mergeToDate
                               ? `between ${displayYmd(mergeFromDate)} and ${displayYmd(mergeToDate)}`
                               : mergeFromDate
                                 ? `on or after ${displayYmd(mergeFromDate)}`
                                 : `on or before ${displayYmd(mergeToDate)}`
                           }${mergeMeta.hasMore ? ` (showing the newest ${mergeCandidates.length} of ${mergeMeta.totalMatching})` : ""}`
-                        : `Latest ${mergeCandidates.length} report${mergeCandidates.length === 1 ? "" : "s"}${
+                        : `Latest ${mergeCandidates.length} scan job${mergeCandidates.length === 1 ? "" : "s"}${
                             mergeMeta.hasMore ? ` of ${mergeMeta.totalMatching}. Set From/To to find older ones.` : ""
                           }`}
                   </p>
@@ -893,13 +897,13 @@ export function ReportsExportPage() {
                       {mergeCandidates.length === 0 ? (
                         <p className="text-sm text-ink-400">
                           {mergeMeta.filtered
-                            ? "No case with a saved site overview in this date range."
-                            : "No case has a saved site overview yet."}
+                            ? "No finished scan job in this date range (its case also needs a saved site overview)."
+                            : "No finished scan job yet whose case has a saved site overview."}
                         </p>
                       ) : (
                         mergeCandidates.map((c) => {
-                          const checked = mergeCaseIds.includes(c.id);
-                          const label = c.title || c.number || c.id.slice(0, 8);
+                          const checked = mergeJobIds.includes(c.job_id);
+                          const caseLabel = c.case_title || c.case_number || c.case_id.slice(0, 8);
                           const dayBadge = mergeDayBadge(c.day_label);
                           const d = c.gap_details || {};
                           const detailParts = [
@@ -909,50 +913,67 @@ export function ReportsExportPage() {
                             d.date_of_visit ? `Visit: ${d.date_of_visit}` : null,
                             d.author ? `Author: ${d.author}` : null,
                             d.document_version ? `Ver: ${d.document_version}` : null,
-                            d.num_endpoints ? `Endpoints: ${d.num_endpoints}` : null,
                           ].filter(Boolean);
-                          const created = c.created_at
-                            ? new Date(c.created_at).toLocaleString("en-IN", {
-                                day: "2-digit",
-                                month: "short",
-                                year: "numeric",
-                                hour: "2-digit",
-                                minute: "2-digit",
-                              })
-                            : "";
+                          const fmt = (v?: string | null) =>
+                            v
+                              ? new Date(v).toLocaleString("en-IN", {
+                                  day: "2-digit",
+                                  month: "short",
+                                  year: "numeric",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })
+                              : "";
+                          const started = fmt(c.started_at || c.created_at);
+                          const finished = fmt(c.completed_at);
+                          const sev = c.severity_counts || { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+                          const sameCaseSelected = mergeCandidates.filter(
+                            (o) => o.case_id === c.case_id && mergeJobIds.includes(o.job_id),
+                          ).length;
                           return (
                             <label
-                              key={c.id}
+                              key={c.job_id}
                               className="flex cursor-pointer items-start gap-2 rounded-lg border border-transparent px-2 py-2 text-sm hover:border-ink-100 hover:bg-ink-50"
                             >
                               <input
                                 type="checkbox"
                                 className="mt-1 h-4 w-4 rounded border-ink-300"
                                 checked={checked}
-                                onChange={() => toggleMergeCase(c.id)}
+                                onChange={() => toggleMergeJob(c.job_id)}
                               />
                               <span className="min-w-0 flex-1">
                                 <span className="flex flex-wrap items-center gap-1.5">
-                                  <span className="font-medium text-ink-800">{label}</span>
+                                  <span className="font-medium text-ink-800">{caseLabel}</span>
+                                  <span className="font-mono text-xs text-ink-600">job {c.job_id.slice(0, 8)}</span>
                                   <Badge tone={dayBadge.tone}>{dayBadge.text}</Badge>
-                                  <span className="font-mono text-[10px] text-ink-400">
-                                    {c.id.slice(0, 8)}
-                                  </span>
+                                  <Badge tone={c.status === "completed" ? "green" : "amber"}>{c.status}</Badge>
+                                  {checked && sameCaseSelected > 1 ? (
+                                    <span className="text-[11px] text-ink-500">
+                                      {sameCaseSelected} jobs of this case selected
+                                    </span>
+                                  ) : null}
                                 </span>
-                                {created ? (
-                                  <span className="mt-0.5 block text-[11px] text-ink-500">
-                                    Created {created}
-                                  </span>
-                                ) : null}
+                                <span className="mt-0.5 block text-[11px] text-ink-500">
+                                  Scan {started}
+                                  {finished ? ` → ${finished}` : ""} · {c.target_count} target
+                                  {c.target_count === 1 ? "" : "s"}
+                                </span>
+                                <span className="mt-0.5 block text-[11px] tabular-nums">
+                                  <span className="text-red-700">{sev.critical} critical</span>
+                                  <span className="text-ink-300">, </span>
+                                  <span className="text-orange-700">{sev.high} high</span>
+                                  <span className="text-ink-300">, </span>
+                                  <span className="text-amber-600">{sev.medium} medium</span>
+                                  <span className="text-ink-300">, </span>
+                                  <span className="text-amber-700">{sev.low} low</span>
+                                  <span className="text-ink-300">, </span>
+                                  <span className="text-ink-500">{sev.info} info</span>
+                                </span>
                                 {detailParts.length > 0 ? (
                                   <span className="mt-0.5 block text-[11px] text-ink-600">
                                     {detailParts.join(" · ")}
                                   </span>
-                                ) : (
-                                  <span className="mt-0.5 block text-[11px] text-ink-400">
-                                    Site overview saved (no detail fields filled)
-                                  </span>
-                                )}
+                                ) : null}
                               </span>
                             </label>
                           );
@@ -963,14 +984,14 @@ export function ReportsExportPage() {
                       <Button
                         variant="brand"
                         loading={gapExporting === "merged"}
-                        disabled={mergeCaseIds.length < 2}
+                        disabled={mergeJobIds.length < 2}
                         onClick={() => void exportMergedGap()}
                       >
                         <Download className="h-4 w-4" /> Merge &amp; download PDF
                       </Button>
                       <span className="text-xs text-ink-500">
-                        {mergeCaseIds.length} case{mergeCaseIds.length === 1 ? "" : "s"} selected
-                        {mergeCaseIds.length > 0 && mergeCaseIds.length < 2
+                        {mergeJobIds.length} scan job{mergeJobIds.length === 1 ? "" : "s"} selected
+                        {mergeJobIds.length > 0 && mergeJobIds.length < 2
                           ? " · pick one more"
                           : ""}
                       </span>

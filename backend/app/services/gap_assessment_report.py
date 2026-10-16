@@ -928,23 +928,82 @@ def merge_gap_sites(sites: list[dict[str, Any]]) -> dict[str, Any]:
     return primary
 
 
+def load_merge_job_refs(db, job_ids: list[str]) -> list[dict[str, Any]]:
+    """V1.10.6: the selected scan jobs (in the given order) with their case id."""
+    ordered: list[str] = []
+    for raw in job_ids or []:
+        jid = str(raw or "").strip()
+        if jid and jid not in ordered:
+            ordered.append(jid)
+    if len(ordered) < 2:
+        raise ValueError("Select at least two scan jobs to merge gap assessment reports")
+    params = {f"j{i}": jid for i, jid in enumerate(ordered)}
+    placeholders = ", ".join(f"CAST(:j{i} AS uuid)" for i in range(len(ordered)))
+    rows = fetchall(
+        db,
+        f"""SELECT id, case_id, status, started_at, completed_at, created_at
+              FROM vuln_scan_jobs WHERE id IN ({placeholders})""",
+        params,
+    )
+    by_id = {str(r["id"]): dict(r) for r in rows}
+    missing = [jid for jid in ordered if jid not in by_id]
+    if missing:
+        raise ValueError(f"Scan job not found: {', '.join(m[:8] for m in missing)}")
+    return [by_id[jid] for jid in ordered]
+
+
+def _union_job_endpoint_count(db, job_ids: list[str]) -> int | None:
+    """Distinct host-like targets across the merged jobs (each IP counted once)."""
+    params = {f"j{i}": jid for i, jid in enumerate(job_ids)}
+    placeholders = ", ".join(f"CAST(:j{i} AS uuid)" for i in range(len(job_ids)))
+    row = fetchone(
+        db,
+        f"""SELECT COUNT(DISTINCT LOWER(BTRIM(t.target))) AS endpoint_count
+              FROM vuln_scan_targets t
+             WHERE t.scan_job_id IN ({placeholders})
+               AND COALESCE(t.excluded, FALSE) = FALSE
+               AND BTRIM(COALESCE(t.target, '')) <> ''
+               AND LOWER(BTRIM(COALESCE(t.target_type, 'host')))
+                   IN ('host', 'hostname', 'ip', 'ipv4', 'ipv6', 'endpoint')""",
+        params,
+    )
+    try:
+        count = int((row or {}).get("endpoint_count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return count if count > 0 else None
+
+
 def build_merged_gap_report_context(
     db,
-    case_ids: list[str],
+    case_ids: list[str] | None = None,
     *,
     use_llm: bool | None = None,
+    job_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    ids = [str(c).strip() for c in case_ids if str(c).strip()]
-    # Preserve order, drop duplicates.
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for cid in ids:
-        if cid in seen:
-            continue
-        seen.add(cid)
-        ordered.append(cid)
-    if len(ordered) < 2:
-        raise ValueError("Select at least two cases to merge gap assessment reports")
+    """Merge gap reports of several cases, or (V1.10.6) of several scan jobs.
+
+    With ``job_ids`` each part is one scan job: its findings, scan verification
+    and service coverage only. Jobs may come from one case (re-scans, network
+    segments) or from several. The site overview always comes from the job's case.
+    """
+    by_job = bool(job_ids)
+    parts: list[tuple[str, str | None]] = []
+    job_refs: list[dict[str, Any]] = []
+    if by_job:
+        job_refs = load_merge_job_refs(db, list(job_ids or []))
+        parts = [(str(r["case_id"]), str(r["id"])) for r in job_refs]
+    else:
+        ids = [str(c).strip() for c in (case_ids or []) if str(c).strip()]
+        # Preserve order, drop duplicates.
+        seen: set[str] = set()
+        for cid in ids:
+            if cid in seen:
+                continue
+            seen.add(cid)
+            parts.append((cid, None))
+        if len(parts) < 2:
+            raise ValueError("Select at least two cases to merge gap assessment reports")
 
     sites: list[dict[str, Any]] = []
     findings_lists: list[list[dict[str, Any]]] = []
@@ -953,24 +1012,41 @@ def build_merged_gap_report_context(
     assessment_states: list[dict[str, Any]] = []
     service_coverage_jobs: list[dict[str, Any]] = []
     primary_case: dict[str, Any] | None = None
-    for cid in ordered:
-        case_row = load_case_row(db, cid)
-        if not case_row:
-            raise ValueError(f"Case not found: {cid}")
+    case_rows: dict[str, dict[str, Any]] = {}
+    site_cache: dict[str, dict[str, Any]] = {}
+    for cid, jid in parts:
+        if cid not in case_rows:
+            case_row = load_case_row(db, cid)
+            if not case_row:
+                raise ValueError(f"Case not found: {cid}")
+            case_rows[cid] = case_row
         if primary_case is None:
-            primary_case = case_row
-        case_site = load_gap_site(db, cid)
-        _apply_derived_site_facts(db, cid, case_site)
-        sites.append(case_site)
-        assessment_states.append(load_case_scan_assessment(db, cid))
-        service_coverage_jobs.extend(load_service_coverage(db, case_id=cid))
-        # Merge on raw scanner text before LLM rewrite so identical findings share IPs.
-        inventory = load_gap_finding_inventory(db, cid)
+            primary_case = case_rows[cid]
+        if cid not in site_cache:
+            case_site = load_gap_site(db, cid)
+            if not by_job:
+                _apply_derived_site_facts(db, cid, case_site)
+            site_cache[cid] = case_site
+        sites.append(dict(site_cache[cid]))
+        if jid:
+            assessment_states.append(load_case_scan_assessment(db, cid, jid))
+            service_coverage_jobs.extend(load_service_coverage(db, case_id=cid, scan_job_id=jid))
+            inventory = load_gap_finding_inventory(db, cid, jid)
+        else:
+            assessment_states.append(load_case_scan_assessment(db, cid))
+            service_coverage_jobs.extend(load_service_coverage(db, case_id=cid))
+            # Merge on raw scanner text before LLM rewrite so identical findings share IPs.
+            inventory = load_gap_finding_inventory(db, cid)
         findings_lists.append(inventory["findings"])
         informational_lists.append(inventory["informational_findings"])
         summary_items.append(inventory["finding_summary"])
 
     site = merge_gap_sites(sites)
+    if by_job and _site_value_missing(site.get("num_endpoints")):
+        # Endpoints of the merged jobs, each IP counted once (not the sum per job).
+        union = _union_job_endpoint_count(db, [jid for _, jid in parts if jid])
+        if union is not None:
+            site["num_endpoints"] = str(union)
     findings = merge_gap_findings(findings_lists)
     informational_findings = [item for items in informational_lists for item in items]
     finding_summary = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0, "total": 0, "actionable": 0, "informational": 0}
@@ -991,9 +1067,19 @@ def build_merged_gap_report_context(
         llm_on = use_llm if use_llm is not None else bool(get_settings().gap_report_llm_enabled)
         findings = enrich_gap_findings(findings, client=client, enabled=llm_on)
 
+    case_order: list[str] = []
+    for cid, _ in parts:
+        if cid not in case_order:
+            case_order.append(cid)
     return {
-        "case_id": ordered[0],
-        "case_ids": ordered,
+        "case_id": case_order[0],
+        "case_ids": case_order,
+        "scan_job_ids": [jid for _, jid in parts if jid],
+        "merged_jobs": [
+            {"job_id": str(r["id"]), "case_id": str(r["case_id"]), "status": r.get("status"),
+             "case_title": (case_rows.get(str(r["case_id"])) or {}).get("title")}
+            for r in job_refs
+        ],
         "case": primary_case,
         "site": site,
         "client": client,
@@ -1001,7 +1087,7 @@ def build_merged_gap_report_context(
         "findings": findings,
         "informational_findings": informational_findings,
         "finding_summary": finding_summary,
-        "assessment": merge_scan_assessments(assessment_states),
+        "assessment": merge_scan_assessments(assessment_states, unit="job" if by_job else "case"),
         "service_coverage_jobs": service_coverage_jobs,
         "intro": site.get("introduction") or DEFAULT_GAP_INTRO,
         "merged": True,
@@ -1010,19 +1096,23 @@ def build_merged_gap_report_context(
 
 def export_merged_gap_report(
     db,
-    case_ids: list[str],
+    case_ids: list[str] | None = None,
     *,
     fmt: str = "pdf",
     use_llm: bool | None = None,
+    job_ids: list[str] | None = None,
 ) -> tuple[bytes, str, str]:
     from app.config import get_settings
 
     settings = get_settings()
     if use_llm is None:
         use_llm = bool(settings.gap_report_llm_enabled)
-    ctx = build_merged_gap_report_context(db, case_ids, use_llm=use_llm)
+    if job_ids:
+        ctx = build_merged_gap_report_context(db, use_llm=use_llm, job_ids=job_ids)
+    else:
+        ctx = build_merged_gap_report_context(db, case_ids, use_llm=use_llm)
     client_slug = re.sub(r"[^\w\-]+", "-", ctx["client"])[:40].strip("-") or "client"
-    suffix = "merged"
+    suffix = f"merged-{len(ctx['scan_job_ids'])}-jobs" if job_ids else "merged"
     if fmt == "docx":
         data = render_gap_docx(ctx)
         return (
