@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 RAG_CHUNK_DB_BATCH = int(os.environ.get("RAG_CHUNK_DB_BATCH", "6000") or 6000)
 from contextlib import ExitStack
@@ -25,6 +26,9 @@ from app.services.forensic_serial_policy import (
 )
 
 NIL_ID = "00000000-0000-0000-0000-000000000000"
+# V1.11.0: the serial parse loop shares the queue with parallel parse shards.
+PARSE_NO_PROGRESS_SEC = max(60, int(os.environ.get("PARSE_NO_PROGRESS_SEC", "600") or 600))
+PARSE_SHARD_WAIT_SEC = max(1.0, float(os.environ.get("PARSE_SHARD_WAIT_SEC", "3") or 3))
 
 
 def report_progress(
@@ -115,40 +119,46 @@ def _materialize_full(db, job_id):
     entries = list(by_path.values())
     # Every extracted file enters inventory. Unsupported/no-text files are
     # explicit stage exceptions, never discarded by hash or path filters.
+    # V1.10.9: one pass. Each row is inserted with its provenance (extracted part)
+    # and its parse-queue decision (forensic -> pending; media / noise / oversized
+    # EVTX -> skipped, media routed to OCR). Before, every row was inserted, then
+    # UPDATEd again for provenance, and native parsing re-filtered all rows.
+    def _provenance(entry: dict) -> dict:
+        return {
+            "serial_materialized": True,
+            "extracted_part_uri": entry["part_uri"],
+            "extracted_part_id": entry.get("part_id"),
+            "extracted_part_offset": entry.get("offset"),
+            "source_sha256": entry.get("sha256"),
+        }
+
     result = materialize_index_entries(
-        db, job_id, entries, update_status=True, phase1_filter=False
+        db,
+        job_id,
+        entries,
+        update_status=True,
+        phase1_filter=False,
+        classify_parse_queue=True,
+        extra_metadata=_provenance,
     )
     db.commit()
-    for start in range(0, len(entries), 1000):
-        values = [
-            (
-                job_id,
-                entry["path"],
-                json.dumps(
-                    {
-                        "serial_materialized": True,
-                        "extracted_part_uri": entry["part_uri"],
-                        "extracted_part_id": entry.get("part_id"),
-                        "extracted_part_offset": entry.get("offset"),
-                        "source_sha256": entry.get("sha256"),
-                    }
-                ),
-            )
-            for entry in entries[start : start + 1000]
-        ]
-        def _write_part_metadata() -> None:
-            lock_job_artifacts_for_paths(db, job_id, [item[1] for item in values])
-            with db.connection().connection.cursor() as cur:
-                execute_values(
-                    cur,
-                    """UPDATE job_artifacts AS ja SET metadata=COALESCE(ja.metadata,'{}'::jsonb) || v.meta::jsonb
-                    FROM (VALUES %s) AS v(job_id,path,meta) WHERE ja.job_id=v.job_id::uuid AND ja.file_path=v.path""",
-                    values,
-                    page_size=500,
-                )
-            db.commit()
-
-        retry_on_deadlock(db, _write_part_metadata)
+    try:  # bookkeeping only; never fail registration over it
+        execute(
+            db,
+            """UPDATE pipeline_stage_runs SET details=coalesce(details,'{}'::jsonb) ||
+               jsonb_build_object('parse_queue_classified', true,
+                                  'parse_pending', CAST(:pending AS bigint),
+                                  'parse_skipped_at_registration', CAST(:skipped AS bigint)),
+               updated_at=NOW() WHERE job_id=:jid AND stage='materialize'""",
+            {"jid": job_id, "pending": int(result.get("parse_pending") or 0),
+             "skipped": int(result.get("parse_skipped_at_registration") or 0)},
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     report_progress(
         db,
         job_id,
@@ -194,6 +204,26 @@ def _materialize_full(db, job_id):
     }
 
 
+def _parse_shards_active(db, job_id) -> bool:
+    """True while a V1.11.0 parse shard sidecar is queued or running for the job."""
+    try:
+        if not (fetchone(db, "SELECT to_regclass('pipeline_sidecar_runs') AS t") or {}).get("t"):
+            return False
+        row = fetchone(
+            db,
+            """SELECT count(*) AS c FROM pipeline_sidecar_runs
+               WHERE job_id=:jid AND sidecar LIKE 'parse_shard_%' AND status IN ('queued','running')""",
+            {"jid": job_id},
+        ) or {}
+        return int(row.get("c") or 0) > 0
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return True  # unsure: keep live claims rather than risk double parsing
+
+
 def _parse(db, job_id, schema_name):
     from app.config import get_settings
     from app.services.artifact_parse import parse_job_artifacts_for_paths
@@ -220,11 +250,19 @@ def _parse(db, job_id, schema_name):
 
     # The execution lock proves no other serial parse runner is alive. Claims
     # left by a killed worker may be reset immediately rather than wait 30 min.
-    execute(
-        db,
-        "UPDATE job_artifacts SET parse_status='pending' WHERE job_id=:jid AND parse_status='parsing'",
-        {"jid": job_id},
-    )
+    # V1.11.0: parse shards hold live claims (heartbeated while they work), so
+    # while any shard is active only stale claims are returned to the queue;
+    # resetting all of them would let two processes parse the same file.
+    if _parse_shards_active(db, job_id):
+        from app.services.artifact_parse import recover_stale_parsing_claims
+
+        recover_stale_parsing_claims(db, job_id)
+    else:
+        execute(
+            db,
+            "UPDATE job_artifacts SET parse_status='pending' WHERE job_id=:jid AND parse_status='parsing'",
+            {"jid": job_id},
+        )
     db.commit()
     # V58 performance lane: prepare the evidence-focused parse queue once before
     # draining it. All extracted files remain registered/in inventory, but media,
@@ -243,6 +281,8 @@ def _parse(db, job_id, schema_name):
             {"jid": job_id},
         )["c"]
     )
+    previous_pending = None
+    last_progress_at = time.monotonic()
     while True:
         row = fetchone(
             db,
@@ -272,11 +312,25 @@ def _parse(db, job_id, schema_name):
                 "failed": int(row["failed"]),
                 "skipped": int(row["skipped"]),
             }
+        # V1.11.0: parallel parse shards (sidecars on the idle extraction
+        # workers) drain the same queue. While they hold claims this loop may
+        # find nothing to claim; that is progress elsewhere, so it waits briefly
+        # instead of giving up after one quiet batch. Only a queue that has not
+        # moved for PARSE_NO_PROGRESS_SEC becomes a resumable wait.
+        pending_now = int(row["pending"])
+        now = time.monotonic()
+        if previous_pending is None or pending_now < previous_pending:
+            previous_pending = pending_now
+            last_progress_at = now
+        elif now - last_progress_at > PARSE_NO_PROGRESS_SEC:
+            raise StageWaiting(
+                "Parsing made no progress; remaining evidence claims must finish"
+            )
         from app.services.job_control import pipeline_should_stop
 
         if pipeline_should_stop(db, job_id):
             raise StageWaiting("Parsing paused by user")
-        parse_job_artifacts_for_paths(
+        batch = parse_job_artifacts_for_paths(
             db,
             job_id,
             paths=None,
@@ -284,20 +338,12 @@ def _parse(db, job_id, schema_name):
             batch_limit=max(100, int(get_settings().parse_drain_batch_limit or 500)),
             update_status=False,
             forensic_only=True,
-        )
+            queue_prepared=True,
+        ) or {}
         db.commit()
-        after = int(
-            fetchone(
-                db,
-                """SELECT count(*) AS c FROM job_artifacts
-            WHERE job_id=:jid AND parse_status IN ('pending','parsing')""",
-                {"jid": job_id},
-            )["c"]
-        )
-        if after >= int(row["pending"]) and after:
-            raise StageWaiting(
-                "Parsing made no progress; remaining evidence claims must finish"
-            )
+        if not int(batch.get("parsed") or 0) and not int(batch.get("skipped") or 0):
+            # Everything still pending is claimed by a parse shard right now.
+            time.sleep(PARSE_SHARD_WAIT_SEC)
 
 
 def _recovery(db, job_id):
@@ -347,10 +393,16 @@ def _recovery(db, job_id):
     tagged = total = 0
     recovery_batch = 5000
     while True:
+        # V1.11.0: rows registered by the serial registration stage already
+        # carry the path-based deleted/trash hint (detect_deleted_path_hint runs
+        # for every row while registering), so they are not re-read and
+        # re-written here. Only rows registered by older/other paths are analysed.
         rows = fetchall(
             db,
             """SELECT id,file_path,metadata FROM job_artifacts
-            WHERE job_id=:jid AND id>:last ORDER BY id LIMIT :lim""",
+            WHERE job_id=:jid AND id>:last
+              AND coalesce(metadata->>'serial_materialized','false') <> 'true'
+            ORDER BY id LIMIT :lim""",
             {"jid": job_id, "last": last, "lim": recovery_batch},
         )
         if not rows:
@@ -389,11 +441,24 @@ def _recovery(db, job_id):
             completed=total,
             label="Analyzing extracted deleted/recovered evidence",
         )
+    registered = fetchone(
+        db,
+        """SELECT count(*) AS total,
+                  count(*) FILTER (WHERE coalesce(metadata->>'is_deleted','false')='true') AS deleted
+             FROM job_artifacts WHERE job_id=:jid""",
+        {"jid": job_id},
+    ) or {}
+    all_rows = int(registered.get("total") or 0)
+    report_progress(db, job_id, "recovery", total=all_rows, completed=all_rows,
+                    label="Deleted / recovery analysis (applied while registering)")
     return {
         "status": "ok",
-        "total": total,
-        "completed": total,
+        "total": all_rows,
+        "completed": all_rows,
+        "analysed_now": total,
+        "analysed_at_registration": max(all_rows - total, 0),
         "deleted_sources_tagged": tagged,
+        "deleted_sources_total": int(registered.get("deleted") or 0),
         "scope": "derived_evidence; filesystem recovery is performed during extraction",
     }
 

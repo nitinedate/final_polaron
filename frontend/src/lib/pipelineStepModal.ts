@@ -24,7 +24,7 @@ const AGENT_STEP_COPY: Record<string, Pick<PipelineStepDef, "runningMessage" | "
     doneMessage: "Android Agent finished extract and RAG for this Android phone.",
   },
   drive_mount_agent: {
-    runningMessage: "Looking for every attached drive and mounting it in Docker…",
+    runningMessage: "Mounting the selected drive so extraction can read it in place…",
     errorMessage: "Could not mount host drives. Start the host drive helper, then Try again.",
     doneMessage: "All attached drives are mounted. List Folder can run.",
   },

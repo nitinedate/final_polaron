@@ -22,8 +22,8 @@ $ErrorActionPreference = "Stop"
 # Version marker. host-drive-helper.ps1 reports it on /health as
 # job_script_version and ensure-host-drive-helper.ps1 restarts a helper whose
 # loaded job script is older than the one on disk.
-# AETHERIS_JOB_VERSION: 4.15
-$script:JobVersion = "4.15"
+# AETHERIS_JOB_VERSION: 4.16
+$script:JobVersion = "4.16"
 
 # Docker Compose writes progress ("Container x Recreate", "Waiting", ...) to
 # stderr. Keep that output plain so it can be logged and filtered reliably.
@@ -538,6 +538,18 @@ function Wait-ApiHealthy {
     return $false
 }
 
+function Convert-DaemonHostPathToWindowsBind {
+    param([string]$Source)
+    if (-not $Source) { return $Source }
+    if ($Source -match '^[A-Za-z]:[/\\]?$') {
+        return ("{0}:/" -f $Source.Substring(0, 1).ToUpper())
+    }
+    if ($Source -match '^/(?:mnt/host|run/desktop/mnt/host|host_mnt|tmp/docker-desktop-root/mnt/host)/([A-Za-z])/?$') {
+        return ("{0}:/" -f $Matches[1].ToUpper())
+    }
+    return $Source
+}
+
 function Read-SourceState {
     $state = @{}
     if (-not (Test-Path -LiteralPath $sourceStateFile)) { return $state }
@@ -551,12 +563,22 @@ function Read-SourceState {
                 $value = $prop.Value
                 if (-not $value) { continue }
                 if ($value -is [string]) {
-                    $state[$letter] = @{ source = [string]$value; mode = 'legacy' }
+                    $storedSource = Convert-DaemonHostPathToWindowsBind -Source ([string]$value)
+                    $state[$letter] = @{
+                        source = $storedSource
+                        mode = $(if ($storedSource -match '^[A-Za-z]:/') { 'docker-direct' } else { 'legacy' })
+                    }
                 }
                 elseif ($value.PSObject.Properties.Name -contains 'source') {
+                    $storedSource = [string]$value.source
+                    $storedMode = $(if ($value.mode) { [string]$value.mode } else { 'unknown' })
+                    if ($storedMode -ne 'wsl-compose') {
+                        $storedSource = Convert-DaemonHostPathToWindowsBind -Source $storedSource
+                        if ($storedSource -match '^[A-Za-z]:/') { $storedMode = 'docker-direct' }
+                    }
                     $state[$letter] = @{
-                        source       = [string]$value.source
-                        mode         = $(if ($value.mode) { [string]$value.mode } else { 'unknown' })
+                        source       = $storedSource
+                        mode         = $storedMode
                         wsl_distro   = $(if ($value.wsl_distro) { [string]$value.wsl_distro } else { '' })
                         wsl_mount    = $(if ($value.wsl_mount) { [string]$value.wsl_mount } else { '' })
                         mount_target = $(if ($value.mount_target) { [string]$value.mount_target } else { '' })
@@ -606,6 +628,9 @@ function Ensure-DaemonPathVolumes {
         if (-not $State.ContainsKey($letter)) { continue }
         $source = [string]$State[$letter].source
         if (-not $source -or -not $source.StartsWith('/')) { continue }
+        # Windows letters are compose binds (G:/). Do not create an external
+        # volume whose device is Docker Desktop's /mnt/host stub.
+        if ($source -match '^/(?:mnt/host|run/desktop/mnt/host|host_mnt)/[A-Za-z]/?$') { continue }
 
         # Compose runs from Windows, while the verified WSL source is a path in
         # Docker's Linux daemon namespace.  Pre-create a uniquely named external
@@ -927,6 +952,7 @@ try {
                 ok           = $true
                 unchanged    = $true
                 busy         = $false
+                required_path = $normalizedRequiredPath
                 drives       = @(Get-OverrideHostLetters $script:ComposeDrivesFile)
                 message      = "Selected path is already visible in Docker: $normalizedRequiredPath"
                 error        = $null
@@ -988,6 +1014,13 @@ try {
 
     foreach ($letter in $orderedLetters) {
         $exact = if ($letter -eq $requiredLetter) { $normalizedRequiredPath } else { '' }
+        # A selected folder only needs its own letter resolved. Re-probing every
+        # other drive here is what made "extract this folder" wait minutes and
+        # then time out. Letters already resolved keep their saved source.
+        if ($requiredLetter -and $letter -ne $requiredLetter -and $sourceState.ContainsKey($letter)) {
+            $resolutionLog += "${letter}: kept existing Docker source"
+            continue
+        }
         try {
             $resolved = Invoke-DriveSourceResolver -Letter $letter -ExactPath $exact
             Update-SourceStateEntry -State $sourceState -Result $resolved
@@ -1114,6 +1147,14 @@ try {
             }
         }
 
+        # The selected folder can become readable while source resolution is
+        # still running (the drive was already bound). Do not rebuild Docker,
+        # and do not wait on the iOS/Android stacks, when extraction can start.
+        if ($mustRecreate -and $normalizedRequiredPath -and (Test-RequiredPathInContainer -Path $normalizedRequiredPath)) {
+            $mustRecreate = $false
+            $resolutionLog += "Selected path is already readable in Docker. Skipping container recreate."
+        }
+
         if ($mustRecreate) {
             Write-Status @{
                 status  = 'running'
@@ -1234,6 +1275,7 @@ try {
         status       = 'done'
         ok           = $true
         unchanged    = (-not $mustRecreate -and -not ($composeOutput.Count -gt 1))
+        required_path = $(if ($normalizedRequiredPath) { $normalizedRequiredPath } else { $null })
         drives       = $letters
         skipped_drives = @($excluded)
         mount_mode   = $(if ($requiredResolution) { [string]$requiredResolution.mode } else { $null })

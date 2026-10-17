@@ -5,114 +5,97 @@
 services:
   api:
     volumes:
-      - type: volume
-        source: aetheris_hostdrive_c_8635bfe8086f
+      - type: bind
+        source: 'C:/'
         target: '/host/c'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_d_116ee6e5c644
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'D:/'
         target: '/host/d'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_e_4e99e62d9f52
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'E:/'
         target: '/host/e'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_f_a21974c125b4
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'F:/'
         target: '/host/f'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_g_d315c908c353
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'G:/'
         target: '/host/g'
         read_only: true
-        volume:
-          nocopy: true
+        bind:
+          create_host_path: false
   worker-build:
     volumes:
-      - type: volume
-        source: aetheris_hostdrive_c_8635bfe8086f
+      - type: bind
+        source: 'C:/'
         target: '/host/c'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_d_116ee6e5c644
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'D:/'
         target: '/host/d'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_e_4e99e62d9f52
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'E:/'
         target: '/host/e'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_f_a21974c125b4
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'F:/'
         target: '/host/f'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_g_d315c908c353
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'G:/'
         target: '/host/g'
         read_only: true
-        volume:
-          nocopy: true
+        bind:
+          create_host_path: false
   worker-parse:
     volumes:
-      - type: volume
-        source: aetheris_hostdrive_c_8635bfe8086f
+      - type: bind
+        source: 'C:/'
         target: '/host/c'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_d_116ee6e5c644
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'D:/'
         target: '/host/d'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_e_4e99e62d9f52
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'E:/'
         target: '/host/e'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_f_a21974c125b4
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'F:/'
         target: '/host/f'
         read_only: true
-        volume:
-          nocopy: true
-      - type: volume
-        source: aetheris_hostdrive_g_d315c908c353
+        bind:
+          create_host_path: false
+      - type: bind
+        source: 'G:/'
         target: '/host/g'
         read_only: true
-        volume:
-          nocopy: true
-
-volumes:
-  aetheris_hostdrive_c_8635bfe8086f:
-    external: true
-    name: aetheris_hostdrive_c_8635bfe8086f
-  aetheris_hostdrive_d_116ee6e5c644:
-    external: true
-    name: aetheris_hostdrive_d_116ee6e5c644
-  aetheris_hostdrive_e_4e99e62d9f52:
-    external: true
-    name: aetheris_hostdrive_e_4e99e62d9f52
-  aetheris_hostdrive_f_a21974c125b4:
-    external: true
-    name: aetheris_hostdrive_f_a21974c125b4
-  aetheris_hostdrive_g_d315c908c353:
-    external: true
-    name: aetheris_hostdrive_g_d315c908c353
+        bind:
+          create_host_path: false

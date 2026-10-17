@@ -56,7 +56,10 @@ def probe_helper() -> dict[str, Any]:
                 continue
             drives: dict[str, Any] = {}
             try:
-                drives = _http_json(f"{base}/drives", timeout=4.0)
+                # V1.10.10: the helper answers /drives on its accept thread from
+                # the Windows drive table (milliseconds); 6 s still covers an
+                # older helper that queues the request behind other work.
+                drives = _http_json(f"{base}/drives", timeout=6.0)
             except Exception as exc:
                 drives = {"ok": False, "error": str(exc)[:200]}
             letters = drives.get("drives") if isinstance(drives, dict) else None
@@ -71,6 +74,9 @@ def probe_helper() -> dict[str, Any]:
                 "volumes": drives.get("volumes") if isinstance(drives, dict) else [],
                 "mobile_devices": mobiles or [],
                 "mobile_count": len(mobiles or []),
+                "drives_ok": bool(isinstance(drives, dict) and drives.get("ok")),
+                "drives_error": (drives.get("error") if isinstance(drives, dict) else None),
+                "drives_source": (drives.get("source") if isinstance(drives, dict) else None),
                 "message": f"HostDrive agent online — {len(letters or [])} drive letter(s)",
                 "start_hint": (
                     "powershell -ExecutionPolicy Bypass -File scripts\\ensure-host-drive-helper.ps1"
@@ -198,7 +204,25 @@ def proxy_refresh_mounts(required_path: str | None = None) -> dict[str, Any]:
                 pass
         return {"ok": False, "error": body or str(exc), "helper_url": base}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)[:500], "helper_url": base}
+        text = str(exc)
+        # The helper answers 202 immediately, but a folder listing ahead of this
+        # POST used to hold the socket until urllib raised "timed out". A refresh
+        # that is already running is the mount we should wait for, not a failure.
+        if "timed out" in text.lower():
+            current = refresh_status()
+            job_status = str(current.get("status") or "").lower()
+            if job_status in ("running", "done") or current.get("busy"):
+                return {
+                    "ok": True,
+                    "started": job_status != "done",
+                    "joined_existing": True,
+                    "message": current.get("message") or "Drive mount refresh already running",
+                    "required_path": current.get("required_path"),
+                    "drives": current.get("drives") or status.get("drives") or [],
+                    "helper_url": base,
+                    "agent": "hostdrive_agent",
+                }
+        return {"ok": False, "error": text[:500], "helper_url": base}
 
 
 def refresh_status() -> dict[str, Any]:
@@ -262,7 +286,11 @@ def proxy_drives() -> dict[str, Any]:
                 _add_volume(vol)
         for raw in helper.get("drives") or []:
             _add_volume(str(raw))
+    partial = False
     if not volumes:
+        # Only drives Docker mounted at startup. When the helper is online this
+        # list is incomplete (a drive attached later is missing): say so.
+        partial = bool(helper.get("ok"))
         for row in inspect_host_letters():
             if row.get("mounted"):
                 _add_volume(str(row.get("letter") or "").upper())
@@ -284,8 +312,14 @@ def proxy_drives() -> dict[str, Any]:
         "mobile_count": len(mobile_devices),
         "mounted": sorted(docker_mounted),
         "count": len(volumes),
-        "message": helper.get("message")
-        or ("Office HostDrive online" if helper.get("ok") else "Listing Docker-mounted office letters"),
+        "partial": partial,
+        "drives_source": helper.get("drives_source"),
+        "message": (
+            "HostDrive helper online but its drive list did not arrive; showing drives mounted at startup only"
+            if partial
+            else helper.get("message")
+            or ("Office HostDrive online" if helper.get("ok") else "Listing Docker-mounted office letters")
+        ),
         "start_hint": helper.get("start_hint"),
     }
 

@@ -31,7 +31,7 @@ def claim_sidecar(db,job_id,sidecar,*,details=None):
     claimed = fetchone(db,"""INSERT INTO pipeline_sidecar_runs(job_id,sidecar,status,task_id,heartbeat_at,updated_at,details)
       SELECT :jid,:s,'queued',:tid,NOW(),NOW(),CAST(:d AS jsonb)
       WHERE EXISTS (SELECT 1 FROM pipeline_stage_runs WHERE job_id=:jid
-        AND stage=:active AND status='running')
+        AND stage=:active AND status IN ('running','queued','waiting'))
       ON CONFLICT(job_id,sidecar) DO UPDATE SET status='queued',task_id=EXCLUDED.task_id,
         heartbeat_at=NOW(),updated_at=NOW(),details=EXCLUDED.details
       WHERE pipeline_sidecar_runs.status NOT IN ('queued','running')
@@ -82,6 +82,73 @@ def defer_sidecar_if_busy(task, exc) -> None:
 # Legacy V68 prechunk guard was: if active_stage in {'ocr','media_review'}:
 # Legacy V68 leakage guard was: if active_stage in {'recovery','ocr'}:
 # V71 intentionally broadens these after dependency analysis and slot admission.
+PARSE_SHARD_STAGES = frozenset({'materialize','parse'})
+EARLY_OCR_STAGES = frozenset({'materialize','parse'})
+GRAPH_FILES_STAGES = frozenset({'parse','recovery','ocr','media_review','inventory','chunk','enrichment'})
+
+
+def parse_shard_count() -> int:
+    """Parallel parse shards (processes) beside the serial parse loop."""
+    from app.services.forensic_serial_policy import PIPELINE_PARALLEL_SLOTS
+    raw = str(os.environ.get('PARSE_SHARD_SIDECARS', '6') or '6').strip()
+    n = int(raw) if raw.isdigit() else 6
+    # Leave room in the shared slot budget for prechunk / leakage / graph.
+    return max(0, min(n, 8, PIPELINE_PARALLEL_SLOTS - 3))
+
+
+def _schedule_pipelined_sidecars(db, job_id, *, schema_name, active_stage, available):
+    """V1.11.0: overlap the Disk RAG stages wherever their input already exists.
+
+    * registration / parsing -> part-owned parse shards on the idle extraction
+      workers (SKIP LOCKED claims; the serial parse loop drains the same queue);
+    * registration / parsing -> quality triage + GPU OCR (OCR routing is decided
+      at registration), so CUDA works while the CPUs parse;
+    * parsing and later -> graph EvidenceFile nodes (registration is final).
+    Disk jobs only: mobile stages keep their own platform pipeline.
+    """
+    from app.forensic_common.job_types import is_mobile_job
+    queued = []
+    try:
+        if is_mobile_job(db, job_id):
+            return {'queued': queued, 'available': available}
+    except Exception:
+        return {'queued': queued, 'available': available}
+
+    if active_stage in PARSE_SHARD_STAGES:
+        from app.tasks import parse_shard_queue, parse_shard_sidecar_task
+        shards = parse_shard_count()
+        for bucket in range(shards):
+            if available <= 0:
+                break
+            name = f'parse_shard_{bucket}'
+            tid = claim_sidecar(db, job_id, name, details={'parallel_with': active_stage, 'bucket': bucket,
+                                                           'buckets': shards, 'slot_budget': available})
+            if tid:
+                parse_shard_sidecar_task.apply_async(args=(schema_name, job_id, tid, bucket, shards),
+                                                     queue=parse_shard_queue(), task_id=tid)
+                queued.append(name); available -= 1
+
+    if active_stage in EARLY_OCR_STAGES:
+        from app.forensic_common.pipeline_routing import parse_queue
+        from app.tasks import early_ocr_sidecar_task
+        # Light dispatcher (no slot): it only queues triage and the OCR agent,
+        # so it runs on a CPU queue and never waits behind CUDA work.
+        if str(os.environ.get('EARLY_GPU_OCR', '1')).strip().lower() not in {'0', 'false', 'no', 'off'}:
+            tid = claim_sidecar(db, job_id, 'early_ocr', details={'parallel_with': active_stage})
+            if tid:
+                early_ocr_sidecar_task.apply_async(args=(schema_name, job_id, tid), queue=parse_queue(), task_id=tid)
+                queued.append('early_ocr')
+
+    if active_stage in GRAPH_FILES_STAGES and available > 0:
+        from app.forensic_common.pipeline_routing import rag_prep_queue
+        from app.tasks import graph_files_sidecar_task
+        tid = claim_sidecar(db, job_id, 'graph_files', details={'parallel_with': active_stage, 'slot_budget': available})
+        if tid:
+            graph_files_sidecar_task.apply_async(args=(schema_name, job_id, tid), queue=rag_prep_queue(), task_id=tid)
+            queued.append('graph_files'); available -= 1
+    return {'queued': queued, 'available': available}
+
+
 def schedule_safe_sidecars(db,job_id,*,schema_name,active_stage):
     """Run dependency-independent CPU/DB helpers beside the owning stage.
 
@@ -94,7 +161,7 @@ def schedule_safe_sidecars(db,job_id,*,schema_name,active_stage):
     from app.tasks import company_leakage_sidecar_task, prechunk_sidecar_task, artifact_inventory_sidecar_task
     from app.services.forensic_serial_policy import PIPELINE_PARALLEL_SLOTS
     queued=[]
-    if active_stage not in {'parse','recovery','ocr','media_review','inventory','chunk'}:
+    if active_stage not in {'materialize','parse','recovery','ocr','media_review','inventory','chunk','enrichment'}:
         return {'queued':queued}
     admitted, resources = cpu_sidecar_headroom()
     if not admitted:
@@ -113,6 +180,13 @@ def schedule_safe_sidecars(db,job_id,*,schema_name,active_stage):
         if tid:
             task.apply_async(args=(schema_name,job_id,tid),queue=queue,task_id=tid)
             queued.append(name); available-=1
+
+    # V1.11.0: pipelined Disk RAG. Downstream work starts as soon as its input
+    # exists instead of waiting for the previous stage to finish.
+    early = _schedule_pipelined_sidecars(db, job_id, schema_name=schema_name,
+                                         active_stage=active_stage, available=available)
+    queued.extend(early['queued'])
+    available = early['available']
 
     # Prechunk consumes only already-parsed text; it is safe from parse onward.
     if active_stage in {'parse','recovery','ocr','media_review','inventory'}:

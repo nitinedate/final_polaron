@@ -57,6 +57,9 @@ interface BrowseFolderDialogProps {
   recommendedLetters?: string[];
 }
 
+/** How often the open dialog re-checks the server's drive letters (V1.10.10). */
+const DRIVE_POLL_MS = 3000;
+
 function joinWindowsPath(base: string, name: string): string {
   const root = base.replace(/[\\/]+$/, "");
   return `${root}\\${name}`;
@@ -112,9 +115,38 @@ export function BrowseFolderDialog({
   const recommendedKey = recommended.join(",");
   const helperKnownOnline = helperOnline === true || helperFromDrives === true;
   const loadSeq = useRef(0);
+  // V1.10.10: drives attached or removed while the dialog is open show up on
+  // their own (quiet re-check every few seconds), without "Refresh server drives".
+  const volumesKey = useRef("");
+  const pollBusy = useRef(false);
+  const manualBusy = useRef(false);  // a ref: the poll timer must see the live value
+  const [arrived, setArrived] = useState<string[]>([]);
+  const [partialList, setPartialList] = useState(false);
+
+  function volumesFrom(host: Awaited<ReturnType<typeof listOfficeServerDriveLetters>>): HostDriveVolume[] {
+    const volumes = (host?.volumes || []).filter((v) => v.drive_type !== "cdrom");
+    if (volumes.length) return volumes;
+    return (host?.drives || []).map((letter) => ({ letter, drive_type: "fixed" as const }));
+  }
+
+  function applyVolumes(next: HostDriveVolume[], { announce }: { announce: boolean }) {
+    const key = next
+      .map((v) => `${v.letter.toUpperCase()}|${v.label || ""}|${v.drive_type || ""}|${v.mounted ? 1 : 0}`)
+      .sort()
+      .join(",");
+    if (key === volumesKey.current) return;  // nothing changed: no re-render, no flicker
+    const before = new Set(volumesKey.current ? volumesKey.current.split(",").map((k) => k.split("|")[0]) : []);
+    volumesKey.current = key;
+    setWindowsVolumes(next);
+    if (announce && before.size) {
+      const added = next.map((v) => v.letter.toUpperCase()).filter((l) => !before.has(l));
+      if (added.length) setArrived(added);
+    }
+  }
 
   async function loadDrives() {
     const seq = ++loadSeq.current;
+    manualBusy.current = true;
     setDrivesLoading(true);
     setBrowseError(null);
     try {
@@ -123,22 +155,55 @@ export function BrowseFolderDialog({
       if (typeof host?.helper_online === "boolean") {
         setHelperFromDrives(host.helper_online);
       }
-      const volumes = (host?.volumes || []).filter((v) => v.drive_type !== "cdrom");
+      setPartialList(Boolean(host?.partial));
+      const volumes = volumesFrom(host);
       if (volumes.length) {
-        setWindowsVolumes(volumes);
+        applyVolumes(volumes, { announce: false });
         return;
       }
-      const letters = host?.drives || [];
-      if (letters.length) {
-        setWindowsVolumes(letters.map((letter) => ({ letter, drive_type: "fixed" as const })));
-        return;
-      }
-      setWindowsVolumes([]);
+      applyVolumes([], { announce: false });
       setBrowseError(host?.message || host?.error || "No HDD, SSD, USB, pendrive or mapped drive was detected.");
     } finally {
-      if (seq === loadSeq.current) setDrivesLoading(false);
+      if (seq === loadSeq.current) {
+        setDrivesLoading(false);
+        manualBusy.current = false;
+      }
     }
   }
+
+  async function pollDrives() {
+    if (pollBusy.current || manualBusy.current) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    pollBusy.current = true;
+    const seq = loadSeq.current;
+    try {
+      const host = await listOfficeServerDriveLetters(6000);
+      // A manual refresh started meanwhile wins; a failed poll changes nothing.
+      if (seq !== loadSeq.current || !host?.ok) return;
+      if (typeof host.helper_online === "boolean") setHelperFromDrives(host.helper_online);
+      setPartialList(Boolean(host.partial));
+      const volumes = volumesFrom(host);
+      if (volumes.length) {
+        applyVolumes(volumes, { announce: true });
+        setBrowseError((prev) => (prev && prev.startsWith("No HDD") ? null : prev));
+      }
+    } finally {
+      pollBusy.current = false;
+    }
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    const timer = window.setInterval(() => void pollDrives(), DRIVE_POLL_MS);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!arrived.length) return;
+    const timer = window.setTimeout(() => setArrived([]), 15_000);
+    return () => window.clearTimeout(timer);
+  }, [arrived]);
 
   useEffect(() => {
     if (!open) {
@@ -152,6 +217,10 @@ export function BrowseFolderDialog({
       setDrivesLoading(false);
       setAgentLetters([]);
       setHelperFromDrives(null);
+      volumesKey.current = "";
+      manualBusy.current = false;
+      setArrived([]);
+      setPartialList(false);
       return;
     }
     setAgentLetters(recommendedLettersKey ? recommendedLettersKey.split(",") : []);
@@ -302,6 +371,21 @@ export function BrowseFolderDialog({
           {drivesLoading && !windowsVolumes.length ? (
             <p className="text-xs text-ink-500">Detecting HDD / SSD / USB / mapped drives…</p>
           ) : null}
+
+          {arrived.length ? (
+            <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900" role="status">
+              New drive detected: {arrived.map((l) => `${l}:`).join(", ")}. Select it below to browse.
+            </div>
+          ) : null}
+
+          {partialList ? (
+            <p className="text-[11px] text-amber-800">
+              The HostDrive helper did not return its drive list in time, so only the drives mounted when the
+              application started are shown. Newly attached drives appear as soon as the helper answers.
+            </p>
+          ) : (
+            <p className="text-[11px] text-ink-400">Drives you attach or remove appear here automatically.</p>
+          )}
 
           {browseError ? (
             <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">

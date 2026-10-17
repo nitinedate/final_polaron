@@ -260,7 +260,7 @@ $script:AcquireJobs = @{}
 $script:RefreshStatusFile = Join-Path $env:TEMP ("aetheris_drive_refresh_{0}.json" -f $PID)
 $script:RefreshProcess = $null
 $refreshJobScript = Join-Path $root "scripts\refresh-drive-mounts-job.ps1"
-$script:HelperVersion = "5.50"
+$script:HelperVersion = "5.52"  # V1.10.11: drive refresh starts on the accept thread, not behind a folder listing
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -2732,6 +2732,7 @@ using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 public class AetherisHelperDispatcher {
   public readonly BlockingCollection<HttpListenerContext> Queue = new BlockingCollection<HttpListenerContext>();
   HttpListener _listener;
@@ -2745,6 +2746,9 @@ public class AetherisHelperDispatcher {
   public string NativeMtpJobScript = "";
   public string NativeIosJobScript = "";
   public string JobsDir = "";
+  public string ExpectedToken = "";
+  public string RefreshStatusFile = "";
+  public string RefreshJobScript = "";
   int _liveBusy;
   int _liveFiles;
   long _liveBytes;
@@ -2783,6 +2787,9 @@ public class AetherisHelperDispatcher {
         else if (method == "GET" && path == "/acquisition/adapters") WriteCached(ctx, AdaptersJsonPath, DefaultAdaptersJson);
         else if (method == "GET" && path == "/acquisition/devices") WriteCached(ctx, DevicesJsonPath, DefaultDevicesJson);
         else if (method == "GET" && (path == "/mobile-devices" || path == "/mobile_devices")) WriteMobileDevices(ctx);
+        else if (method == "GET" && path == "/drives") WriteDrives(ctx);
+        else if (method == "GET" && (path == "/refresh-drive-mounts" || path == "/refresh-drive-mounts/status")) WriteRefreshStatus(ctx);
+        else if (method == "POST" && path == "/refresh-drive-mounts") StartRefreshMount(ctx);
         else Queue.Add(ctx);
       } catch (HttpListenerException) { break; }
       catch (ObjectDisposedException) { break; }
@@ -2852,6 +2859,122 @@ public class AetherisHelperDispatcher {
         if (!string.IsNullOrWhiteSpace(raw)) json = raw;
       }
     } catch {}
+    WriteBytes(ctx, json);
+  }
+  // V1.10.10: GET /drives is answered here, on the accept thread, from the
+  // Windows drive table (no WMI / Storage cmdlets, no PowerShell queue). Before,
+  // it waited behind any long request (folder listing, drive refresh) and ran
+  // Get-Volume + Get-Partition + Win32_LogicalDisk, so the server's 4 s timeout
+  // fell back to the drives Docker mounted at startup and a newly attached
+  // USB / external disk (e.g. G:) never appeared.
+  static string JsonEsc(string s) {
+    if (s == null) return "";
+    StringBuilder sb = new StringBuilder(s.Length + 8);
+    foreach (char c in s) {
+      if (c == '\\') sb.Append("\\\\");
+      else if (c == '"') sb.Append("\\\"");
+      else if (c < (char)0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+      else sb.Append(c);
+    }
+    return sb.ToString();
+  }
+  public static string DriveRow(string root) {
+    string letter = root.Substring(0, 1).ToUpperInvariant();
+    string type = "other";
+    string label = "";
+    string fs = "";
+    long size = 0;
+    long free = 0;
+    bool ready = false;
+    try {
+      DriveInfo d = new DriveInfo(root);
+      DriveType t = d.DriveType;
+      if (t == DriveType.Fixed || t == DriveType.Ram) type = "fixed";
+      else if (t == DriveType.Removable) type = "removable";
+      else if (t == DriveType.Network) type = "network";
+      else if (t == DriveType.CDRom) type = "cdrom";
+      // A disconnected mapped share can block on any volume query: list its
+      // letter without touching it.
+      if (t != DriveType.Network) {
+        ready = d.IsReady;
+        if (ready) {
+          try { label = d.VolumeLabel; } catch {}
+          try { fs = d.DriveFormat; } catch {}
+          try { size = d.TotalSize; } catch {}
+          try { free = d.TotalFreeSpace; } catch {}
+        } else if (t == DriveType.Removable || t == DriveType.CDRom) {
+          return null;  // empty card-reader slot / no disc: Explorer hides these too
+        }
+      }
+    } catch {}
+    return "{\"letter\":\"" + letter + "\",\"label\":\"" + JsonEsc(label) + "\",\"drive_type\":\"" + type +
+      "\",\"size_bytes\":" + size + ",\"free_bytes\":" + free + ",\"filesystem\":\"" + JsonEsc(fs) +
+      "\",\"ready\":" + (ready ? "true" : "false") + "}";
+  }
+  static int CountTopLevelObjects(string jsonArray) {
+    int depth = 0, count = 0;
+    bool inString = false, escaped = false;
+    foreach (char c in jsonArray) {
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c == '\\') escaped = true;
+        else if (c == '"') inString = false;
+        continue;
+      }
+      if (c == '"') inString = true;
+      else if (c == '[' || c == '{') { if (c == '{' && depth == 1) count++; depth++; }
+      else if (c == ']' || c == '}') depth--;
+    }
+    return count;
+  }
+  public static string DrivesJson(string mobileJsonPath, int detailTimeoutMs) {
+    Stopwatch sw = Stopwatch.StartNew();
+    List<string> roots = new List<string>();
+    foreach (string root in Environment.GetLogicalDrives()) {
+      if (!string.IsNullOrEmpty(root) && root.Length >= 2 && root[1] == ':' && char.IsLetter(root[0])) roots.Add(root);
+    }
+    // Volume details in parallel with one time limit: a stuck device cannot hold
+    // the answer; it is listed by letter only.
+    List<Task<string>> tasks = new List<Task<string>>();
+    foreach (string root in roots) {
+      string r = root;
+      tasks.Add(Task.Factory.StartNew<string>(() => DriveRow(r)));
+    }
+    try { Task.WaitAll(tasks.ToArray(), detailTimeoutMs); } catch {}
+    List<string> volumes = new List<string>();
+    List<string> letters = new List<string>();
+    for (int i = 0; i < roots.Count; i++) {
+      string letter = roots[i].Substring(0, 1).ToUpperInvariant();
+      string row;
+      if (tasks[i].Status == TaskStatus.RanToCompletion) {
+        row = tasks[i].Result;
+        if (row == null) continue;
+      } else {
+        row = "{\"letter\":\"" + letter + "\",\"label\":\"\",\"drive_type\":\"other\",\"size_bytes\":0,\"free_bytes\":0,\"filesystem\":\"\",\"ready\":false,\"slow\":true}";
+      }
+      volumes.Add(row);
+      letters.Add("\"" + letter + "\"");
+    }
+    string mobile = "[]";
+    try {
+      if (!string.IsNullOrEmpty(mobileJsonPath) && File.Exists(mobileJsonPath)) {
+        string raw = File.ReadAllText(mobileJsonPath).Trim();
+        if (raw.StartsWith("[")) mobile = raw;
+      }
+    } catch {}
+    return "{\"ok\":true,\"source\":\"helper_fast\",\"drives\":[" + string.Join(",", letters.ToArray()) +
+      "],\"volumes\":[" + string.Join(",", volumes.ToArray()) + "],\"count\":" + volumes.Count +
+      ",\"mobile_devices\":" + mobile + ",\"mobile_count\":" + CountTopLevelObjects(mobile) +
+      ",\"scanned_ms\":" + sw.ElapsedMilliseconds + "}";
+  }
+  void WriteDrives(HttpListenerContext ctx) {
+    if (!string.IsNullOrEmpty(ExpectedToken) && ctx.Request.Headers["X-Host-Helper-Token"] != ExpectedToken) {
+      WriteJson(ctx, 401, "{\"ok\":false,\"error\":\"Unauthorized\"}");
+      return;
+    }
+    string json;
+    try { json = DrivesJson(MobileJsonPath, 2500); }
+    catch (Exception ex) { json = "{\"ok\":false,\"error\":\"" + JsonEsc(ex.Message) + "\"}"; }
     WriteBytes(ctx, json);
   }
   void WriteMobileDevices(HttpListenerContext ctx) {
@@ -3570,6 +3693,76 @@ public class AetherisHelperDispatcher {
       } catch {}
     }
   }
+  static string QuoteArg(string value) {
+    if (value == null) value = "";
+    int tail = 0;
+    for (int i = value.Length - 1; i >= 0 && value[i] == '\\'; i--) tail++;
+    string body = tail > 0 ? value.Substring(0, value.Length - tail) : value;
+    return "\"" + body + new string('\\', tail * 2) + "\"";
+  }
+  void WriteRefreshStatus(HttpListenerContext ctx) {
+    string json = "{\"ok\":true,\"status\":\"idle\",\"busy\":false}";
+    try {
+      if (!string.IsNullOrEmpty(RefreshStatusFile) && File.Exists(RefreshStatusFile)) {
+        string raw = File.ReadAllText(RefreshStatusFile);
+        if (!string.IsNullOrWhiteSpace(raw)) json = raw;
+      }
+    } catch {}
+    WriteBytes(ctx, json);
+  }
+  void StartRefreshMount(HttpListenerContext ctx) {
+    try {
+      string body = "";
+      using (StreamReader reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8)) {
+        body = reader.ReadToEnd() ?? "";
+      }
+      string required = JsonStr(body, "required_path");
+      if (string.IsNullOrEmpty(required)) required = JsonStr(body, "path");
+      required = (required ?? "").Trim().Replace('/', '\\');
+      string current = "";
+      try {
+        if (!string.IsNullOrEmpty(RefreshStatusFile) && File.Exists(RefreshStatusFile))
+          current = File.ReadAllText(RefreshStatusFile);
+      } catch {}
+      if (current.IndexOf("\"status\":\"running\"", StringComparison.OrdinalIgnoreCase) >= 0
+          || current.IndexOf("\"status\": \"running\"", StringComparison.OrdinalIgnoreCase) >= 0) {
+        WriteJson(ctx, 409, "{\"ok\":false,\"error\":\"Refresh already in progress\",\"status\":\"running\",\"busy\":true}");
+        return;
+      }
+      if (!string.IsNullOrEmpty(required)) {
+        if (required.Length < 3 || required[1] != ':') {
+          WriteJson(ctx, 400, "{\"ok\":false,\"error\":\"Selected evidence path must be an absolute Windows drive path.\"}");
+          return;
+        }
+        if (!Directory.Exists(required) && !File.Exists(required)) {
+          WriteJson(ctx, 400, "{\"ok\":false,\"error\":\"Windows cannot see the selected evidence path: " + JsonEscape(required) + "\"}");
+          return;
+        }
+      }
+      string msg = string.IsNullOrEmpty(required)
+        ? "Drive mount refresh started."
+        : "Checking Docker access to the selected folder.";
+      string statusJson = "{\"status\":\"running\",\"ok\":null,\"busy\":true,\"message\":\"" + JsonEscape(msg) +
+        "\",\"required_path\":" + (string.IsNullOrEmpty(required) ? "null" : "\"" + JsonEscape(required) + "\"") + "}";
+      try {
+        if (!string.IsNullOrEmpty(RefreshStatusFile))
+          File.WriteAllText(RefreshStatusFile, statusJson, new UTF8Encoding(false));
+      } catch {}
+      ProcessStartInfo psi = new ProcessStartInfo();
+      psi.FileName = "powershell.exe";
+      psi.UseShellExecute = false;
+      psi.CreateNoWindow = true;
+      string args = "-NoProfile -ExecutionPolicy Bypass -File " + QuoteArg(RefreshJobScript)
+        + " -Root " + QuoteArg(RootPath)
+        + " -StatusFile " + QuoteArg(RefreshStatusFile);
+      if (!string.IsNullOrEmpty(required)) args += " -RequiredPath " + QuoteArg(required);
+      psi.Arguments = args;
+      Process.Start(psi);
+      WriteJson(ctx, 202, "{\"ok\":true,\"started\":true,\"status\":\"running\",\"message\":\"" + JsonEscape(msg) + "\"}");
+    } catch (Exception ex) {
+      try { WriteJson(ctx, 500, "{\"ok\":false,\"error\":\"" + JsonEscape(ex.Message) + "\"}"); } catch {}
+    }
+  }
   public HttpListenerContext Dequeue(int timeoutMs) {
     HttpListenerContext ctx;
     if (Queue.TryTake(out ctx, timeoutMs)) return ctx;
@@ -3603,6 +3796,9 @@ $dispatcher.RootPath = $root
 $dispatcher.NativeMtpJobScript = Join-Path $root "scripts\native_mtp_job.ps1"
 $dispatcher.NativeIosJobScript = Join-Path $root "scripts\native_ios_job.ps1"
 $dispatcher.JobsDir = Join-Path $env:TEMP "aetheris_acq_jobs"
+$dispatcher.ExpectedToken = [string]$expectedToken
+$dispatcher.RefreshStatusFile = $script:RefreshStatusFile
+$dispatcher.RefreshJobScript = $refreshJobScript
 $dispatcher.Start($listener)
 
 Write-Host "Host drive helper listening on $listenPrefix"

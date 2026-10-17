@@ -153,9 +153,50 @@ def _write_graph_batches(driver, batches, write_fn) -> int:
         return sum(pool.map(run, pending))
 
 
-def _sync_parsed_edges(session, job_id: str, parsed_rows: list[dict], *, max_records: int | None = 20) -> int:
-    """Create evidence-derived graph edges from parse results."""
-    edges = 0
+_UNWIND_CHUNK = 5000
+
+# V1.10.9: one UNWIND statement per relationship type and batch. The previous
+# code sent one Cypher statement (one round trip, one transaction) per parsed
+# record, so a parsed EVTX with 40,000 events cost 40,000+ round trips.
+_PARSED_EDGE_CYPHER = {
+    "process": """UNWIND $rows AS r
+        MERGE (p:Process {name: r.name, job_id: $jid})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:PROVES_EXECUTION]->(p)""",
+    "link": """UNWIND $rows AS r
+        MERGE (f:File {path: r.target})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:LINKS_TO]->(f)""",
+    "event": """UNWIND $rows AS r
+        MERGE (ev:TimelineEvent {event_id: r.eid, job_id: $jid})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:CONTAINS_EVENT]->(ev)""",
+    "registry": """UNWIND $rows AS r
+        MERGE (rk:RegistryKey {path: r.rkey})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:STORES_KEY]->(rk)""",
+    "user": """UNWIND $rows AS r
+        MERGE (u:UserAccount {name: r.uname, job_id: $jid})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:BELONGS_TO_USER]->(u)""",
+    "table": """UNWIND $rows AS r
+        MERGE (db:Database {table: r.tbl, job_id: $jid})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:HAS_TABLE]->(db)""",
+    "encyclopedia": """UNWIND $rows AS r
+        MERGE (a:Artifact {id: r.aid})
+        MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+        MERGE (e)-[:MAPS_TO_ENCYCLOPEDIA]->(a)""",
+}
+_EVIDENCE_FILE_CYPHER = """UNWIND $rows AS r
+    MERGE (e:EvidenceFile {path: r.path, job_id: $jid})
+    SET e.parser = r.parser"""
+
+
+def _collect_parsed_edges(parsed_rows: list[dict], max_records: int | None) -> tuple[list[dict], dict[str, list[dict]]]:
+    """Same records and edge rules as before, grouped by relationship type."""
+    files: list[dict] = []
+    edges: dict[str, list[dict]] = {key: [] for key in _PARSED_EDGE_CYPHER}
     for row in parsed_rows:
         norm = row.get("normalized")
         if isinstance(norm, str):
@@ -165,113 +206,50 @@ def _sync_parsed_edges(session, job_id: str, parsed_rows: list[dict], *, max_rec
                 norm = [{"text": norm}]
         if not isinstance(norm, list):
             norm = [norm] if norm else []
-
         path = row.get("file_path", "")
         aid = row.get("encyclopedia_artifact_id")
-        parser_name = row.get("parser_name", "")
-
-        session.run(
-            """
-            MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-            SET e.parser = $parser
-            """,
-            path=path,
-            jid=job_id,
-            parser=parser_name,
-        )
-
+        files.append({"path": path, "parser": row.get("parser_name", "")})
         for rec in norm if max_records is None else norm[:max_records]:
             if not isinstance(rec, dict):
                 continue
             if rec.get("executable") or rec.get("format") == "prefetch_scca":
-                exe = rec.get("executable", "")
-                session.run(
-                    """
-                    MERGE (p:Process {name: $name, job_id: $jid})
-                    MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                    MERGE (e)-[:PROVES_EXECUTION]->(p)
-                    """,
-                    name=exe,
-                    jid=job_id,
-                    path=path,
-                )
-                edges += 1
+                edges["process"].append({"name": rec.get("executable", ""), "path": path})
             if rec.get("target") or rec.get("target_paths"):
                 target = rec.get("target") or (rec.get("target_paths") or [""])[0]
-                session.run(
-                    """
-                    MERGE (f:File {path: $target})
-                    MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                    MERGE (e)-[:LINKS_TO]->(f)
-                    """,
-                    target=target[:500],
-                    path=path,
-                    jid=job_id,
-                )
-                edges += 1
+                edges["link"].append({"target": str(target)[:500], "path": path})
             if rec.get("event_id"):
-                session.run(
-                    """
-                    MERGE (ev:TimelineEvent {event_id: $eid, job_id: $jid})
-                    MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                    MERGE (e)-[:CONTAINS_EVENT]->(ev)
-                    """,
-                    eid=str(rec["event_id"]),
-                    jid=job_id,
-                    path=path,
-                )
-                edges += 1
+                edges["event"].append({"eid": str(rec["event_id"]), "path": path})
             if rec.get("registry_key"):
-                session.run(
-                    """
-                    MERGE (rk:RegistryKey {path: $rkey})
-                    MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                    MERGE (e)-[:STORES_KEY]->(rk)
-                    """,
-                    rkey=rec["registry_key"][:500],
-                    path=path,
-                    jid=job_id,
-                )
-                edges += 1
+                edges["registry"].append({"rkey": str(rec["registry_key"])[:500], "path": path})
             if rec.get("user_profile"):
-                session.run(
-                    """
-                    MERGE (u:UserAccount {name: $uname, job_id: $jid})
-                    MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                    MERGE (e)-[:BELONGS_TO_USER]->(u)
-                    """,
-                    uname=rec["user_profile"],
-                    jid=job_id,
-                    path=path,
-                )
-                edges += 1
+                edges["user"].append({"uname": rec["user_profile"], "path": path})
             if rec.get("table"):
-                session.run(
-                    """
-                    MERGE (db:Database {table: $tbl, job_id: $jid})
-                    MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                    MERGE (e)-[:HAS_TABLE]->(db)
-                    """,
-                    tbl=rec["table"],
-                    jid=job_id,
-                    path=path,
-                )
-                edges += 1
-
+                edges["table"].append({"tbl": rec["table"], "path": path})
         if aid:
-            session.run(
-                """
-                MERGE (a:Artifact {id: $aid})
-                MERGE (e:EvidenceFile {path: $path, job_id: $jid})
-                MERGE (e)-[:MAPS_TO_ENCYCLOPEDIA]->(a)
-                """,
-                aid=aid,
-                path=path,
-                jid=job_id,
-            )
-            edges += 1
+            edges["encyclopedia"].append({"aid": aid, "path": path})
+    return files, edges
 
-    return edges
+
+def _unwind(session, cypher: str, rows: list[dict], job_id: str) -> None:
+    for start in range(0, len(rows), _UNWIND_CHUNK):
+        result = session.run(cypher, rows=rows[start:start + _UNWIND_CHUNK], jid=job_id)
+        # Consume so a write error surfaces here (and is retried by the caller).
+        consume = getattr(result, "consume", None)
+        if callable(consume):
+            consume()
+
+
+def _sync_parsed_edges(session, job_id: str, parsed_rows: list[dict], *, max_records: int | None = 20) -> int:
+    """Create evidence-derived graph edges from parse results (batched UNWIND)."""
+    files, edges = _collect_parsed_edges(parsed_rows, max_records)
+    if files:
+        _unwind(session, _EVIDENCE_FILE_CYPHER, files, job_id)
+    total = 0
+    for key, rows in edges.items():
+        if rows:
+            _unwind(session, _PARSED_EDGE_CYPHER[key], rows, job_id)
+            total += len(rows)
+    return total
 
 
 def sync_job_graph(db, job_id: str, *, schema_name: str) -> dict:
@@ -402,6 +380,69 @@ def sync_job_graph(db, job_id: str, *, schema_name: str) -> dict:
     return {"status": "ok", "nodes": nodes, "edges": edges}
 
 
+def sync_graph_files_phase(db, job_id: str, *, driver, total: int, stop=None, stage: str = "graph") -> int:
+    """EvidenceFile nodes for every registered file, then mark graph_files_done.
+
+    V1.11.0: this phase needs only the registered files, which are final once
+    registration ends. The graph_files sidecar runs it while native parsing and
+    the later stages are still busy; the serial graph stage then finds it done.
+    MERGE makes a repeated or concurrent run harmless.
+    """
+    from app.services.forensic_serial_stages import report_progress
+    from app.services.progress_agent import note_operation
+
+    last = "00000000-0000-0000-0000-000000000000"
+    scanned = 0
+
+    def write_files(session, rows):
+        payload = [{"path": r["file_path"], "sha": r["sha256"], "aid": r["encyclopedia_artifact_id"]} for r in rows]
+        session.run("""UNWIND $rows AS r
+            MERGE (e:EvidenceFile {path:r.path,job_id:$jid}) SET e.sha256=r.sha,e.artifact_id=r.aid
+            FOREACH (aid IN CASE WHEN r.aid IS NULL THEN [] ELSE [r.aid] END |
+                MERGE (a:Artifact {id:aid}) MERGE (e)-[:MAPS_TO_ENCYCLOPEDIA]->(a))""",
+            rows=payload, jid=job_id).consume()
+        return len(rows)
+
+    while True:
+        if stop is not None:
+            stop()
+        wave = []
+        for _ in range(GRAPH_WRITE_SLOTS):
+            rows = fetchall(db, """SELECT id,file_path,sha256,encyclopedia_artifact_id FROM job_artifacts
+                WHERE job_id=:jid AND id>:last ORDER BY id LIMIT 500""", {"jid": job_id, "last": last})
+            db.commit()
+            if not rows:
+                break
+            last = str(rows[-1]["id"])
+            wave.append([dict(row) for row in rows])
+        if not wave:
+            break
+        note_operation(db, job_id, stage, "Graph synchronization of extracted evidence", advanced=True, timeout_seconds=900)
+        scanned += _write_graph_batches(driver, wave, write_files)
+        if stage == "graph":
+            report_progress(db, job_id, "graph", total=total, completed=scanned, label="Graph synchronization of extracted evidence")
+    _mark_graph_phase(driver, job_id, "graph_files_done")
+    return scanned
+
+
+def run_graph_files_sidecar(db, job_id: str) -> dict:
+    """Graph files phase beside the running stages (disk jobs, after registration)."""
+    driver = _get_driver()
+    if driver is None:
+        return {"status": "deferred", "reason": "neo4j_unavailable"}
+    _ensure_graph_indexes(driver)
+    with driver.session() as session:
+        session.run("MERGE (j:Job {id:$jid}) SET j.updated_at=datetime()", jid=job_id).consume()
+        flag = session.run(
+            "MATCH (j:Job {id:$jid}) RETURN coalesce(j.graph_files_done,false) AS files", jid=job_id
+        ).single() or {}
+    if bool(flag.get("files")):
+        return {"status": "ok", "already_done": True}
+    total = int(fetchone(db, "SELECT count(*) AS c FROM job_artifacts WHERE job_id=:jid", {"jid": job_id})["c"])
+    written = sync_graph_files_phase(db, job_id, driver=driver, total=total, stage="graph_files")
+    return {"status": "ok", "evidence_files": written, "total": total}
+
+
 def sync_job_graph_serial(db, job_id: str, *, schema_name: str, mobile: bool = False) -> dict:
     """Keyset graph construction after enrichment, with no 5,000-file/20-record cap."""
     from app.services.forensic_serial_pipeline import StageWaiting
@@ -450,37 +491,10 @@ def sync_job_graph_serial(db, job_id: str, *, schema_name: str, mobile: bool = F
         nodes = total
         edges = total
     else:
-        last = "00000000-0000-0000-0000-000000000000"
-
-        def write_files(session, rows):
-            payload = [{"path": r["file_path"], "sha": r["sha256"], "aid": r["encyclopedia_artifact_id"]} for r in rows]
-            session.run("""UNWIND $rows AS r
-                MERGE (e:EvidenceFile {path:r.path,job_id:$jid}) SET e.sha256=r.sha,e.artifact_id=r.aid
-                FOREACH (aid IN CASE WHEN r.aid IS NULL THEN [] ELSE [r.aid] END |
-                    MERGE (a:Artifact {id:aid}) MERGE (e)-[:MAPS_TO_ENCYCLOPEDIA]->(a))""",
-                rows=payload, jid=job_id).consume()
-            return len(rows)
-
-        while True:
-            stop()
-            wave = []
-            for _ in range(GRAPH_WRITE_SLOTS):
-                rows = fetchall(db, """SELECT id,file_path,sha256,encyclopedia_artifact_id FROM job_artifacts
-                    WHERE job_id=:jid AND id>:last ORDER BY id LIMIT 500""", {"jid": job_id, "last": last})
-                db.commit()
-                if not rows:
-                    break
-                last = str(rows[-1]["id"])
-                wave.append([dict(row) for row in rows])
-            if not wave:
-                break
-            note_operation(db, job_id, "graph", "Graph synchronization of extracted evidence", advanced=True, timeout_seconds=900)
-            written = _write_graph_batches(driver, wave, write_files)
-            scanned += written
-            nodes += written
-            edges += written
-            report_progress(db, job_id, "graph", total=total, completed=scanned, label="Graph synchronization of extracted evidence")
-        _mark_graph_phase(driver, job_id, "graph_files_done")
+        written = sync_graph_files_phase(db, job_id, driver=driver, total=total, stop=stop)
+        scanned += written
+        nodes += written
+        edges += written
 
     if not parsed_done:
         last = "00000000-0000-0000-0000-000000000000"

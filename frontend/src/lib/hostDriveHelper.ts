@@ -85,6 +85,9 @@ export type HostDriveVolume = {
   free_bytes?: number;
   filesystem?: string;
   mounted?: boolean;
+  /** V1.10.10: false for a locked / not-ready volume; slow = details timed out */
+  ready?: boolean;
+  slow?: boolean;
 };
 
 export type MobileAttachHost = "office_server" | "this_pc";
@@ -129,6 +132,8 @@ export type HostDriveLettersResult = {
   mobile_count?: number;
   error?: string;
   message?: string;
+  /** V1.10.10: helper online but its list was unavailable; only startup-mounted drives are shown */
+  partial?: boolean;
 };
 
 export type HostMobileDevicesResult = {
@@ -1117,7 +1122,7 @@ export async function startHostDriveAgentFromBrowser(
 }
 
 function mountCallRestarted(message: string): boolean {
-  return /bad gateway|still starting|502|504|unable to reach|timed out while contacting|network_error/i.test(
+  return /bad gateway|still starting|502|504|unable to reach|timed out|network_error/i.test(
     message
   );
 }
@@ -1135,7 +1140,7 @@ async function ensureOfficePathMountedOnce(
       message?: string;
       required_letter?: string | null;
       refresh_error?: string | null;
-    }>("/api/hostdrive/ensure-path", { required_path: requiredPath }, { timeoutMs: 180_000 });
+    }>("/api/hostdrive/ensure-path", { required_path: requiredPath }, { timeoutMs: 240_000 });
     // Exact evidence readability is authoritative. A mounted G: root can be a
     // stale bind left from a previously attached removable disk.
     if (ensured.ok !== false && ensured.path_ready === true) {

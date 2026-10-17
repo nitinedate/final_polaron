@@ -638,23 +638,15 @@ if ($RemountOnly) {
     exit $(if ($ok) { 0 } else { 31 })
 }
 
-$desktopHostReady = Ensure-DockerDesktopHostLetter -Letter $letter
-$attempts += [pscustomobject]@{
-    source = "/mnt/host/$lower"
-    mode = "docker-desktop-host"
-    ok = [bool]$desktopHostReady
-    detail = $(if ($desktopHostReady) { "Drive is visible in Docker Desktop at /mnt/host/$lower" } else { "Could not attach ${letter}: under Docker Desktop /mnt/host/$lower" })
-}
-
+# Read the Windows letter itself first. A compose bind of G:/ is the path
+# Docker Desktop keeps after a USB replug. /mnt/host/g is an internal stub
+# that becomes "no such device" and must not win while the letter is readable.
+$desktopHostReady = $false
 if (-not $ForceWslBridge) {
-    # Test exact bytes/path, not merely whether Docker created /probe. An empty
-    # stale mount is the failure mode this resolver is designed to catch.
-    # Prefer the remounted daemon path first: Windows G:\ binds stay empty
-    # until DrvFs is attached at /mnt/host/g.
     $directSources = @(
-        "/mnt/host/$lower",
         "${letter}:/",
         "${letter}:\",
+        "/mnt/host/$lower",
         "/run/desktop/mnt/host/$lower",
         "/host_mnt/$lower",
         "/$lower"
@@ -664,6 +656,9 @@ if (-not $ForceWslBridge) {
         $probe = Test-DockerSource -Source $source -Image $image -RelativePath $relative
         $attempts += [pscustomobject]@{ source = $source; mode = "direct"; ok = [bool]$probe.ok; detail = $probe.output }
         if ($probe.ok) {
+            if ($source -match '^[A-Za-z]:[/\\]?$') {
+                $source = "{0}:/" -f $source.Substring(0, 1).ToUpper()
+            }
             Write-Result @{
                 ok             = $true
                 drive          = $letter

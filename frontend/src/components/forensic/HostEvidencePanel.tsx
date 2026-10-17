@@ -640,34 +640,26 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     const missing = host.drives.filter(
       (letter) => !mounted.has(letter.replace(":", "").toLowerCase())
     );
+    lastHostDrivesRef.current = hostKey;
     if (!missing.length) {
-      lastHostDrivesRef.current = hostKey;
       lastAutoRemountRef.current = "";
       return false;
     }
-
-    // Avoid restarting the forensic containers on every poll when Docker
-    // Desktop refuses one specific removable volume. A newly changed drive
-    // inventory gets one automatic remount attempt; the Refresh button remains
-    // available for an explicit retry.
+    // Show the new letter immediately. Docker is mounted for that folder when
+    // extraction starts, not by rebuilding every drive in the background.
     if (lastAutoRemountRef.current === hostKey) return false;
     lastAutoRemountRef.current = hostKey;
-
     syncInFlightRef.current = true;
     try {
       toastRef.current.info(
-        `Server drive(s) ${missing.join(", ")} detected — mounting read-only into forensic workers…`
+        `New drive ${missing.join(", ")} detected. Select its folder — extraction reads that drive in place.`
       );
-      const ok = await refreshDriveMountsOnHost();
-      if (ok) {
-        const refreshed = await loadBrowse({ drive: "", path: "", silent: true });
-        if (refreshed) lastHostDrivesRef.current = hostKey;
-      }
-      return ok;
+      await loadBrowse({ drive: "", path: "", silent: true });
+      return true;
     } finally {
       syncInFlightRef.current = false;
     }
-  }, [disabled, fetchBrowse, loadBrowse, refreshDriveMountsOnHost, remounting]);
+  }, [disabled, fetchBrowse, loadBrowse, remounting]);
 
   const prepareForFolderSelect = useCallback(async (opts?: { force?: boolean }) => {
     const health = await ensureHostDriveHelper(
@@ -1339,13 +1331,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       // recreates only the four forensic services when a mount is missing/stale.
       const driveMatch = normalized.match(/^([A-Za-z]):[\\/]/);
       if (driveMatch) {
-        onRegisterProgress?.({
-          active: true,
-          pct: 2,
-          fileName: normalized,
-          phase: "mounting",
-        });
-        toastRef.current.info(`Mounting office ${driveMatch[1].toUpperCase()}: so Docker can read it…`);
+        // Stay on the button until we know a remount is required. An already
+        // readable folder must not open the Drive mount step.
         const mount = await ensureOfficePathMounted(normalized);
         const mountReady = Boolean(mount.ok);
         if (!mountReady) {

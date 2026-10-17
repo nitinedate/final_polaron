@@ -422,7 +422,12 @@ def test_serial_graph_reads_every_parsed_record():
         )
         == 50
     )
-    assert sum("CONTAINS_EVENT" in args[0] for args, kwargs in calls) == 50
+    # V1.10.9: every record is still written, now in one batched UNWIND call
+    # instead of one call per record.
+    event_calls = [(args, kwargs) for args, kwargs in calls if "CONTAINS_EVENT" in args[0]]
+    assert sum(len(kwargs["rows"]) for args, kwargs in event_calls) == 50
+    assert {row["eid"] for args, kwargs in event_calls for row in kwargs["rows"]} == {str(i + 1) for i in range(50)}
+    assert len(event_calls) == 1
 
 
 def test_missing_registered_file_blocks_materialization(monkeypatch):

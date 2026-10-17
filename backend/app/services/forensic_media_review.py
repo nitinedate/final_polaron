@@ -559,22 +559,64 @@ def _commit_media_inspection(db, job_id, row, inspected: dict) -> None:
     )
 
 
+def media_review_workers() -> int:
+    """V1.10.9: Tesseract workers follow the CPU count (was a fixed 8).
+
+    MEDIA_REVIEW_WORKERS overrides. Each Tesseract call is held to one OpenMP
+    thread so N workers use about N cores instead of oversubscribing them.
+    """
+    raw = str(os.environ.get("MEDIA_REVIEW_WORKERS") or "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return min(int(raw), 64)
+    cpus = os.cpu_count() or 8
+    return max(4, min(16, cpus - 2))
+
+
+_PROGRESS_EVERY_FILES = 50
+_PROGRESS_EVERY_SECONDS = 3.0
+_PROGRESS_STATE: dict[str, dict] = {}
+
+
+def _progress_due(job_id) -> bool:
+    """True every 50 files or 3 s per job (the final summary always recounts)."""
+    import time as _time
+
+    state = _PROGRESS_STATE.setdefault(str(job_id), {"since": 0, "at": 0.0})
+    state["since"] += 1
+    now = _time.monotonic()
+    if state["since"] >= _PROGRESS_EVERY_FILES or now - state["at"] >= _PROGRESS_EVERY_SECONDS:
+        state["since"] = 0
+        state["at"] = now
+        return True
+    return False
+
+
 def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
-    """Tesseract over unclear pictures, eight at a time. Clear pictures are skipped."""
+    """Tesseract over unclear pictures, in parallel. Clear pictures are skipped."""
+    import time as _time
+
     from app.services.artifact_media_properties import _stream_to_temp
     from app.services.forensic_serial_stages import report_progress
     from app.services.job_control import pipeline_should_stop
     from app.services.progress_agent import note_operation
 
-    workers = 8
+    workers = media_review_workers()
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+    progress_state = {"since": 0, "at": 0.0}
 
     def _kind(row):
         ext = Path(row["file_path"]).suffix.lower()
         mime = str((row.get("metadata") or {}).get("mime") or (row.get("metadata") or {}).get("detected_mime") or "")
         return "video" if ext in _VIDEO or mime.startswith("video/") else "image"
 
-    def _publish(row, inspected) -> None:
-        _commit_media_inspection(db, job_id, row, inspected)
+    def _report(force: bool = False) -> None:
+        # V1.10.9: the progress count ran after EVERY file (a full count of all
+        # observations of the job each time). Now at most every 50 files / 3 s.
+        now = _time.monotonic()
+        if not force and progress_state["since"] < _PROGRESS_EVERY_FILES and now - progress_state["at"] < _PROGRESS_EVERY_SECONDS:
+            return
+        progress_state["since"] = 0
+        progress_state["at"] = now
         note_operation(db, job_id, "media_review", "Tesseract image/video text", advanced=True, timeout_seconds=900)
         counts = fetchone(
             db,
@@ -591,6 +633,11 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
             skipped=int(counts["skipped"]),
             label="Tesseract on unclear images and videos",
         )
+
+    def _publish(row, inspected) -> None:
+        _commit_media_inspection(db, job_id, row, inspected)
+        progress_state["since"] += 1
+        _report()
 
     def _inspect(temp, row):
         try:
@@ -668,6 +715,7 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
             _submit(row, temp)
         while inflight:
             _drain(True)
+    _report(force=True)
 
 
 def run_media_review(db, job_id, *, schema_name):
@@ -721,7 +769,7 @@ def run_media_review(db, job_id, *, schema_name):
             db,
             job_id,
             (
-                "Image/video observations — Tesseract on unclear pictures, 8 workers. Clear pictures are skipped."
+                f"Image/video observations — Tesseract on unclear pictures, {media_review_workers()} workers. Clear pictures are skipped."
                 if fast_ocr
                 else "Evidence observations are only for images and videos that are not clear. Clear pictures, audio, and video are skipped and not added."
             ),
@@ -1018,21 +1066,22 @@ def run_media_review(db, job_id, *, schema_name):
             finally:
                 if temp:
                     Path(temp).unlink(missing_ok=True)
-            counts = fetchone(
-                db,
-                "SELECT count(*) FILTER(WHERE status='done') AS done,count(*) FILTER(WHERE status='failed') AS failed,count(*) FILTER(WHERE status='skipped') AS skipped FROM forensic_media_observations WHERE job_id=:jid",
-                {"jid": job_id},
-            )
-            report_progress(
-                db,
-                job_id,
-                "media_review",
-                total=total,
-                completed=int(counts["done"]),
-                failed=int(counts["failed"]),
-                skipped=int(counts["skipped"]),
-                label="Unclear image and video evidence only",
-            )
+            if _progress_due(job_id):
+                counts = fetchone(
+                    db,
+                    "SELECT count(*) FILTER(WHERE status='done') AS done,count(*) FILTER(WHERE status='failed') AS failed,count(*) FILTER(WHERE status='skipped') AS skipped FROM forensic_media_observations WHERE job_id=:jid",
+                    {"jid": job_id},
+                )
+                report_progress(
+                    db,
+                    job_id,
+                    "media_review",
+                    total=total,
+                    completed=int(counts["done"]),
+                    failed=int(counts["failed"]),
+                    skipped=int(counts["skipped"]),
+                    label="Unclear image and video evidence only",
+                )
         if fast_ocr and pending_rows:
             _run_fast_media_observations(db, job_id, by_part, loose, total)
         else:

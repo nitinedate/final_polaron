@@ -11,7 +11,7 @@ def test_job_detail_disk_does_not_hide_server_browser_in_auto_process_mode():
     panel = read("frontend/src/components/forensic/HostEvidencePanel.tsx")
     assert "const fullyAutomated = embedded && autoProcess && isLiveMobileSource" in panel
     assert "Server evidence browser — zero-copy" in panel
-    assert "Detect server drives" in panel
+    assert "Forensic server drives" in panel
 
 
 def test_server_drive_inventory_is_not_gated_by_client_localhost_helper():
@@ -21,12 +21,13 @@ def test_server_drive_inventory_is_not_gated_by_client_localhost_helper():
     assert "hostDriveHelperHealth" not in root
 
 
-def test_new_attached_server_drive_triggers_sync_attached_mount():
+def test_new_attached_server_drive_is_listed_without_a_stack_rebuild():
     panel = read("frontend/src/components/forensic/HostEvidencePanel.tsx")
     dialog = read("frontend/src/components/forensic/BrowseFolderDialog.tsx")
     assert "syncAttached: !opts?.requiredPath" in panel
-    assert "syncAttached: true" in dialog
-    assert "Server drive(s)" in panel and "mounting read-only" in panel
+    assert "New drive detected:" in dialog
+    assert "New drive" in panel and "reads that drive in place" in panel
+    assert "mounting read-only into forensic workers" not in panel
 
 
 def test_server_drive_poll_does_not_require_browser_helper_cache():

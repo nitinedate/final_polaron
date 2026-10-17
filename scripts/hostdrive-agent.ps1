@@ -53,16 +53,9 @@ function Get-HostDriveLetterSet {
             }
     }
     catch { }
-    try {
-        Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
-            Where-Object { $_.DeviceID -match '^[A-Z]:$' } |
-            ForEach-Object {
-                $letter = $_.DeviceID.Substring(0, 1).ToUpper()
-                if (Test-Path -LiteralPath "${letter}:\") { [void]$found.Add($letter) }
-            }
-    }
-    catch { }
-    # Fresh removable drives can appear in Explorer before PSDrive/CIM updates.
+    # Fresh removable drives can appear in Explorer before PSDrive updates.
+    # Do not query Win32_LogicalDisk here: a stale letter makes that call hang
+    # and the new drive never gets announced.
     # Probe all possible letters so G/H/I/J/K/L/M/N/... work automatically.
     foreach ($code in ([int][char]'A')..([int][char]'Z')) {
         $letter = [string][char]$code
@@ -161,40 +154,13 @@ while ($true) {
         if (Test-Path -LiteralPath $lettersFile) {
             $prev = (Get-Content -LiteralPath $lettersFile -Raw -ErrorAction SilentlyContinue).Trim()
         }
-        $staleMount = $false
-        $apiName = ""
-        try {
-            $apiName = (docker ps --filter "name=aetheris-forensic-api" --format "{{.Names}}" 2>$null | Select-Object -First 1)
-        } catch { $apiName = "" }
-        if ($apiName -and $now) {
-            foreach ($letter in @($now.Split(",") | Where-Object { $_ })) {
-                $low = "$letter".ToLower()
-                $winHasFiles = $false
-                try {
-                    $winHasFiles = [bool](Get-ChildItem -LiteralPath "${letter}:\" -Force -ErrorAction Stop | Select-Object -First 1)
-                } catch { $winHasFiles = $false }
-                $probe = docker exec $apiName python -c "import os; print(len(os.listdir('/host/$low')))" 2>&1 | Out-String
-                if ($LASTEXITCODE -ne 0 -and ($probe -match 'No such device|ENODEV|Errno 19')) {
-                    $staleMount = $true
-                    Write-Host "[HostDrive agent] Docker mount /host/$low is stale (No such device)"
-                    break
-                }
-                if ($winHasFiles -and $LASTEXITCODE -eq 0 -and ($probe.Trim() -eq '0')) {
-                    $staleMount = $true
-                    Write-Host "[HostDrive agent] Docker mount /host/$low is an empty stub; Windows ${letter}: has files"
-                    break
-                }
-            }
-        }
-        if ($now -and (($now -ne $prev) -or $staleMount)) {
-            Write-Host "[HostDrive agent] Drive set changed: '$prev' -> '$now'$(if ($staleMount) { ' (stale Docker mount)' })"
+        if ($now -and $now -ne $prev) {
+            # A newly attached disk is usable as soon as Windows assigns a letter.
+            # This watcher does NOT call Invoke-RefreshMounts here. Rebuilding every
+            # Docker service on plug-in is what made extraction time out. The
+            # selected folder is mounted in place when extraction starts.
+            Write-Host "[HostDrive agent] Drive set changed: '$prev' -> '$now'. Available immediately; extraction mounts that folder in place."
             Set-Content -Path $lettersFile -Value $now -Encoding ascii
-            try {
-                Invoke-RefreshMounts | Out-Null
-            }
-            catch {
-                Write-Warning ("[HostDrive agent] Auto-refresh failed: {0}" -f $_.Exception.Message)
-            }
         }
     }
     catch {

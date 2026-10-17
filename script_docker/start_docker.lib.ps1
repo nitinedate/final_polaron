@@ -21,8 +21,18 @@ function Get-DockerJson {
 
 function Get-StackComposeArgs {
     param([string]$Root, [string]$Name)
-    return @("compose", "--project-directory", $Root, "--project-name", "aetheris-$Name",
+    $composeArgs = @("compose", "--project-directory", $Root, "--project-name", "aetheris-$Name",
         "-f", "services/$Name/docker-compose.yml")
+    $drives = switch ($Name) {
+        'forensic' { 'docker-compose.drives.forensic.yml' }
+        'mobile-android' { 'docker-compose.drives.mobile-android.yml' }
+        'mobile-ios' { 'docker-compose.drives.mobile-ios.yml' }
+        default { '' }
+    }
+    if ($drives -and (Test-Path -LiteralPath (Join-Path $Root $drives))) {
+        $composeArgs += @('-f', $drives)
+    }
+    return $composeArgs
 }
 
 function Write-NewDeploymentFile {

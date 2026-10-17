@@ -41,6 +41,90 @@ def _match_encyclopedia_id(path: str, enc_cache: list[dict]) -> str | None:
     return match_encyclopedia_id(path, enc_cache)
 
 
+def parse_queue_classification_sql() -> tuple[str, str]:
+    """(parse_status CASE, ocr_status CASE) evaluated on the row being inserted.
+
+    V1.10.9: the same decisions ``prepare_forensic_parse_queue`` used to make in
+    a second full pass over job_artifacts (``skip_low_value_pending`` then
+    ``bulk_skip_non_parser_pending``), applied while the row is registered:
+
+    * not forensic (keep-set)            -> parse skipped, OCR untouched (default)
+    * media / fonts in the keep-set      -> parse skipped, OCR routed (pending/skipped/na)
+    * oversized non-critical EVTX        -> parse skipped, OCR 'na'
+    * everything else                    -> parse pending
+    Every row is still registered and stays in inventory.
+    """
+    from app.config import get_settings
+    from app.services.artifact_parse import _MEDIA_SKIP_EXTENSIONS_SQL, forensic_parse_keep_sql
+    from app.services.ocr_gpu import ocr_status_sql_for_parse_skip
+
+    evtx_max = int(getattr(get_settings(), "parse_evtx_max_bytes", 6_000_000) or 6_000_000)
+    keep = forensic_parse_keep_sql()
+    media = f"({_MEDIA_SKIP_EXTENSIONS_SQL})"
+    evtx = (
+        "(lower(coalesce(extension, '')) = '.evtx'"
+        f" AND coalesce(size_bytes, 0) > {evtx_max}"
+        " AND NOT (file_path ILIKE '%Security.evtx' OR file_path ILIKE '%System.evtx'"
+        " OR file_path ILIKE '%Application.evtx'))"
+    )
+    parse_case = (
+        f"CASE WHEN NOT {keep} THEN 'skipped' WHEN {media} THEN 'skipped' "
+        f"WHEN {evtx} THEN 'skipped' ELSE 'pending' END"
+    )
+    ocr_case = (
+        f"CASE WHEN NOT {keep} THEN 'pending' WHEN {media} THEN {ocr_status_sql_for_parse_skip()} "
+        f"WHEN {evtx} THEN 'na' ELSE 'pending' END"
+    )
+    return parse_case, ocr_case
+
+
+def _classified_insert_sql() -> str:
+    """INSERT .. SELECT FROM (VALUES %s) for psycopg2 execute_values.
+
+    The classification predicates refer to the unqualified column names of the
+    VALUES alias, so they are evaluated on the incoming row. Literal ``%`` in
+    the LIKE patterns is doubled for psycopg2 parameter formatting.
+    """
+    parse_case, ocr_case = parse_queue_classification_sql()
+    parse_case = parse_case.replace("%", "%%")
+    ocr_case = ocr_case.replace("%", "%%")
+    return f"""INSERT INTO job_artifacts (job_id, file_path, file_name, extension, size_bytes, sha256,
+           encyclopedia_artifact_id, parse_status, ocr_status, metadata)
+        SELECT job_id, file_path, file_name, extension, size_bytes, sha256, enc,
+               {parse_case}, {ocr_case}, metadata
+        FROM (VALUES %s) AS v(job_id, file_path, file_name, extension, size_bytes, sha256, enc, metadata)
+        ON CONFLICT (job_id, file_path) DO UPDATE SET
+          encyclopedia_artifact_id=EXCLUDED.encyclopedia_artifact_id,
+          metadata = CASE
+            WHEN EXCLUDED.metadata IS NOT NULL AND EXCLUDED.metadata <> '{{}}'::jsonb
+              THEN coalesce(job_artifacts.metadata, '{{}}'::jsonb) || EXCLUDED.metadata
+            ELSE job_artifacts.metadata
+          END,
+          updated_at=NOW()"""
+
+
+_CLASSIFIED_VALUES_TEMPLATE = "(%s::uuid, %s, %s, %s, %s::bigint, %s, %s, %s::jsonb)"
+
+
+def _write_classified_batch(db, sql: str, batch: list[dict]) -> None:
+    """Bulk insert one batch (one round trip per 1000 rows) and commit it."""
+    from psycopg2.extras import execute_values
+
+    from app.db.sql_helpers import retry_on_deadlock
+
+    values = [
+        (row["job_id"], row["path"], row["name"], row["ext"], row["size"], row["sha"], row["enc"], row["meta"])
+        for row in batch
+    ]
+
+    def _write() -> None:
+        with db.connection().connection.cursor() as cur:
+            execute_values(cur, sql, values, template=_CLASSIFIED_VALUES_TEMPLATE, page_size=1000)
+        db.commit()
+
+    retry_on_deadlock(db, _write)
+
+
 def materialize_index_entries(
     db,
     job_id: str,
@@ -48,7 +132,17 @@ def materialize_index_entries(
     *,
     update_status: bool = True,
     phase1_filter: bool | None = None,
+    classify_parse_queue: bool = False,
+    extra_metadata=None,
 ) -> dict:
+    """Register extracted entries as job_artifacts.
+
+    V1.10.9 (serial Disk RAG): ``classify_parse_queue`` sets parse/OCR status
+    while inserting, so native parsing no longer needs a second filtering pass
+    over every registered row, and ``extra_metadata(entry)`` stores provenance in
+    the same insert instead of a second UPDATE of every row. Both use bulk
+    ``execute_values`` inserts.
+    """
     if not entries:
         return {"status": "ok", "artifacts_total": 0, "encyclopedia_matched": 0}
 
@@ -104,6 +198,16 @@ def materialize_index_entries(
              updated_at=NOW()"""
     )
     deleted_tagged = 0
+    classified_sql = _classified_insert_sql() if classify_parse_queue else None
+
+    def _flush(rows: list[dict]) -> None:
+        if not rows:
+            return
+        if classified_sql:
+            _write_classified_batch(db, classified_sql, rows)
+        else:
+            db.execute(insert_sql, rows)
+            db.flush()
 
     for e in entries:
         inspected += 1
@@ -157,6 +261,10 @@ def materialize_index_entries(
                 del_meta["deleted_at"] = e.get("deleted_at")
         if del_meta:
             deleted_tagged += 1
+        if extra_metadata is not None:
+            extra = extra_metadata(e) or {}
+            if extra:
+                del_meta = {**(del_meta or {}), **extra}
         batch.append({
             "job_id": job_id,
             "path": path,
@@ -169,8 +277,7 @@ def materialize_index_entries(
         })
         created += 1
         if len(batch) >= _BATCH_SIZE:
-            db.execute(insert_sql, batch)
-            db.flush()
+            _flush(batch)
             batch.clear()
 
         if update_status and (inspected - last_progress >= _PROGRESS_EVERY or inspected >= total_entries):
@@ -204,8 +311,8 @@ def materialize_index_entries(
             last_progress = inspected
 
     if batch:
-        db.execute(insert_sql, batch)
-        db.flush()
+        _flush(batch)
+        batch.clear()
 
     if update_status:
         from app.services.pipeline_progress import write_merged_pipeline_progress
@@ -241,6 +348,7 @@ def materialize_index_entries(
                 "skipped_noise": skipped_noise,
                 "deleted_tagged": deleted_tagged,
                 "phase1_filter": phase1_filter,
+                "parse_queue_classified_at_registration": bool(classify_parse_queue),
             },
         )
         db.commit()
@@ -250,7 +358,18 @@ def materialize_index_entries(
         "encyclopedia_matched": matched,
         "skipped_noise": skipped_noise,
         "phase1_filter": phase1_filter,
+        "parse_queue_classified": bool(classify_parse_queue),
     }
+    if classify_parse_queue:
+        counts = fetchone(
+            db,
+            """SELECT count(*) FILTER (WHERE parse_status='pending') AS parse_pending,
+                      count(*) FILTER (WHERE parse_status='skipped') AS parse_skipped
+                 FROM job_artifacts WHERE job_id=:jid""",
+            {"jid": job_id},
+        ) or {}
+        result["parse_pending"] = int(counts.get("parse_pending") or 0)
+        result["parse_skipped_at_registration"] = int(counts.get("parse_skipped") or 0)
     try:
         from app.services.evidence_browse_indexes import ensure_evidence_browse_indexes
 

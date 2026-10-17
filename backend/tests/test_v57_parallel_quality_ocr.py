@@ -33,7 +33,8 @@ def test_recovery_starts_gpu_ocr_sidecar():
 
 def test_ocr_worker_may_run_while_recovery_is_authoritative():
     text = Path('app/tasks.py').read_text(encoding='utf-8')
-    assert "stage IN ('parse','recovery')" in text
+    # V1.11.0 widened the overlap: OCR may also run while artifacts are registered.
+    assert "stage IN ('materialize','parse','recovery')" in text
     assert 'if not parallel_recovery:' in text
 
 

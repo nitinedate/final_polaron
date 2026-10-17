@@ -32,20 +32,66 @@ if (-not (Test-Path -LiteralPath $libPath -PathType Leaf)) {
 function Write-Ok([string]$Message) { Write-Host "    $Message" -ForegroundColor Green }
 function Write-Warn([string]$Message) { Write-Host "    $Message" -ForegroundColor Yellow }
 
+function Get-RunningContainerIds {
+    $ids = @(& docker ps -q 2>$null)
+    return @($ids | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+}
+
 function Stop-PolaronStacks {
     # Stop only owned project containers; never run global docker stop/prune.
+    # V1.10.8.1: all Polaron containers are stopped in ONE parallel docker stop
+    # (each still gets 45 s to shut down cleanly), with progress every 10 s.
+    # Before, the six projects were stopped one after another and the console
+    # showed nothing while e.g. the 11 vulnerability containers shut down.
     Write-Step 'Stop existing Polaron project containers (preserve volumes/evidence)'
     $names = @('aetheris-gateway','aetheris-vuln','aetheris-mobile-ios','aetheris-mobile-android','aetheris-forensic','aetheris-common')
+    $all = New-Object System.Collections.ArrayList
     foreach ($name in $names) {
-        $ids = @(& docker ps -aq --filter "label=com.docker.compose.project=$name")
+        $ids = @(& docker ps -q --filter "label=com.docker.compose.project=$name")
         if ($LASTEXITCODE -ne 0) { throw "Cannot query owned containers for $name" }
-        $ids = @($ids | Where-Object { $_ -and $_.Trim() })
+        $ids = @($ids | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
         if ($ids.Count -gt 0) {
-            Write-Host "    Stopping $name ($($ids.Count) containers)..."
-            & docker stop --time 45 @ids | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Cannot stop $name; refusing to start competing containers." }
+            Write-Host "    $name : $($ids.Count) running container(s)"
+            foreach ($id in $ids) { [void]$all.Add($id) }
         }
     }
+    if ($all.Count -eq 0) {
+        Write-Ok 'No Polaron containers are running.'
+        return
+    }
+    Write-Host ("    Stopping {0} containers together (each gets up to 45 s to shut down cleanly)..." -f $all.Count)
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $proc = Start-Process -FilePath 'docker' -ArgumentList (@('stop', '--time', '45') + @($all)) -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $null = $proc.Handle  # keeps ExitCode readable after exit (Windows PowerShell 5.1)
+        $hardLimitSec = 150
+        if ("$env:AETHERIS_STOP_HARD_LIMIT_SEC" -match '^[0-9]+$' -and [int]$env:AETHERIS_STOP_HARD_LIMIT_SEC -gt 0) {
+            $hardLimitSec = [int]$env:AETHERIS_STOP_HARD_LIMIT_SEC
+        }
+        while (-not $proc.WaitForExit(10000)) {
+            $running = @(Get-RunningContainerIds)
+            $left = @($all | Where-Object { $running -contains $_ })
+            Write-Host ("    ... {0:n0} s, {1} of {2} still shutting down" -f $sw.Elapsed.TotalSeconds, $left.Count, $all.Count)
+            if ($sw.Elapsed.TotalSeconds -ge $hardLimitSec) {
+                Write-Warn ("docker stop did not return after {0} s; forcing the remaining {1} container(s) to stop." -f $hardLimitSec, $left.Count)
+                try { $proc.Kill() } catch { }
+                if ($left.Count) { & docker kill @left *> $null }
+                break
+            }
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+    $running = @(Get-RunningContainerIds)
+    $left = @($all | Where-Object { $running -contains $_ })
+    if ($left.Count) {
+        throw ("Cannot stop {0} Polaron container(s) ({1}); refusing to start competing containers. Restart Docker Desktop and retry." -f $left.Count, ($left -join ', '))
+    }
+    Write-Ok ("Stopped {0} containers in {1:n0} s." -f $all.Count, $sw.Elapsed.TotalSeconds)
 }
 
 function Assert-StartupAssets {
@@ -96,6 +142,56 @@ function Assert-RuntimeHealth {
     $probe = @(& docker exec $apiId[0] python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=8).read()" 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "Android API /health failed: $($probe -join ' ')" }
     Write-Ok 'Gateway, APIs and generated drive mapping validated.'
+}
+
+function Invoke-DriveMountRefresh {
+    # V1.10.8: run the drive generator with a time limit. On some PCs a Windows
+    # storage query or a Docker probe of a removable/network drive never returns,
+    # and startup sat forever at this step with no output.
+    param([string]$Generator, [bool]$Public)
+    $timeoutSec = 240
+    if ("$env:AETHERIS_DRIVE_SCAN_TIMEOUT_SEC" -match '^[0-9]+$' -and [int]$env:AETHERIS_DRIVE_SCAN_TIMEOUT_SEC -gt 0) {
+        $timeoutSec = [int]$env:AETHERIS_DRIVE_SCAN_TIMEOUT_SEC
+    }
+    $outFile = Join-Path $root 'docker-compose.drives.generated.yml'
+    $startedUtc = [DateTime]::UtcNow
+    Write-Host ("    Scanning drives (time limit {0}s; set AETHERIS_DRIVE_SCAN_TIMEOUT_SEC to change)..." -f $timeoutSec)
+    $proc = Start-Process -FilePath 'powershell.exe' -NoNewWindow -PassThru -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $Generator))
+    $null = $proc.Handle  # keeps ExitCode readable after exit (Windows PowerShell 5.1)
+    $exited = $proc.WaitForExit($timeoutSec * 1000)
+    $fresh = (Test-Path -LiteralPath $outFile) -and ((Get-Item -LiteralPath $outFile).LastWriteTimeUtc -ge $startedUtc)
+    $previousUsable = $false
+    $previousWhen = ''
+    if (Test-Path -LiteralPath $outFile) {
+        $text = (Get-Content -LiteralPath $outFile -Raw)
+        $previousUsable = [bool]($text -and $text.Trim() -and $text.Trim() -ne 'services:')
+        $previousWhen = (Get-Item -LiteralPath $outFile).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+    }
+    if (-not $exited) {
+        & taskkill.exe /PID $proc.Id /T /F *> $null
+        if ($fresh -and $previousUsable) {
+            Write-Warn 'Drive scan wrote the drive mapping but did not exit; stopped it and continuing.'
+            return
+        }
+        if ($previousUsable) {
+            Write-Warn ("Drive scan did not finish within {0}s; it was stopped. Keeping the previous drive mapping from {1}." -f $timeoutSec, $previousWhen)
+            Write-Warn 'Drives connected since then are mapped by the next successful start or by the HostDrive refresh in the app.'
+            Write-Warn 'A disconnected network drive or a stuck USB card reader is the usual cause; disconnect it and restart.'
+            return
+        }
+        throw ("Drive scan did not finish within {0}s and no previous drive mapping exists. Disconnect stuck USB card readers / offline network drives, or raise AETHERIS_DRIVE_SCAN_TIMEOUT_SEC, then retry." -f $timeoutSec)
+    }
+    $code = $proc.ExitCode
+    if ($code -eq 0 -or ($null -eq $code -and $fresh)) {
+        Write-Ok 'Drive mapping refreshed.'
+        return
+    }
+    if (-not $Public -and $previousUsable) {
+        Write-Warn ("Drive scan failed (exit {0}); keeping the previous drive mapping from {1} for this local start." -f $code, $previousWhen)
+        return
+    }
+    throw "Drive-mount generation failed (exit $code)."
 }
 
 function Assert-DockerReady {
@@ -725,8 +821,7 @@ try {
     $driveGenerator = Join-Path $root 'scripts/generate-drive-mounts.ps1'
     if (Test-Path -LiteralPath $driveGenerator -PathType Leaf) {
         Write-Step 'Refresh Windows drive/evidence mount configuration'
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $driveGenerator
-        if ($LASTEXITCODE -ne 0) { throw "Drive-mount generation failed (exit $LASTEXITCODE)." }
+        Invoke-DriveMountRefresh -Generator $driveGenerator -Public $isPublic
     }
 
     # Stop existing containers only after preflight and drive generation succeed.
@@ -806,8 +901,9 @@ try {
         Write-Host "READY: https://$($settings.PublicIP)/" -ForegroundColor Green
         if ($settings.Domain) { Write-Host "READY: https://$($settings.Domain)/" -ForegroundColor Green }
     } else {
-        Write-Host 'READY: http://localhost:3000/' -ForegroundColor Green
-        Write-Host 'READY: http://localhost:3001/' -ForegroundColor Green
+        # V1.10.8: local uses the same stacks and gateway as prod, without HTTPS.
+        Write-Host "READY (frontend HTTP): http://localhost:3001/" -ForegroundColor Green
+        Write-Host "READY (frontend HTTP on LAN): http://<WINDOWS_LAN_IP>:3001/ (requires LAN firewall access)" -ForegroundColor Yellow
     }
     Write-Host "Application build ID: $buildId" -ForegroundColor DarkGray
 }

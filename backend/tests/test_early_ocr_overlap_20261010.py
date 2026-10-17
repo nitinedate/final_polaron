@@ -15,7 +15,8 @@ def test_early_ocr_is_claimed_atomically():
 
 def test_ocr_can_process_committed_artifacts_during_parse():
     code = (Path(__file__).parents[1] / 'app/tasks.py').read_text()
-    assert "stage IN ('parse','recovery')" in code
+    # V1.11.0 widened the overlap: OCR may also run while artifacts are registered.
+    assert "stage IN ('materialize','parse','recovery')" in code
     assert "queue_for_stage('ocr')" in code
     assert "if not parallel_recovery:" in code
 

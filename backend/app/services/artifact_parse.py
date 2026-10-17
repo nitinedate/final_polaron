@@ -924,6 +924,36 @@ def _process_parse_work_parallel(
     if pending_commits:
         db.commit()
 
+_PART_PATHS_CACHE: dict[int, tuple[dict, dict[str, list[str]]]] = {}
+
+
+def count_pending_in_part_bucket(db, job_id: str, *, bucket: int, buckets: int) -> int:
+    """Pending/claimed forensic rows of one part-hash shard (V1.11.0)."""
+    row = fetchone(
+        db,
+        f"""SELECT count(*) AS c FROM job_artifacts
+            WHERE job_id=:jid AND parse_status IN ('pending','parsing')
+              AND {forensic_parse_keep_sql()}
+              AND mod(abs(hashtext(coalesce(metadata->>'extracted_part_uri', file_path))), {int(buckets)}) = {int(bucket)}""",
+        {"jid": job_id},
+    )
+    return int((row or {}).get("c") or 0)
+
+
+def _paths_for_part(index_map: dict[str, str], part: str) -> list[str]:
+    """Paths stored in one extracted part; the reverse map is built once per index map."""
+    key = id(index_map)
+    cached = _PART_PATHS_CACHE.get(key)
+    if cached is None or cached[0] is not index_map:
+        reverse: dict[str, list[str]] = {}
+        for path, uri in index_map.items():
+            reverse.setdefault(uri, []).append(path)
+        _PART_PATHS_CACHE.clear()  # one live index map per worker is enough
+        cached = (index_map, reverse)
+        _PART_PATHS_CACHE[key] = cached
+    return list(cached[1].get(part) or [])
+
+
 def parse_job_artifacts_for_paths(
     db,
     job_id: str,
@@ -935,12 +965,20 @@ def parse_job_artifacts_for_paths(
     forensic_only: bool = False,
     parse_bucket: int | None = None,
     parse_buckets: int | None = None,
+    queue_prepared: bool = False,
+    bucket_by_part: bool = False,
 ) -> dict:
     settings = get_settings()
     limit = int(batch_limit if batch_limit is not None else getattr(settings, "parse_batch_limit", 5000) or 5000)
     bucket_filter = ""
     if parse_bucket is not None and parse_buckets and int(parse_buckets) > 1:
-        bucket_filter = f" AND mod(abs(hashtext(file_path)), {int(parse_buckets)}) = {int(parse_bucket)}"
+        # V1.11.0: parallel parse shards own whole extracted parts, so every
+        # multi-GB part is decompressed by one process only (path-hash buckets
+        # made every shard stream every part).
+        bucket_key = (
+            "coalesce(metadata->>'extracted_part_uri', file_path)" if bucket_by_part else "file_path"
+        )
+        bucket_filter = f" AND mod(abs(hashtext({bucket_key})), {int(parse_buckets)}) = {int(parse_bucket)}"
     forensic_filter = (
         f" AND {forensic_parse_keep_sql()}"
         if forensic_only
@@ -951,9 +989,12 @@ def parse_job_artifacts_for_paths(
     # shard used to UPDATE the same pending set and deadlock. Drain / bucket
     # callers already run prepare_forensic_parse_queue once. Path-scoped shard
     # work only selects forensic rows for its own paths.
+    # V1.10.9: a caller that prepared the queue once (serial drain) does not pay
+    # for two more filtering scans of every pending row on every batch.
     if forensic_only and not paths:
-        skip_low_value_pending(db, job_id)
-        bulk_skip_non_parser_pending(db, job_id)
+        if not queue_prepared:
+            skip_low_value_pending(db, job_id)
+            bulk_skip_non_parser_pending(db, job_id)
     if paths:
         artifacts = _fetch_pending_artifacts_for_paths(
             db,
@@ -991,17 +1032,22 @@ def parse_job_artifacts_for_paths(
             # One pass over the part. A 700-file slice forces another full read of
             # the same multi-GB zstd shard, and the card sits still during that scan.
             if best_part and not str(best_part).startswith("direct:"):
-                wanted = [p for p, uri in index_map.items() if uri == best_part]
+                # V1.10.9: the part -> paths map is built once per index map (it
+                # was rebuilt by scanning the whole index on every batch), and the
+                # lookup matches file_path directly so the (job_id, file_path)
+                # index is used instead of a replace() scan of every row.
+                wanted = _paths_for_part(index_map, best_part)
                 rows: list[dict] = []
                 for chunk in iter_path_chunks(wanted, PATH_ANY_CHUNK):
+                    variants = list(chunk) + [p.replace("/", "\\") for p in chunk if "/" in p]
                     rows.extend(
                         fetchall(
                             db,
                             """SELECT id, file_path, minio_uri, size_bytes, metadata
                                FROM job_artifacts
                                WHERE job_id=:jid AND parse_status='pending'
-                                 AND replace(file_path, chr(92), '/') = ANY(:paths)""",
-                            {"jid": job_id, "paths": chunk},
+                                 AND file_path = ANY(:paths)""",
+                            {"jid": job_id, "paths": variants},
                         )
                     )
                 artifacts = rows or [a for a in artifacts if part_of.get(str(a["id"])) == best_part]

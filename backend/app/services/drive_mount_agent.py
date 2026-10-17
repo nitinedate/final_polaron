@@ -145,6 +145,45 @@ def mounts_ready(
     return bool(mounted_letters(rows))
 
 
+def _wait_until_readable(required_path: str, *, timeout_sec: float) -> dict[str, Any]:
+    """Return as soon as Docker can read the folder, without waiting for other stacks."""
+    deadline = time.time() + max(float(timeout_sec), 8.0)
+    last: dict[str, Any] = {}
+    while time.time() < deadline:
+        if path_is_readable(required_path):
+            return {
+                "status": "done",
+                "ok": True,
+                "required_path": required_path,
+                "message": f"Selected path is already readable: {required_path}",
+            }
+        last = wait_for_refresh(timeout_sec=2.0)
+        status = str(last.get("status") or "").lower()
+        if status in ("done", "error"):
+            return last
+        if status in ("idle", "offline") and not last.get("busy") and not last.get("timed_out"):
+            return last
+    if path_is_readable(required_path):
+        return {
+            "status": "done",
+            "ok": True,
+            "required_path": required_path,
+            "message": f"Selected path is already readable: {required_path}",
+        }
+    last["timed_out"] = True
+    return last
+
+
+def _refresh_covers_path(waited: dict[str, Any], required_path: str) -> bool:
+    """True when the finished helper job was for this exact Windows folder."""
+    wanted = required_path.replace("/", "\\").rstrip("\\").lower()
+    covered = str(waited.get("required_path") or "").replace("/", "\\").rstrip("\\").lower()
+    if covered and covered == wanted:
+        return True
+    message = str(waited.get("message") or "").replace("/", "\\").lower()
+    return bool(wanted and wanted in message)
+
+
 def _required_path_for_missing(missing: list[str]) -> str | None:
     if not missing:
         return None
@@ -302,8 +341,19 @@ def ensure_path_mounted(required_path: str, *, wait_sec: float = 90.0) -> dict[s
     # stale bind. The exact selected path is the authority; if it is unreadable,
     # ask the Windows HostDrive refresh job to resolve/remount that path.
     refresh = proxy_refresh_mounts(required_path=raw)
-    if refresh.get("started") or refresh.get("ok"):
-        waited = wait_for_refresh(timeout_sec=min(max(float(wait_sec), 8.0), 180.0))
+    budget = min(max(float(wait_sec), 8.0), 180.0)
+    if path_is_readable(raw):
+        waited = {"status": "done", "ok": True, "required_path": raw, "message": "Selected path is already readable"}
+    elif refresh.get("joined_existing"):
+        waited = _wait_until_readable(raw, timeout_sec=budget)
+        covered = _refresh_covers_path(waited, raw)
+        if not path_is_readable(raw) and not covered:
+            # The in-flight job was a general drive scan. It does not mount the
+            # folder the examiner just selected. Start that mount now.
+            refresh = proxy_refresh_mounts(required_path=raw)
+            waited = {}
+    if not path_is_readable(raw) and (refresh.get("started") or refresh.get("ok")):
+        waited = _wait_until_readable(raw, timeout_sec=budget)
     deadline = time.time() + max(float(wait_sec), 8.0)
     after = before
     refresh_failed = str(waited.get("status") or "").lower() == "error" or waited.get("ok") is False

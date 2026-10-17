@@ -1282,7 +1282,7 @@ def ocr_drain_sync(
             _r = fetchone(
                 _db,
                 """SELECT 1 AS ok FROM pipeline_stage_runs
-                   WHERE job_id=:jid AND stage IN ('parse','recovery')
+                   WHERE job_id=:jid AND stage IN ('materialize','parse','recovery')
                      AND status='running' LIMIT 1""",
                 {"jid": job_id},
             )
@@ -2894,6 +2894,180 @@ def prechunk_sidecar_task(schema_name: str, job_id: str, task_id: str | None = N
                 finish_sidecar(db, job_id, "prechunk", task_id, status="failed", details={"error":str(exc)[:300]})
         except Exception:
             pass
+        raise
+
+
+def _sidecar_failed(name: str, schema_name: str, job_id: str, task_id: str, exc: Exception) -> None:
+    try:
+        with firm_session(schema_name) as db:
+            from app.services.forensic_failure_alerts import record_failure
+            from app.services.safe_parallel import finish_sidecar
+            record_failure(db, job_id, name, task_id, exc)
+            finish_sidecar(db, job_id, name, task_id, status="failed", details={"error": str(exc)[:300]})
+    except Exception:
+        pass
+
+
+def parse_shard_queue() -> str:
+    """Extraction workers (disk-build): idle once extraction ends."""
+    import os as _os
+
+    return str(_os.environ.get("PARSE_SHARD_QUEUE") or "disk-build")
+
+
+@celery.task(name="app.tasks.parse_shard_sidecar_task", bind=True)
+def parse_shard_sidecar_task(self, schema_name: str, job_id: str, task_id: str | None = None,
+                             bucket: int = 0, buckets: int = 1) -> dict:
+    """V1.11.0: one part-owned share of native parsing, beside the serial stages.
+
+    Starts while artifacts are still being registered and keeps draining its
+    share (whole extracted parts, so each part is decompressed once) through the
+    serial parse stage. Every claim is SKIP LOCKED, so the serial parse loop and
+    the other shards never parse the same file. Runs on the extraction workers,
+    which are otherwise idle after extraction.
+    """
+    import time as _time
+
+    from app.services.safe_parallel import finish_sidecar, sidecar_execution, sidecar_slot
+
+    name = f"parse_shard_{int(bucket)}"
+    task_id = task_id or str(getattr(self.request, "id", "") or "")
+    try:
+        with sidecar_slot(name):
+            with firm_session(schema_name) as db:
+                with sidecar_execution(db, job_id, name, task_id, schema_name=schema_name) as owns:
+                    if not owns:
+                        return {"status": "held", "reason": "duplicate or obsolete sidecar delivery"}
+                    from app.config import get_settings
+                    from app.db.sql_helpers import fetchone
+                    from app.services.artifact_parse import (
+                        count_pending_in_part_bucket,
+                        parse_job_artifacts_for_paths,
+                    )
+                    from app.services.forensic_serial_stages import _index_map
+                    from app.services.job_control import pipeline_should_stop
+
+                    index_map = _index_map(db, job_id)
+                    batch_limit = max(100, int(get_settings().parse_drain_batch_limit or 500))
+                    parsed = skipped = rounds = 0
+                    started = _time.monotonic()
+                    # Bounded delivery: the slot lease and heartbeats stay fresh.
+                    while _time.monotonic() - started < 240:
+                        if pipeline_should_stop(db, job_id):
+                            finish_sidecar(db, job_id, name, task_id, status="paused",
+                                           details={"parsed": parsed, "skipped": skipped})
+                            return {"status": "paused", "parsed": parsed}
+                        res = parse_job_artifacts_for_paths(
+                            db, job_id, paths=None, index_map=index_map, batch_limit=batch_limit,
+                            update_status=False, forensic_only=True, queue_prepared=True,
+                            parse_bucket=int(bucket), parse_buckets=int(buckets), bucket_by_part=True,
+                        ) or {}
+                        db.commit()
+                        rounds += 1
+                        parsed += int(res.get("parsed") or 0)
+                        skipped += int(res.get("skipped") or 0)
+                        if not int(res.get("parsed") or 0) and not int(res.get("skipped") or 0):
+                            break
+                    left = count_pending_in_part_bucket(db, job_id, bucket=int(bucket), buckets=int(buckets))
+                    reg = fetchone(
+                        db,
+                        """SELECT status FROM pipeline_stage_runs WHERE job_id=:jid AND stage='materialize'""",
+                        {"jid": job_id},
+                    ) or {}
+                    registering = str(reg.get("status") or "") not in {"done", "skipped"}
+                    details = {"parsed": parsed, "skipped": skipped, "rounds": rounds, "pending_left": left,
+                               "bucket": int(bucket), "buckets": int(buckets)}
+                    if left > 0 or registering:
+                        # More of this share exists, or registration may still add rows.
+                        parse_shard_sidecar_task.apply_async(
+                            args=(schema_name, job_id, task_id, int(bucket), int(buckets)),
+                            queue=parse_shard_queue(),
+                            countdown=2 if left > 0 else 10,
+                        )
+                        return {"status": "requeued", **details}
+                    finish_sidecar(db, job_id, name, task_id, status="done", details=details)
+                    return {"status": "ok", **details}
+    except Exception as exc:
+        from app.services.adaptive_semaphore import ResourceSemaphoreTimeout
+        if isinstance(exc, ResourceSemaphoreTimeout):
+            from app.services.safe_parallel import defer_sidecar_if_busy
+            defer_sidecar_if_busy(parse_shard_sidecar_task, exc)
+        _sidecar_failed(name, schema_name, job_id, task_id, exc)
+        raise
+
+
+@celery.task(name="app.tasks.early_ocr_sidecar_task")
+def early_ocr_sidecar_task(schema_name: str, job_id: str, task_id: str | None = None) -> dict:
+    """V1.11.0: quality triage + GPU OCR from registration on (was: from recovery).
+
+    Registration already routes each picture/video (V1.10.9), so the OCR lane
+    can work on the GPU while native parsing runs on the CPUs. Both write
+    idempotent per-artifact state; the serial OCR stage later finishes the rest.
+    """
+    from app.services.safe_parallel import finish_sidecar, sidecar_execution
+
+    task_id = task_id or str(getattr(early_ocr_sidecar_task.request, "id", "") or "")
+    try:
+        with firm_session(schema_name) as db:
+            with sidecar_execution(db, job_id, "early_ocr", task_id, schema_name=schema_name) as owns:
+                if not owns:
+                    return {"status": "held", "reason": "duplicate or obsolete sidecar delivery"}
+                from app.db.sql_helpers import fetchone
+                from app.forensic_common.pipeline_routing import parse_queue
+                from app.services.job_control import pipeline_should_stop
+                from app.services.ocr_gpu import count_pending_ocr, dispatch_ocr_agent
+
+                if pipeline_should_stop(db, job_id):
+                    finish_sidecar(db, job_id, "early_ocr", task_id, status="paused")
+                    return {"status": "paused"}
+                quality_ocr_triage_task.delay(schema_name, job_id)
+                pending = int(count_pending_ocr(db, job_id) or 0)
+                buckets = dispatch_ocr_agent(schema_name, job_id) if pending > 0 else 0
+                details = {"ocr_pending": pending, "ocr_buckets": int(buckets or 0)}
+                # Triage keeps filling the OCR bucket while files are registered and
+                # parsed: look again every 45 s until parsing ends (recovery then
+                # dispatches OCR as before).
+                active = fetchone(
+                    db,
+                    """SELECT 1 AS ok FROM pipeline_stage_runs WHERE job_id=:jid
+                       AND stage IN ('materialize','parse') AND status IN ('running','queued','waiting') LIMIT 1""",
+                    {"jid": job_id},
+                )
+                if active:
+                    early_ocr_sidecar_task.apply_async(args=(schema_name, job_id, task_id),
+                                                       queue=parse_queue(), countdown=45)
+                    return {"status": "requeued", **details}
+                finish_sidecar(db, job_id, "early_ocr", task_id, status="done", details=details)
+                return {"status": "ok", **details}
+    except Exception as exc:
+        _sidecar_failed("early_ocr", schema_name, job_id, task_id, exc)
+        raise
+
+
+@celery.task(name="app.tasks.graph_files_sidecar_task")
+def graph_files_sidecar_task(schema_name: str, job_id: str, task_id: str | None = None) -> dict:
+    """V1.11.0: graph EvidenceFile nodes while parsing and the later stages run."""
+    from app.services.safe_parallel import finish_sidecar, sidecar_execution, sidecar_slot
+
+    task_id = task_id or str(getattr(graph_files_sidecar_task.request, "id", "") or "")
+    try:
+        with sidecar_slot("graph_files"):
+            with firm_session(schema_name) as db:
+                with sidecar_execution(db, job_id, "graph_files", task_id, schema_name=schema_name) as owns:
+                    if not owns:
+                        return {"status": "held", "reason": "duplicate or obsolete sidecar delivery"}
+                    from app.services.neo4j_sync import run_graph_files_sidecar
+
+                    result = run_graph_files_sidecar(db, job_id)
+                    status = "done" if result.get("status") == "ok" else "deferred"
+                    finish_sidecar(db, job_id, "graph_files", task_id, status=status, details=result)
+                    return result
+    except Exception as exc:
+        from app.services.adaptive_semaphore import ResourceSemaphoreTimeout
+        if isinstance(exc, ResourceSemaphoreTimeout):
+            from app.services.safe_parallel import defer_sidecar_if_busy
+            defer_sidecar_if_busy(graph_files_sidecar_task, exc)
+        _sidecar_failed("graph_files", schema_name, job_id, task_id, exc)
         raise
 
 

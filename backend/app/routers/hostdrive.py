@@ -97,7 +97,7 @@ def hostdrive_ensure_path(
     """Remount the selected office-host letter until Docker can list that folder."""
     from app.services.drive_mount_agent import ensure_path_mounted
 
-    wait_sec = body.wait_sec if body.wait_sec is not None else 90.0
+    wait_sec = body.wait_sec if body.wait_sec is not None else 180.0
     return ensure_path_mounted(body.required_path, wait_sec=wait_sec)
 
 

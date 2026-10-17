@@ -84,6 +84,30 @@ def test_proxy_refresh_mounts_joins_existing_refresh_on_409(monkeypatch):
     ]
 
 
+def test_proxy_refresh_mounts_joins_when_the_post_times_out(monkeypatch):
+    monkeypatch.setattr(
+        hda,
+        "probe_helper",
+        lambda: {"ok": True, "helper_url": "http://host.docker.internal:9876", "drives": ["C", "G"]},
+    )
+
+    def fake_http_json(url: str, *, method="GET", timeout=3.0, body=None):
+        if method == "POST":
+            raise TimeoutError("timed out")
+        return {
+            "status": "running",
+            "busy": True,
+            "required_path": r"G:\DISK2\DataExtration\SegerEx-1",
+            "message": "Checking Docker access to the selected folder.",
+        }
+
+    monkeypatch.setattr(hda, "_http_json", fake_http_json)
+    result = hda.proxy_refresh_mounts(r"G:\DISK2\DataExtration\SegerEx-1")
+    assert result["ok"] is True
+    assert result["joined_existing"] is True
+    assert "error" not in result
+
+
 def test_scheduled_agent_refreshes_existing_drives_on_startup():
     installer = (ROOT / "scripts" / "install-hostdrive-agent.ps1").read_text(encoding="utf-8")
     # A reboot/logon must synchronize drives that were already attached; waiting

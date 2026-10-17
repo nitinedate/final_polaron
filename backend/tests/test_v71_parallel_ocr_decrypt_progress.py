@@ -17,7 +17,9 @@ def test_parallelism_defaults_to_ten_slots():
 
 def test_safe_parallel_scheduler_covers_dependency_free_stages():
     src = read('backend/app/services/safe_parallel.py')
-    assert "{'parse','recovery','ocr','media_review','inventory','chunk'}" in src
+    # V1.11.0: the scheduler also covers registration (parse shards, early GPU OCR)
+    # and enrichment (early graph nodes); every earlier stage is still covered.
+    assert "{'materialize','parse','recovery','ocr','media_review','inventory','chunk','enrichment'}" in src
     assert 'PIPELINE_PARALLEL_SLOTS' in src
     assert 'forensic-pipeline-cpu' in src
     assert 'prechunk' in src and 'company_leakage' in src and 'artifact_inventory' in src
