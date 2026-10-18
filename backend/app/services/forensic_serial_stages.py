@@ -80,6 +80,60 @@ def _index_map(db, job_id):
     return {path.replace("\\", "/"): uri for path, uri in build_index_map(ds).items()}
 
 
+def _inventory_path_for_duplicate(path: str, part_id: int, offset: int) -> str:
+    """Keep a second extracted blob without changing the original file name or extension."""
+    normalized = path.replace("\\", "/").strip("/")
+    parent, _, name = normalized.rpartition("/")
+    folder = f".extracted-part-{part_id}-{offset}"
+    if parent:
+        return f"{parent}/{folder}/{name}"
+    return f"{folder}/{name}"
+
+
+def _materialize_entries(manifest: dict) -> list[dict]:
+    """One inventory row per extracted blob.
+
+    The combined index and the per-shard indexes list the same blob twice.
+    A path can also be extracted twice at different part offsets (the same
+    Windows path in two places). Those are different files and both stay.
+    """
+    from app.services.disk_manifest import load_index_entries, resolve_part_uri
+
+    identities: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for entry in load_index_entries(manifest):
+        path = (entry.get("path") or "").replace("\\", "/")
+        if not path:
+            raise RuntimeError("Extracted manifest contains an entry without a path")
+        part_id = int(entry.get("part_id") or 0)
+        offset = int(entry.get("offset") or 0)
+        part = resolve_part_uri(manifest, part_id)
+        if not part:
+            raise RuntimeError(f"Extracted part is missing for {path}")
+        prepared = {**entry, "path": path, "source_path": path, "part_uri": part}
+        key = (path, part_id, offset)
+        previous = identities.get(key)
+        if previous is None:
+            identities[key] = prepared
+            order.append(key)
+        elif prepared.get("sha256") and not previous.get("sha256"):
+            identities[key] = prepared
+    used: set[str] = set()
+    entries: list[dict] = []
+    for key in order:
+        entry = identities[key]
+        inventory = entry["path"]
+        if inventory in used:
+            inventory = _inventory_path_for_duplicate(entry["path"], key[1], key[2])
+            suffix = 2
+            while inventory in used:
+                inventory = f"{_inventory_path_for_duplicate(entry['path'], key[1], key[2])}#{suffix}"
+                suffix += 1
+        used.add(inventory)
+        entries.append({**entry, "path": inventory})
+    return entries
+
+
 def _materialize_full(db, job_id):
     from app.services.forensic_shard_overlap import unfinished_shards
     from app.services.forensic_serial_pipeline import StageWaiting
@@ -89,7 +143,6 @@ def _materialize_full(db, job_id):
     from psycopg2.extras import execute_values
 
     from app.services.artifact_materialize import materialize_index_entries
-    from app.services.disk_manifest import load_index_entries, resolve_part_uri
 
     row = fetchone(
         db, "SELECT disk_source,files_extracted FROM jobs WHERE id=:id", {"id": job_id}
@@ -99,24 +152,12 @@ def _materialize_full(db, job_id):
         if isinstance(row["disk_source"], str)
         else row["disk_source"] or {}
     )
-    by_path = {}
-    for entry in load_index_entries(manifest):
-        path = (entry.get("path") or "").replace("\\", "/")
-        if not path:
-            raise RuntimeError("Extracted manifest contains an entry without a path")
-        part = resolve_part_uri(manifest, int(entry.get("part_id") or 0))
-        if not part:
-            raise RuntimeError(f"Extracted part is missing for {path}")
-        previous = by_path.get(path)
-        if previous and previous.get("sha256") and not entry.get("sha256"):
-            continue
-        by_path[path] = {**entry, "path": path, "part_uri": part}
-    expected = len(by_path)
+    entries = _materialize_entries(manifest)
+    expected = len(entries)
     if expected < int(row.get("files_extracted") or 0):
         raise RuntimeError(
             f"Extracted manifest accounts for {expected:,} / {int(row['files_extracted']):,} extracted files"
         )
-    entries = list(by_path.values())
     # Every extracted file enters inventory. Unsupported/no-text files are
     # explicit stage exceptions, never discarded by hash or path filters.
     # V1.10.9: one pass. Each row is inserted with its provenance (extracted part)
@@ -130,6 +171,7 @@ def _materialize_full(db, job_id):
             "extracted_part_id": entry.get("part_id"),
             "extracted_part_offset": entry.get("offset"),
             "source_sha256": entry.get("sha256"),
+            "source_path": entry.get("source_path") or entry.get("path"),
         }
 
     result = materialize_index_entries(
