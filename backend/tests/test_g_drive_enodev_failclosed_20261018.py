@@ -33,8 +33,11 @@ def test_resolver_does_not_alter_docker_desktop_daemon_mounts():
     assert 'function Test-DockerDesktopHostLetter' not in s
     assert 'umount -l /mnt/host/' not in s
     assert 'function Repair-StaleWindowsLetter' in s
+    assert 'function Mount-HostLetterDrvFs' in s
     assert 'mount -t drvfs -o ro,metadata,uid=0,gid=0' in s
     assert 'stale-letter-repair' in s
+    assert 'docker-drvfs' in s
+    assert '/mnt/aetheris-host-drives/' in s
     # The repair may detach only the dead letter. It must not wipe every host share.
     assert 'umount -l "$mp"' in s
     remount = s.split('if ($RemountOnly) {', 1)[1].split('\n}', 1)[0]
@@ -71,10 +74,12 @@ def test_diagnostic_only_removes_legacy_unused_probe_names_when_requested():
     assert "-RequireDrive @($letter) -WriteStartupStackOverrides" in s
 
 
-def test_preset_mounts_dont_include_unavailable_g():
+def test_preset_mounts_do_not_bind_the_windows_letter_for_g():
+    # A Compose source of G:/ makes Docker Desktop reinstall a dead 9p share.
+    # G: is attached through the private read-only volume instead.
     for rel in ('docker-compose.drives.forensic.yml',
                 'docker-compose.drives.mobile-android.yml',
                 'docker-compose.drives.mobile-ios.yml'):
         s = txt(rel)
         assert "source: 'G:/" not in s
-        assert "target: '/host/g'" not in s
+        assert "source: G:/" not in s

@@ -125,6 +125,9 @@ function Convert-DaemonHostPathToWindowsBind {
     if ($Source -match '^[A-Za-z]:[/\\]?$') {
         return ("{0}:/" -f $Source.Substring(0, 1).ToUpper())
     }
+    if ($Source -match '^/mnt/aetheris-host-drives/[a-z]/?$') {
+        return $Source
+    }
     if ($Source -match '^/(?:mnt/host|run/desktop/mnt/host|host_mnt|tmp/docker-desktop-root/mnt/host)/([A-Za-z])/?$') {
         return ("{0}:/" -f $Matches[1].ToUpper())
     }
@@ -441,6 +444,39 @@ function Invoke-DockerDriveProbes {
     return $status
 }
 
+function Resolve-UnsharedWindowsLetter {
+    # Ask the drive resolver to mount this letter read-only where dockerd can
+    # see it, without using Docker Desktop's G:/ share.
+    param([string]$Letter)
+    $resolver = Join-Path $root 'scripts\resolve-docker-drive-source.ps1'
+    if (-not (Test-Path -LiteralPath $resolver)) { return $null }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("aetheris-drive-source-{0}-{1}.json" -f $Letter.ToLower(), $PID)
+    $prev = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $resolver -DriveLetter $Letter -Root $root -OutputFile $tmp | Out-Null
+        if (-not (Test-Path -LiteralPath $tmp)) { return $null }
+        $result = Get-Content -LiteralPath $tmp -Raw -ErrorAction Stop | ConvertFrom-Json
+        $source = [string]$result.source
+        if (-not $result.ok -or $source -notmatch '^/mnt/aetheris-host-drives/[a-z]/?$') { return $null }
+        return @{
+            source = $source
+            mode = 'docker-drvfs'
+            wsl_distro = ''
+            wsl_mount = ''
+            mount_target = "/host/$($Letter.ToLower())"
+            source_scope = 'drive'
+        }
+    }
+    catch {
+        return $null
+    }
+    finally {
+        $ErrorActionPreference = $prev
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-PreviousMappedLetters {
     # Letters the last successful run mapped (target: '/host/<letter>').
     param([string]$Path)
@@ -535,10 +571,22 @@ if ($toProbe.Count) {
             $kept.Add($letter) | Out-Null
         }
         else {
-            # On timeout, missing image, or bind failure, exclude the drive.
-            # The previous mapping is NOT proof it is connected now.
-            Write-ScanNote ("Excluding {0}: Docker probe returned {1}" -f $letter, $(if ($state) { $state } else { 'unknown' }))
-            $skippedDocker.Add($letter) | Out-Null
+            # A letter Windows can see but Docker Desktop did not share (plugged
+            # in after startup, or a dead 9p share) is mounted read-only at
+            # /mnt/aetheris-host-drives/<letter>. Compose must use that path.
+            # A G:/ bind makes Desktop reinstall the dead share.
+            $attached = Resolve-UnsharedWindowsLetter -Letter $letter
+            if ($attached) {
+                $sourceMap[$letter] = $attached
+                $kept.Add($letter) | Out-Null
+                Write-ScanNote ("Docker is using a read-only private mount for {0}: {1}" -f $letter, $attached.source)
+            }
+            else {
+                # On timeout, missing image, or bind failure, exclude the drive.
+                # The previous mapping is NOT proof it is connected now.
+                Write-ScanNote ("Excluding {0}: Docker probe returned {1}" -f $letter, $(if ($state) { $state } else { 'unknown' }))
+                $skippedDocker.Add($letter) | Out-Null
+            }
         }
     }
 }
@@ -655,6 +703,23 @@ function New-DriveComposeText {
     return (($lines -join "`n") + "`n")
 }
 
+function Ensure-PrivateDriveVolume {
+    param([string]$Name, [string]$Device)
+    $prev = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & docker volume inspect $Name 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { return }
+        & docker volume create --driver local --opt type=none --opt o=bind --opt ("device={0}" -f $Device) $Name 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not create Docker volume $Name for $Device."
+        }
+    }
+    finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function Write-VerifiedDriveOverride {
     param([string]$Path, [string[]]$Services)
     $content = New-DriveComposeText -TargetServices $Services
@@ -674,6 +739,12 @@ function Write-VerifiedDriveOverride {
 # All three product overlays must be derived from the SAME verified drive
 # inventory. The former launcher refreshed only the unused generic override;
 # stale G:/ binds remained in docker-compose.drives.forensic.yml forever.
+foreach ($letter in @($letters)) {
+    $mount = $driveMounts[$letter]
+    if ($mount.daemon_path -and [string]$mount.source -match '^/mnt/aetheris-host-drives/[a-z]/?$') {
+        Ensure-PrivateDriveVolume -Name ([string]$mount.volume_name) -Device ([string]$mount.source)
+    }
+}
 Write-VerifiedDriveOverride -Path $out -Services $serviceNames
 if ($WriteStartupStackOverrides) {
     $startupOverrides = @(

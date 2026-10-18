@@ -301,6 +301,76 @@ echo "remounted ${LETTER}: read-only"
     }
 }
 
+# Docker Desktop's 9p share for a letter plugged in after startup is missing or
+# ENODEV, and a later Compose bind of "G:/" makes Desktop replace a repaired
+# share with that dead 9p mount. Mount the letter read-only at a private path
+# the file-sharing agent does not own, then bind that path into dockerd.
+# /mnt/host is never unmounted.
+function Mount-HostLetterDrvFs {
+    param(
+        [Parameter(Mandatory = $true)][string]$Letter,
+        [string]$RelativePath = ""
+    )
+    $lower = $Letter.ToLowerInvariant()
+    $relative = (($RelativePath -replace '\\', '/').Trim('/'))
+    $source = "/mnt/aetheris-host-drives/$lower"
+    $shell = @'
+set -eu
+LETTER="$1"
+LOWER="$2"
+REL="$3"
+MP="/mnt/aetheris-host-drives/${LOWER}"
+check="$MP"
+if [ -n "$REL" ]; then
+  check="${MP}/${REL}"
+fi
+is_mount() {
+  grep -q " $1 " /proc/self/mountinfo 2>/dev/null
+}
+mkdir -p "$MP"
+if ! ls -d "$check" >/dev/null 2>&1; then
+  if is_mount "$MP"; then
+    umount -l "$MP" || true
+  fi
+  mkdir -p "$MP"
+  mount -t drvfs -o ro,metadata,uid=0,gid=0 "${LETTER}:" "$MP"
+fi
+ls -d "$check" >/dev/null
+dpid=""
+for proc in /proc/[0-9]*; do
+  cmd=$(tr "\0" " " < "$proc/cmdline" 2>/dev/null || true)
+  case "$cmd" in
+    /usr/local/bin/dockerd\ *) dpid=${proc#/proc/}; break ;;
+  esac
+done
+if [ -z "$dpid" ] || ! command -v nsenter >/dev/null 2>&1; then
+  echo "dockerd namespace unavailable"
+  exit 4
+fi
+if ! nsenter -t "$dpid" -m -- ls -d "$check" >/dev/null 2>&1; then
+  nsenter -t "$dpid" -m -- mkdir -p "$MP"
+  nsenter -t "$dpid" -m -- mount --bind "/proc/1/root${MP}" "$MP"
+fi
+nsenter -t "$dpid" -m -- ls -d "$check" >/dev/null
+echo "private-mount ${MP}"
+'@
+    $shell = ($shell -replace "`r", "").TrimStart([char]0xFEFF)
+    try {
+        $run = Invoke-NativeCapture -FilePath 'wsl.exe' -ArgumentList @(
+            '-d', 'docker-desktop', '-u', 'root', '--', 'sh', '-s', '--', $Letter, $lower, $relative
+        ) -StdinText $shell
+        return @{
+            ok     = ($run.ExitCode -eq 0)
+            exit   = $run.ExitCode
+            output = $run.Text
+            source = $source
+        }
+    }
+    catch {
+        return @{ ok = $false; exit = -1; output = $_.Exception.Message; source = $source }
+    }
+}
+
 
 function Test-DockerSource {
     param(
@@ -750,12 +820,46 @@ if (-not $ForceWslBridge -and $normalizedRequired -and $driveRootHasFiles) {
 # only this letter and mount it read-only, then probe once more.
 $staleShare = $false
 foreach ($attempt in @($attempts)) {
-    if (-not $attempt.ok -and "$($attempt.detail)" -match 'no such device|ENODEV|error evaluating symlinks') {
+    if (-not $attempt.ok -and "$($attempt.detail)" -match 'no such device|ENODEV|error evaluating symlinks|invalid mount config|bind source path does not exist') {
         $staleShare = $true
         break
     }
 }
 if (-not $ForceWslBridge -and $staleShare) {
+    # Keep the letter off Docker Desktop's G:/ share. Compose reinstalls a dead
+    # 9p mount whenever the bind source is the drive letter.
+    $private = Mount-HostLetterDrvFs -Letter $letter -RelativePath $relative
+    $attempts += [pscustomobject]@{
+        source = [string]$private.source
+        mode   = "docker-drvfs"
+        ok     = [bool]$private.ok
+        detail = $private.output
+    }
+    if ($private.ok) {
+        $probe = Test-DockerSource -Source ([string]$private.source) -Image $image -RelativePath $relative
+        $attempts += [pscustomobject]@{
+            source = [string]$private.source
+            mode   = "docker-drvfs"
+            ok     = [bool]$probe.ok
+            detail = $probe.output
+        }
+        if ($probe.ok) {
+            Write-Result @{
+                ok             = $true
+                drive          = $letter
+                source         = [string]$private.source
+                mode           = "docker-drvfs"
+                mount_target   = "/host/$lower"
+                source_scope   = "drive"
+                required_path  = $(if ($normalizedRequired) { $normalizedRequired } else { $null })
+                probe_relative = $relative
+                api_image      = $image
+                attempts       = $attempts
+                message        = "Docker Desktop has no healthy share for ${letter}:. The drive is mounted read-only at $($private.source) and the selected evidence path is readable. No evidence was copied."
+            }
+            exit 0
+        }
+    }
     $repair = Repair-StaleWindowsLetter -Letter $letter -RelativePath $relative
     $attempts += [pscustomobject]@{
         source = "${letter}:/"
