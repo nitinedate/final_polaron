@@ -13,7 +13,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.services.disk_slots import DISK_SLOTS, run_bounded
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -194,6 +194,7 @@ class _ProgressFlusher:
         snap = self.progress.snapshot()
         total = snap["total_files"]
         extracted = snap["files_extracted"]
+        uploaded = snap["files_uploaded"]
         if total <= 0 and extracted <= 0:
             try:
                 with firm_session(self.schema_name) as db:
@@ -217,13 +218,16 @@ class _ProgressFlusher:
         if self.total_bytes > 0 and mib_s > 0.01:
             remaining = max(self.total_bytes - int(snap["bytes_extracted"] or 0), 0)
             eta_seconds = int(remaining / (mib_s * 1024 * 1024))
+        # This is a LOCAL PACKING rate, not a completed MinIO upload rate.
+        # Large shards are uploaded only after tar compression completes.
         sla_state = "on-target" if mib_s >= self.target_mib_s else "warming/below-target"
-        perf_suffix = f" · {mib_s:,.1f} MiB/s · SLA {sla_state}"
+        perf_suffix = f" · packing {mib_s:,.1f} MiB/s · SLA {sla_state} (packing only)"
         if eta_seconds is not None:
-            perf_suffix += f" · ETA {eta_seconds // 60:d}m {eta_seconds % 60:02d}s"
+            perf_suffix += f" · pack ETA {eta_seconds // 60:d}m {eta_seconds % 60:02d}s (upload/finalization extra)"
         message = (
-            f"Extracting files — {extracted:,} / {total:,} ({pct}%)"
-            f" · {snap['bytes_extracted']:,} bytes"
+            f"Packing files — {extracted:,} / {total:,} ({pct}%)"
+            f" · uploaded/checkpointed {uploaded:,}"
+            f" · {snap['bytes_extracted']:,} source bytes packed"
             + perf_suffix
             + suffix
         )
@@ -238,10 +242,12 @@ class _ProgressFlusher:
                         stage="extract",
                         metadata={
                             "files_extracted": extracted,
+                            "files_uploaded": uploaded,
                             "files_total": total,
                             "pre_filtered": pre_filtered,
                             "read_skipped": read_skipped,
                             "bytes_extracted": snap["bytes_extracted"],
+                            "bytes_uploaded": snap["bytes_uploaded"],
                             "progress_pct": pct,
                             "mib_per_s": round(mib_s, 2),
                             "target_mib_per_s": round(self.target_mib_s, 2),
@@ -263,9 +269,13 @@ class _ProgressFlusher:
                             "subphase": "copying",
                             "label": message,
                             "files_extracted": extracted,
+                            "files_packed": extracted,
+                            "files_uploaded": uploaded,
                             "files_total": total,
                             "files_remaining": max(total - extracted, 0),
                             "bytes_extracted": int(snap["bytes_extracted"] or 0),
+                            "bytes_packed": int(snap["bytes_extracted"] or 0),
+                            "bytes_uploaded": int(snap["bytes_uploaded"] or 0),
                             "bytes_total": self.total_bytes or None,
                             "bytes_remaining": (
                                 max(self.total_bytes - int(snap["bytes_extracted"] or 0), 0)
@@ -451,9 +461,11 @@ class _ExtractionProgress:
         self.total_files = total_files
         self.progress_step = max(progress_step, 500)
         self.files_extracted = initial_extracted
+        self.files_uploaded = initial_extracted
         self.pre_filtered = pre_filtered
         self.read_skipped = 0
         self.bytes_extracted = initial_bytes
+        self.bytes_uploaded = initial_bytes
         self.shard_done: set[int] = set()
         self.last_log_monotonic = 0.0
         self.last_logged_extracted = -1
@@ -482,14 +494,22 @@ class _ExtractionProgress:
         with self.lock:
             self.shard_done.add(shard_id)
 
+    def mark_shard_committed(self, files: int, size: int) -> None:
+        """Count durable files only AFTER MinIO upload + DB checkpoint commit."""
+        with self.lock:
+            self.files_uploaded += max(0, int(files))
+            self.bytes_uploaded += max(0, int(size))
+
     def snapshot(self) -> dict:
         with self.lock:
             return {
                 "total_files": self.total_files,
                 "files_extracted": self.files_extracted,
+                "files_uploaded": self.files_uploaded,
                 "pre_filtered": self.pre_filtered,
                 "read_skipped": self.read_skipped,
                 "bytes_extracted": self.bytes_extracted,
+                "bytes_uploaded": self.bytes_uploaded,
                 "shards_done": len(self.shard_done),
                 "current_path": self.current_path,
                 "current_action": self.current_action,
@@ -561,8 +581,9 @@ def plan_ewf_extract_io(
     n = max(len(nodes), 1)
     reason = "ewf_parallel"
 
-    # Leave two cores for Postgres, MinIO, and the API. A 22-core host can
-    # run more than eight EWF readers; the old ceiling left most CPUs idle.
+    # Eight image-reader slots are the user-selected hard ceiling; separate
+    # shard planning can still create more resumable parts than active readers.
+    # The media-specific reader gate further reduces HDD/network fan-out.
     if usable >= 16:
         hi = 14
     elif usable >= 10:
@@ -571,14 +592,14 @@ def plan_ewf_extract_io(
         hi = 8
     else:
         hi = 4
-    readers = min(max(wanted, 2), hi, usable, n)
+    readers = min(max(wanted, 2), hi, usable, n, 8)
     if float(thermal_pace) < 0.40:
         readers = max(1, readers // 2)
         reason += "+thermal"
     if int(busy_extracts) > 1:
         readers = max(1, min(readers, 2))
         reason += "+multijob"
-    readers = max(1, min(readers, n, 12))
+    readers = max(1, min(readers, n, 8))
 
     shards = min(max(int(configured_shards or readers), readers, 4 if stream_phase3 else readers), 16, n)
     shards = max(readers, min(shards, n))
@@ -1403,12 +1424,72 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
         log_enum_progress = make_session_progress(
             db, job_id, stage="extract", commit=True, schema_name=schema_name
         )
+        enum_coverage = {"unreadable_directories": 0, "alias_directories_skipped": 0,
+                         "metadata_missing": 0}
 
         def on_enum_progress(message: str, metadata: dict | None = None) -> None:
             log_enum_progress(message, metadata)
-            files_found = int((metadata or {}).get("files_found") or 0)
-            if files_found <= 0:
+            enum_coverage["unreadable_directories"] = max(
+                enum_coverage["unreadable_directories"],
+                int((metadata or {}).get("unreadable_directories") or 0),
+            )
+            enum_coverage["alias_directories_skipped"] = max(
+                enum_coverage["alias_directories_skipped"],
+                int((metadata or {}).get("alias_directories_skipped") or 0),
+            )
+            enum_coverage["metadata_missing"] = max(
+                enum_coverage["metadata_missing"],
+                int((metadata or {}).get("metadata_missing") or 0),
+            )
+            meta = metadata or {}
+            count_keys = ("files_found", "directories_scanned", "entries_scanned")
+            has_counts = any(key in meta for key in count_keys)
+            files_found = int(meta.get("files_found") or 0)
+            directories = int(meta.get("directories_scanned") or 0)
+            entries = int(meta.get("entries_scanned") or 0)
+            # Record *native reader position* even when no file was yet found.
+            # An E01 read trace has a phase and an offset but no entry counts.
+            # Those keys stay absent so a diagnostic write cannot zero the walk.
+            reader_phase = str(meta.get("reader_phase") or "")
+            if (not has_counts and not reader_phase
+                    and meta.get("last_source_read_offset") is None):
                 return
+            activity: dict = {"subphase": "enumerating"}
+            progress_update: dict = {"phase": "extract", "extraction_activity": activity}
+            if has_counts:
+                label = (f"Filesystem inventory — {files_found:,} files, "
+                         f"{directories:,} directories, {entries:,} entries")
+                progress_update["completed"] = files_found
+                progress_update["total"] = None
+                progress_update["label"] = label
+                activity["label"] = label
+                activity["files_found"] = files_found
+                activity["directories_scanned"] = directories
+                activity["entries_scanned"] = entries
+            for key in (
+                "unreadable_directories", "alias_directories_skipped", "metadata_missing",
+                "inventory_workers", "pending_directories", "active_directories",
+                "reader_attempt", "reader_pid",
+            ):
+                if key in meta:
+                    activity[key] = int(meta.get(key) or 0)
+            for key in ("entries_per_sec", "directories_per_sec"):
+                if key in meta:
+                    activity[key] = float(meta.get(key) or 0)
+            if meta.get("last_path"):
+                activity["last_path"] = str(meta["last_path"])[:500]
+            if reader_phase:
+                activity["reader_phase"] = reader_phase
+            if meta.get("root_open_strategy"):
+                activity["root_open_strategy"] = str(meta["root_open_strategy"])
+            if meta.get("reader_attempt_started_at"):
+                activity["reader_attempt_started_at"] = str(meta["reader_attempt_started_at"])
+            if meta.get("inventory_mode"):
+                activity["inventory_mode"] = str(meta["inventory_mode"])
+            if meta.get("last_source_read_offset") is not None:
+                activity["last_source_read_offset"] = meta.get("last_source_read_offset")
+            if meta.get("last_source_read_size") is not None:
+                activity["last_source_read_size"] = meta.get("last_source_read_size")
             try:
                 from app.db.session import firm_session
                 from app.services.pipeline_progress import write_merged_pipeline_progress
@@ -1417,17 +1498,7 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
                     write_merged_pipeline_progress(
                         progress_db,
                         job_id,
-                        {
-                            "phase": "extract",
-                            "completed": files_found,
-                            "total": None,
-                            "label": f"Filesystem inventory — {files_found:,} files discovered",
-                            "extraction_activity": {
-                                "subphase": "enumerating",
-                                "label": f"Filesystem inventory — {files_found:,} files discovered",
-                                "files_found": files_found,
-                            },
-                        },
+                        progress_update,
                         writer="extract",
                     )
                     progress_db.commit()
@@ -1465,7 +1536,24 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
             stage="extract",
             interval_sec=15.0,
         ):
-            all_nodes = enumerate_all_files(vd, on_progress=on_enum_progress)
+            if vd._fs_info is not None and vd.mode in {"ewf", "raw"} and (
+                os.environ.get("EXTRACT_TSK_ISOLATED_WALK", "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                from app.services.tsk_walk_isolated import enumerate_tsk_isolated
+
+                try:
+                    all_nodes = enumerate_tsk_isolated(
+                        vd, on_progress=on_enum_progress, schema_name=schema_name,
+                    )
+                except JobStopRequested:
+                    mark_job_paused(db, job_id, message="Stopped during TSK filesystem inventory; safe to resume")
+                    write_disk_log(db, job_id, "Examiner stopped read-only TSK inventory; no partial file plan committed",
+                                   stage="extract", level="info")
+                    db.commit()
+                    return {"status": "paused", "checkpoint": existing_cp or {}}
+            else:
+                all_nodes = enumerate_all_files(vd, on_progress=on_enum_progress)
 
         if not all_nodes:
             root_hint = getattr(vd, "root_folder", None) or (vd.segment_paths[0] if vd.segment_paths else "?")
@@ -1545,6 +1633,20 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
             interval_sec=15.0,
         ):
             nodes, filter_stats = _filter_nodes(all_nodes, settings, os_info=os_info)
+            if any(enum_coverage.values()):
+                # Preserve the limitation in the extract manifest/checkpoint;
+                # do not silently equate processed=100% with full coverage.
+                filter_stats["tsk_unreadable_directories"] = enum_coverage["unreadable_directories"]
+                filter_stats["tsk_alias_directories_skipped"] = enum_coverage["alias_directories_skipped"]
+                filter_stats["tsk_metadata_missing"] = enum_coverage["metadata_missing"]
+                write_disk_log(db, job_id,
+                               f"TSK source limitation: {enum_coverage['unreadable_directories']} unreadable "
+                               f"and {enum_coverage['alias_directories_skipped']} repeated directory aliases "
+                               f"and {enum_coverage['metadata_missing']} entries without metadata "
+                               "(loop protection); analyst review required",
+                               stage="extract", level="warning",
+                               metadata={"source_limitation": True, **enum_coverage})
+                db.commit()
             if not nodes:
                 write_disk_log(db, job_id, "No files matched extraction filter", stage="extract", level="error")
                 db.commit()
@@ -2061,6 +2163,12 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
             metadata={"shard_id": result["shard_id"], "progress_pct": pct},
         )
         db.commit()
+        # All reads and MinIO part upload completed inside the shard worker,
+        # and the checkpoint is now durably committed.  This is NOT the same
+        # counter as the live locally packed-files estimate.
+        progress.mark_shard_committed(
+            int(result.get("files_extracted") or 0), int(result.get("bytes_extracted") or 0)
+        )
         return checkpoint, done_shards, all_index, total_files, total_bytes, total_skipped
 
     try:
@@ -2120,59 +2228,48 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
                         result, done_shards
                     )
             else:
-                executor_workers = min(
-                    len(payloads),
-                    parallel_readers if read_gate_n <= 2 else max(parallel_readers, min(worker_count, parallel_readers + upload_n)),
-                )
-                with ThreadPoolExecutor(max_workers=executor_workers) as pool:
-                    futures = {
-                        pool.submit(
-                            _call_shard_with_io_retry,
+                slot_count = min(len(payloads), DISK_SLOTS)
+
+                def _run_shard(p):
+                    try:
+                        return _call_shard_with_io_retry(
                             lambda p=p: shard_worker_v45(
                                 p, progress, progress_flusher, stop_poller,
                                 event_bus=progress_flusher.event_bus,
                             ),
                             shard_id=int(p["shard_id"]),
                             emit=progress_flusher.event_bus.emit,
-                        ): p["shard_id"]
-                        for p in payloads
-                    }
-                    for future in as_completed(futures):
-                        shard_id = futures[future]
-                        if stop_poller.is_requested() or is_stop_requested(db, job_id):
-                            return _handle_stop(
-                                db,
-                                job_id,
-                                schema_name=schema_name,
-                                checkpoint=checkpoint,
-                                progress=progress,
-                                worker_count=worker_count,
-                            )
-                        try:
-                            result = future.result()
-                        except JobStopRequested:
-                            return _handle_stop(
-                                db,
-                                job_id,
-                                schema_name=schema_name,
-                                checkpoint=checkpoint,
-                                progress=progress,
-                                worker_count=worker_count,
-                            )
-                        except Exception as exc:
-                            log.exception("Shard %s failed for job %s", shard_id, job_id)
-                            write_disk_log(
-                                db,
-                                job_id,
-                                f"Extraction aborted — shard {shard_id} failed: {exc}",
-                                stage="extract",
-                                level="error",
-                            )
-                            db.commit()
-                            return {"status": "failed", "error": f"Shard {shard_id} failed: {exc}"}
-                        _, done_shards, _, total_files, total_bytes, total_skipped = _consume_shard_result(
-                            result, done_shards
                         )
+                    except JobStopRequested:
+                        return {"_stop": True, "shard_id": p["shard_id"]}
+                    except Exception as exc:
+                        return {"_failed": True, "shard_id": p["shard_id"], "error": str(exc)}
+
+                for result in run_bounded(_run_shard, payloads, slots=slot_count):
+                    shard_id = result.get("shard_id") if isinstance(result, dict) else None
+                    if result.get("_stop") or stop_poller.is_requested() or is_stop_requested(db, job_id):
+                        return _handle_stop(
+                            db,
+                            job_id,
+                            schema_name=schema_name,
+                            checkpoint=checkpoint,
+                            progress=progress,
+                            worker_count=worker_count,
+                        )
+                    if result.get("_failed"):
+                        log.error("Shard %s failed for job %s: %s", result.get("shard_id"), job_id, result.get("error"))
+                        write_disk_log(
+                            db,
+                            job_id,
+                            f"Extraction aborted — shard {result.get('shard_id')} failed: {result.get('error')}",
+                            stage="extract",
+                            level="error",
+                        )
+                        db.commit()
+                        return {"status": "failed", "error": f"Shard {result.get('shard_id')} failed: {result.get('error')}"}
+                    _, done_shards, _, total_files, total_bytes, total_skipped = _consume_shard_result(
+                        result, done_shards
+                    )
     finally:
         progress_flusher.stop(flush=True)
         stop_poller.stop()

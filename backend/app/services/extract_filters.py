@@ -690,9 +690,16 @@ def should_extract_node(
         is_forensic_extract_waived,
     )
 
+    mode_l = (mode or "full").strip().lower()
+    # The operator's explicit full-evidence mode must not silently discard a
+    # 5 GiB VHD/PST/VM image because of a generic fast-mode size ceiling.
+    # Forensic/defensible/fast profiles still enforce the configured cap.
+    if mode_l == "full":
+        max_file_bytes = 0
+
     if is_critical_forensic_path(path) or is_forensic_extract_waived(path):
         # Forensic hives/containers: only hard-cap at CRITICAL_HIVE_MAX_BYTES (2 GiB).
-        if CRITICAL_HIVE_MAX_BYTES > 0 and size_bytes > CRITICAL_HIVE_MAX_BYTES:
+        if mode_l != "full" and CRITICAL_HIVE_MAX_BYTES > 0 and size_bytes > CRITICAL_HIVE_MAX_BYTES:
             return False, "too_large"
     elif max_file_bytes > 0 and size_bytes > max_file_bytes:
         return False, "too_large"

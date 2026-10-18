@@ -102,7 +102,10 @@ def detect_os_from_paths(nodes: list[dict[str, Any]]) -> dict[str, Any]:
 
     mobile_scores = {k: scores[k] for k in ("android", "ios")}
     desktop_scores = {k: scores[k] for k in ("windows", "linux", "macos")}
-    if max(mobile_scores.values(), default=0) >= 6:
+    # A handful of Android-shaped paths (a desktop WhatsApp database, a mobile
+    # segment name) must not take a Windows image away from the disk worker.
+    # Mobile wins only when it is actually the stronger score.
+    if max(mobile_scores.values(), default=0) >= 6 and max(mobile_scores.values()) >= max(desktop_scores.values(), default=0):
         family = max(mobile_scores, key=lambda k: mobile_scores[k])
         best = mobile_scores[family]
         ranked = sorted(mobile_scores.values(), reverse=True)

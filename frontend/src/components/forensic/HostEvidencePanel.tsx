@@ -195,7 +195,7 @@ function driveTypeBadge(vol?: HostDriveVolume): string | null {
   if (!vol) return null;
   if (vol.drive_type === "removable") return "USB";
   if (vol.drive_type === "network") return "Network";
-  if (vol.drive_type === "fixed" && vol.letter.toLowerCase() !== "c") return "External SSD/HDD";
+  if (vol.drive_type === "fixed" && vol.letter.toLowerCase() !== "c") return "HDD / SSD";
   return null;
 }
 
@@ -408,6 +408,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
   const [selectedSegments, setSelectedSegments] = useState<Set<string>>(new Set());
   const [selectionLabel, setSelectionLabel] = useState<string | null>(null);
   const [browseDialogOpen, setBrowseDialogOpen] = useState(false);
+  const [preferredBrowseDrive, setPreferredBrowseDrive] = useState("");
   const [resolveError, setResolveError] = useState<{
     open: boolean;
     message: string;
@@ -1042,6 +1043,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
 
   const openNativeFolderPicker = useCallback(async () => {
     if (disabled || registering || acquiring) return;
+    setPreferredBrowseDrive("");
     setBrowseDialogOpen(true);
   }, [acquiring, disabled, registering]);
 
@@ -1767,8 +1769,14 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
 
   async function enterDrive(key: string, mounted = true) {
     if (!mounted) {
-      const ok = await refreshDriveMountsOnHost(key);
-      if (!ok) return;
+      // Newly plugged USB / external HDD / SSD: browse the real Windows drive
+      // through the HostDrive helper first. A root bind is not required to
+      // select a folder, and forcing one here triggers ENODEV on some devices.
+      // Only the selected E01/segment folder gets a verified read-only mount
+      // when the examiner starts extraction.
+      toastRef.current.info(`Opening ${key.toUpperCase()}: on the Windows forensic host. Select the evidence folder; mount verification happens before extraction.`);
+      setPreferredBrowseDrive(key.replace(/:$/, "").toUpperCase());
+      setBrowseDialogOpen(true);
       return;
     }
     setCurrentDrive(key);
@@ -1984,7 +1992,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           refreshing={remounting}
           startingAgent={startingAgent}
           recommendedLetters={recommendedLetters}
-          onClose={() => setBrowseDialogOpen(false)}
+          preferredDrive={preferredBrowseDrive}
+          onClose={() => { setBrowseDialogOpen(false); setPreferredBrowseDrive(""); }}
           onConfirm={(folders) => void confirmStagedBrowseFolders(folders)}
           onRefreshMounts={() => void refreshDriveMountsOnHost()}
           onStartAgent={() => void startHostDriveAgent()}
@@ -2329,7 +2338,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
                           ? badge
                             ? `${badge} drive — open to select image folder`
                             : undefined
-                          : "Server drive is not mounted in Docker — refresh server drive mounts. Do not upload a server-side image just to work around a mount issue."
+                          : "Drive detected by Windows. Select its evidence folder through Browse folder; Docker mount verification is performed only before extraction."
                       }
                     >
                       <DriveIcon className={`h-4 w-4 shrink-0 ${driveMounted ? "text-brand-600" : "text-ink-300"}`} />
@@ -2342,7 +2351,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
                         </span>
                       ) : null}
                       {!driveMounted ? (
-                        <span className="ml-auto text-[10px] text-ink-400">not mounted</span>
+                        <span className="ml-auto text-[10px] text-ink-400">Select folder</span>
                       ) : vol?.size_bytes ? (
                         <span className="ml-auto text-[10px] text-ink-400">{formatBytes(vol.size_bytes)}</span>
                       ) : null}
@@ -2467,7 +2476,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         refreshing={remounting}
         startingAgent={startingAgent}
         recommendedLetters={recommendedLetters}
-        onClose={() => setBrowseDialogOpen(false)}
+        preferredDrive={preferredBrowseDrive}
+        onClose={() => { setBrowseDialogOpen(false); setPreferredBrowseDrive(""); }}
         onConfirm={(folders) => void confirmStagedBrowseFolders(folders)}
         onRefreshMounts={() => void refreshDriveMountsOnHost()}
         onStartAgent={() => void startHostDriveAgent()}

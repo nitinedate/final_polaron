@@ -174,9 +174,10 @@ def scan_encrypted_files(db, job_id: str) -> dict[str, Any]:
         return 0, None
 
     # Parallel ZIP header checks — dominant cost on large corpora.
-    workers = 2 if schema else 1
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for n, sample in pool.map(_scan_one_zip, zip_rows):
+    from app.services.disk_slots import DISK_SLOTS, run_bounded
+
+    workers = min(2 if schema else 1, DISK_SLOTS)
+    for n, sample in run_bounded(_scan_one_zip, zip_rows, slots=workers):
             if n > 0 and sample:
                 zip_entry_total += n
                 encrypted.append(sample)

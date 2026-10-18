@@ -2,6 +2,56 @@ import { CheckCircle2, Circle, Loader2, XCircle } from "lucide-react";
 import type { PipelineProgress } from "../../lib/types/forensic";
 
 type SerialPipeline = NonNullable<PipelineProgress["serial_pipeline"]>;
+type Stage = SerialPipeline["stages"][number];
+
+function num(value: unknown): number {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function StageLiveMeter({ stage }: { stage: Stage }) {
+  const details = stage.details || {};
+  const io = details.parse_io && typeof details.parse_io === "object"
+    ? details.parse_io as Record<string, unknown> : null;
+  const wanted = num(io?.files_wanted);
+  const found = num(io?.files_found ?? io?.files_yielded);
+  const seen = num(io?.bytes_seen);
+  const total = num(io?.bytes_total);
+  const gpuDone = num(io?.gpu_ocr_done);
+  const gpuPending = num(io?.gpu_ocr_pending);
+  const bytePct = total > 0 ? Math.max(0, Math.min(100, Math.round((100 * seen) / total))) : null;
+  const filePct = wanted > 0 ? Math.max(0, Math.min(100, Math.round((100 * found) / wanted))) : null;
+  const pct = bytePct ?? filePct;
+  const priorityDone = num(details.priority_sources_completed);
+  const priorityTotal = num(details.priority_sources_total);
+  const priorityPct = priorityTotal > 0
+    ? Math.max(0, Math.min(100, Math.round((100 * priorityDone) / priorityTotal))) : null;
+  const staleShard = Boolean(io) && seen === 0 && found === 0 && priorityTotal > 0 && priorityDone < priorityTotal;
+  const showShard = Boolean(io) && !staleShard && (wanted > 0 || total > 0 || seen > 0);
+  const showPriority = priorityTotal > 0 && (priorityDone < priorityTotal || !showShard);
+  if (!showShard && !showPriority && !(gpuDone || gpuPending)) return null;
+  return <div className="mt-2 space-y-1.5">
+    {showShard && pct !== null ? <div>
+      <div className="mb-1 flex justify-between gap-2 text-[11px] text-ink-700">
+        <span>This shard</span>
+        <span className="tabular-nums">{wanted > 0 ? `${found.toLocaleString()}/${wanted.toLocaleString()} files · ` : ""}{pct}%</span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded-full bg-white">
+        <div className="h-1.5 bg-amber-500" style={{ width: `${pct}%` }} />
+      </div>
+    </div> : null}
+    {showPriority && priorityPct !== null ? <div>
+      <div className="mb-1 flex justify-between gap-2 text-[11px] text-ink-700">
+        <span>Priority evidence</span>
+        <span className="tabular-nums">{priorityDone.toLocaleString()}/{priorityTotal.toLocaleString()} · {priorityPct}%</span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded-full bg-white">
+        <div className="h-1.5 bg-amber-500" style={{ width: `${priorityPct}%` }} />
+      </div>
+    </div> : null}
+    {(gpuDone > 0 || gpuPending > 0) ? <p className="text-[11px] text-ink-700">GPU OCR {gpuDone.toLocaleString()} done, {gpuPending.toLocaleString()} queued</p> : null}
+  </div>;
+}
 
 export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
   pipeline: SerialPipeline; paused: boolean; compact: boolean; elapsed?: string | null;
@@ -58,6 +108,7 @@ export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
           {stage.total > 0 && <span className="tabular-nums">{Math.min(stage.total, stage.completed + stage.failed + stage.skipped).toLocaleString()} / {stage.total.toLocaleString()} items</span>}
         </div>
         {timeTaken(stage) && <p className="mt-1 text-[11px] tabular-nums text-ink-600">{stage.status === "running" ? "Elapsed" : "Time taken"}: {timeTaken(stage)}</p>}
+        {stage.status === "running" ? <StageLiveMeter stage={stage} /> : null}
         {stage.status !== "done" && stage.status !== "skipped" && typeof stage.details?.progress_agent_reconciliation === "object" && stage.details?.progress_agent_reconciliation ? (
           <p className="mt-2 rounded-md bg-white/70 px-2 py-1.5 text-[11px] leading-snug text-amber-900">
             {String((stage.details.progress_agent_reconciliation as Record<string, unknown>).summary || "progressAgent is verifying remaining work")}

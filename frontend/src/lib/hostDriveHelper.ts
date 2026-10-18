@@ -88,6 +88,9 @@ export type HostDriveVolume = {
   /** V1.10.10: false for a locked / not-ready volume; slow = details timed out */
   ready?: boolean;
   slow?: boolean;
+  /** Windows view vs Docker view: removable media may be present but not shared yet. */
+  access_status?: "docker_accessible" | "select_folder_to_mount" | "unlock_or_reconnect";
+  access_mode?: "read_only_bind" | "windows_helper";
 };
 
 export type MobileAttachHost = "office_server" | "this_pc";

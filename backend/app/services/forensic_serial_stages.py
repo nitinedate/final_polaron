@@ -964,6 +964,11 @@ def execute_stage(db, job_id, stage, *, schema_name, stage_run_id):
             result = _enrich_mobile(db, job_id, result)
         else:
             result = _enrich_mobile(db, job_id, result, table="forensic_priority_records", prefix="priority")
+            # The GPU sidecar updates NULL vectors in-place and never rebuilds
+            # or deletes source-linked chunks. Graph CPU work can continue.
+            from app.services.disk_vector_sidecar import schedule_disk_vectors
+            result["vector_index"] = schedule_disk_vectors(
+                db, job_id, schema_name=schema_name)
         return {
             "status": "ok",
             **result,
@@ -1233,6 +1238,15 @@ def _validate_complete(db, job_id, *, mobile=False):
                 AND rc.metadata->>'priority_artifact_id'=p.artifact_id AND rc.metadata->>'chunk_policy'=:policy)""",{"jid":job_id,"policy":CHUNK_POLICY})["c"])
         if missing_priority:
             raise StageWaiting(f"Completeness check found {missing_priority:,} priority records without chunks")
+    # Semantic coverage is a real barrier when GPU embeddings were requested.
+    # A queued/running task is already covered by assert_no_active_producers;
+    # additionally reject silent failed tasks with unembedded evidence rows.
+    if not mobile and get_settings().rag_embedding_enabled:
+        from app.services.disk_vector_sidecar import count_missing_serial_vectors
+        missing_vectors = count_missing_serial_vectors(db, job_id)
+        if missing_vectors:
+            raise StageWaiting(
+                f"Writing in: {missing_vectors:,} RAG chunks still require semantic vectors")
     from app.services.forensic_priority_evidence import priority_record_table
     table = priority_record_table(db, job_id)
     priority_exceptions = 0

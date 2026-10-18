@@ -441,14 +441,21 @@ def hybrid_retrieve(
         or _OS_INTENT.search(query or "")
         or _section_summary_intent(query or "")
     )
-    from app.services.forensic_serial_policy import serial_enabled
-    skip_vector = skip_vector or serial_enabled() or (structured_intent and has_text_hits)
+    # Forensic serial *processing* does not imply lexical-only *retrieval*.
+    # The old serial_enabled() shortcut disabled pgvector for every Disk/Mobile
+    # question even when embeddings existed, reducing recall for natural-language
+    # leakage and communication questions. Keep deterministic OS/user facts
+    # preferred and never load a query embedding while the GPU indexes a case.
+    skip_vector = skip_vector or not settings_want_vector() or (
+        structured_intent and has_text_hits
+    ) or indexing_gpu
     if not has_text_hits:
-        if skip_vector:
-            vector_hits = []
-        else:
-            vector_hits = _vector_search(db, query, job_id=job_id, limit=search_k)
-    elif settings_want_vector() and not indexing_gpu and not skip_vector:
+        if not skip_vector:
+            try:
+                vector_hits = _vector_search(db, query, job_id=job_id, limit=search_k)
+            except Exception as exc:
+                log.warning("Vector search failed; retaining lexical fallback: %s", exc)
+    elif not skip_vector:
         # Skip optional vector while GPU is embedding — keyword/FTS hits are enough.
         try:
             vector_hits = _vector_search(db, query, job_id=job_id, limit=top_k)
@@ -508,6 +515,11 @@ def hybrid_retrieve(
 
 
 def settings_want_vector() -> bool:
-    """Run vector search alongside keywords when not in tight CPU-only mode."""
+    """Activate pgvector only when vector indexing is enabled for this deployment.
+
+    CPU embedding is supported for query recall when explicitly configured;
+    otherwise a disabled embedding stage must never initialize the model just
+    because a question has no keyword matches.
+    """
     settings = get_settings()
-    return (settings.rag_embedding_device or "").lower() in ("cuda", "gpu", "auto")
+    return bool(getattr(settings, "rag_embedding_enabled", False))

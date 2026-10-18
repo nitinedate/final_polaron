@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
+import queue
+import threading
 import time
 from typing import Any
 
@@ -38,6 +39,54 @@ _PARSE_ATTEMPT_MAX = 3
 _PARSE_CLAIM_STALE_SEC = 20 * 60
 _LARGE_FILE_BYTES = 32 * 1024 * 1024  # serialize parse above this size to avoid OOM
 _PARSE_BATCH_BYTE_BUDGET = 384 * 1024 * 1024  # max bytes held in memory for a parallel batch
+
+
+def _fmt_bytes(n: int) -> str:
+    n = max(int(n or 0), 0)
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.0f} MB"
+    if n >= 1 << 10:
+        return f"{n / (1 << 10):.0f} KB"
+    return f"{n} B"
+
+
+def format_shard_scan_label(
+    detail: dict | None,
+    *,
+    bytes_total: int = 0,
+    rate_mib_s: float = 0.0,
+    gpu_done: int = 0,
+    gpu_pending: int = 0,
+    parsing: int = 0,
+) -> str:
+    """One line for the 99% card while a shard is still being decompressed."""
+    detail = detail or {}
+    wanted = int(detail.get("files_wanted") or 0)
+    found = int(detail.get("files_yielded") or 0)
+    seen = int(detail.get("bytes_seen") or 0)
+    members = int(detail.get("members_scanned") or 0)
+    if parsing:
+        head = f"Parsing {parsing:,} files · shard {found:,}/{wanted:,}"
+    else:
+        head = f"Shard scan {found:,}/{wanted:,} files"
+    bits = [head]
+    if bytes_total > 0:
+        pct = min(100, int(100 * seen / bytes_total))
+        bits.append(f"{_fmt_bytes(seen)} / {_fmt_bytes(bytes_total)} ({pct}% of shard)")
+    elif seen:
+        bits.append(f"{_fmt_bytes(seen)} read")
+    if members:
+        bits.append(f"{members:,} members")
+    if rate_mib_s >= 1:
+        bits.append(f"{rate_mib_s:.0f} MB/s")
+    current = str(detail.get("current_path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    if current and not parsing:
+        bits.append(current[:60])
+    if gpu_done or gpu_pending:
+        bits.append(f"GPU OCR {gpu_done:,} done, {gpu_pending:,} queued")
+    return " · ".join(bits)[:300]
 # Postgres dies if we bind 40k Windows paths into one ANY() (5–7 MB query text).
 PATH_ANY_CHUNK = 250
 
@@ -637,15 +686,25 @@ def _run_parser_with_timeout(path: str, data: bytes, timeout_sec: int) -> tuple[
 
     if timeout_sec <= 0:
         return run_parser(path, data)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(run_parser, path, data)
+    # One slot, no thread-pool executor. A timed-out parser thread is abandoned
+    # the same way a future timeout used to abandon its worker.
+    box: queue.Queue = queue.Queue(maxsize=1)
+
+    def _target() -> None:
         try:
-            return fut.result(timeout=timeout_sec)
-        except concurrent.futures.TimeoutError:
-            log.warning("Parse timeout (%ss) path=%s size=%s", timeout_sec, path, len(data))
-            return "timeout", []
-        except Exception:
-            raise
+            box.put((True, run_parser(path, data)))
+        except Exception as exc:
+            box.put((False, exc))
+
+    threading.Thread(target=_target, name="disk-parse-timeout", daemon=True).start()
+    try:
+        ok, value = box.get(timeout=timeout_sec)
+    except queue.Empty:
+        log.warning("Parse timeout (%ss) path=%s size=%s", timeout_sec, path, len(data))
+        return "timeout", []
+    if not ok:
+        raise value
+    return value
 
 
 def _apply_parse_outcome(
@@ -831,7 +890,6 @@ def _process_parse_work_parallel(
 
     settings = get_settings()
     parallel = bool(getattr(settings, "parse_parallel_enabled", True)) and parse_workers > 1
-    chunk_size = max(parse_workers * 12, 48) if parallel else len(work)
     pending_commits = 0
 
     def _flush_artifact_writes() -> None:
@@ -908,18 +966,20 @@ def _process_parse_work_parallel(
         _flush_artifact_writes()
         heartbeat_fn()
 
-    for offset in range(0, len(small_items), chunk_size):
-        chunk = small_items[offset : offset + chunk_size]
-        if parallel and len(chunk) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=parse_workers) as pool:
-                futures = [pool.submit(_parse_work_item, item, timeout_sec) for item in chunk]
-                results = [fut.result() for fut in concurrent.futures.as_completed(futures)]
-            results.sort(key=lambda r: str((r.get("artifact") or {}).get("id") or ""))
-            for result in results:
-                _persist_result(result)
-        else:
-            for item in chunk:
-                _persist_result(_parse_work_item(item, timeout_sec))
+    if parallel and len(small_items) > 1:
+        # Eight disk slots. Database writes stay on this thread as each parser finishes.
+        from app.services.disk_slots import DISK_SLOTS, run_bounded
+
+        parse_workers = max(1, min(int(parse_workers), DISK_SLOTS))
+        for result in run_bounded(
+            lambda item: _parse_work_item(item, timeout_sec),
+            small_items,
+            slots=parse_workers,
+        ):
+            _persist_result(result)
+    else:
+        for item in small_items:
+            _persist_result(_parse_work_item(item, timeout_sec))
 
     if pending_commits:
         db.commit()
@@ -1169,17 +1229,16 @@ def parse_job_artifacts_for_paths(
             )
         except Exception:
             log.debug("Parse progress publish skipped", exc_info=True)
-        write_disk_log(
-            db,
-            job_id,
-            (
-                f"Native forensic parsing — {job_done:,} / {job_total:,}"
-                if job_total
-                else f"Native forensic parsing — {stats['parsed']:,} parsed this batch"
-            )
-            + f" ({parse_workers} workers)",
-            stage="parse",
-        )
+        # "parsed" alone is not a completion counter; no_parser/skipped/failed
+        # rows have also been fully accounted for by the queue.
+        if job_total:
+            accounted = job_done + int(counts["failed"] or 0) + int(counts["skipped"] or 0)
+            msg = (f"Native forensic parsing — {accounted:,} / {job_total:,} accounted "
+                   f"({job_done:,} parsed, {int(counts['skipped'] or 0):,} skipped/no-parser, "
+                   f"{int(counts['failed'] or 0):,} failed)")
+        else:
+            msg = f"Native forensic parsing — {stats['parsed']:,} parsed this batch"
+        write_disk_log(db, job_id, msg + f" ({parse_workers} workers)", stage="parse")
         if update_status or (total - last_orchestration_at) >= 500:
             last_orchestration_at = total
             try:
@@ -1260,11 +1319,21 @@ def _run_claimed_parse_batch(
 
     work: list[tuple[dict, str, bytes | None]] = []
     batch_bytes = 0
+    max_files = max(16, int(getattr(get_settings(), "parse_stream_max_files", 96) or 96))
+    live_scan: dict[str, Any] = {"detail": {}, "bytes_total": 0}
 
     def _flush_work() -> None:
         nonlocal work, batch_bytes
         if not work:
             return
+        detail = live_scan.get("detail") or {}
+        if detail:
+            _publish_scan(
+                detail,
+                bytes_total=int(live_scan.get("bytes_total") or 0),
+                parsing=len(work),
+                force=True,
+            )
         _process_parse_work_parallel(
             db,
             job_id,
@@ -1287,7 +1356,10 @@ def _run_claimed_parse_batch(
             _flush_work()
         work.append((artifact, path, data))
         batch_bytes += size
-        if size >= _LARGE_FILE_BYTES or batch_bytes >= _PARSE_BATCH_BYTE_BUDGET:
+        # Even tiny extracted members must produce visible durable progress;
+        # a whole shard can contain thousands of small files under 384 MiB.
+        if (size >= _LARGE_FILE_BYTES or batch_bytes >= _PARSE_BATCH_BYTE_BUDGET
+                or len(work) >= max_files):
             _flush_work()
 
     for artifact in direct_minio:
@@ -1312,24 +1384,71 @@ def _run_claimed_parse_batch(
         _enqueue(artifact, path, data)
 
     last_scan_beat = 0.0
+    scan_started = time.monotonic()
+    gpu_cache = {"at": 0.0, "done": 0, "pending": 0}
 
-    def _touch_scan(files: int, scanned: int) -> None:
+    def _gpu_counts() -> tuple[int, int]:
+        now = time.monotonic()
+        if now - float(gpu_cache["at"]) < 15.0:
+            return int(gpu_cache["done"]), int(gpu_cache["pending"])
+        try:
+            row = fetchone(
+                db,
+                """SELECT count(*) FILTER (WHERE ocr_status='done') AS done,
+                          count(*) FILTER (WHERE ocr_status IN ('pending','running')) AS pending
+                   FROM job_artifacts WHERE job_id=:jid""",
+                {"jid": job_id},
+            ) or {}
+            gpu_cache["done"] = int(row.get("done") or 0)
+            gpu_cache["pending"] = int(row.get("pending") or 0)
+            gpu_cache["at"] = now
+        except Exception:
+            log.debug("GPU OCR progress lookup skipped", exc_info=True)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        return int(gpu_cache["done"]), int(gpu_cache["pending"])
+
+    def _publish_scan(detail: dict, *, bytes_total: int = 0, parsing: int = 0, force: bool = False) -> None:
         nonlocal last_scan_beat
         now = time.monotonic()
-        if now - last_scan_beat < 20.0:
+        if not force and now - last_scan_beat < 2.0:
             return
         last_scan_beat = now
+        seen = int(detail.get("bytes_seen") or 0)
+        elapsed = max(now - scan_started, 0.001)
+        gpu_done, gpu_pending = _gpu_counts()
+        label = format_shard_scan_label(
+            detail,
+            bytes_total=bytes_total,
+            rate_mib_s=seen / elapsed / (1024 * 1024),
+            gpu_done=gpu_done,
+            gpu_pending=gpu_pending,
+            parsing=parsing,
+        )
+        payload = {
+            "files_wanted": int(detail.get("files_wanted") or 0),
+            "files_found": int(detail.get("files_yielded") or 0),
+            "members_scanned": int(detail.get("members_scanned") or 0),
+            "bytes_seen": seen,
+            "bytes_total": int(bytes_total or 0),
+            "current_path": str(detail.get("current_path") or "")[:300],
+            "gpu_ocr_done": gpu_done,
+            "gpu_ocr_pending": gpu_pending,
+            "label": label,
+        }
         try:
+            execute(
+                db,
+                """UPDATE pipeline_stage_runs SET
+                   details=COALESCE(details,'{}'::jsonb) || CAST(:patch AS jsonb)
+                   WHERE job_id=:jid AND stage='parse' AND status='running'""",
+                {"jid": job_id, "patch": json.dumps({"parse_io": payload})},
+            )
             from app.services.progress_agent import note_operation
 
-            note_operation(
-                db,
-                job_id,
-                "parse",
-                f"parse: streaming {files:,} files from shard ({scanned:,} members scanned)",
-                timeout_seconds=900,
-                advanced=True,
-            )
+            note_operation(db, job_id, "parse", label, timeout_seconds=900, advanced=True)
         except Exception:
             log.debug("Parse shard scan heartbeat skipped", exc_info=True)
             try:
@@ -1343,43 +1462,57 @@ def _run_claimed_parse_batch(
         by_path = {a["file_path"].replace("\\", "/"): a for a in part_artifacts}
         budgets = {norm: _read_budget_for_artifact(art) for norm, art in by_path.items()}
         paths_set = set(by_path)
+        part_bytes = 0
+        try:
+            row = fetchone(
+                db,
+                """SELECT coalesce(sum(size_bytes), 0) AS n FROM job_artifacts
+                   WHERE job_id=:jid AND metadata->>'extracted_part_uri'=:part""",
+                {"jid": job_id, "part": part_uri},
+            ) or {}
+            part_bytes = int(row.get("n") or 0)
+        except Exception:
+            log.debug("Shard byte total lookup skipped", exc_info=True)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        opening = {
+            "files_wanted": len(paths_set),
+            "files_yielded": 0,
+            "members_scanned": 0,
+            "bytes_seen": 0,
+            "current_path": "",
+        }
+        live_scan["detail"] = opening
+        live_scan["bytes_total"] = part_bytes
         try:
             execute(db, "UPDATE jobs SET updated_at=NOW() WHERE id=:id", {"id": job_id})
             write_disk_log(
                 db,
                 job_id,
-                f"Parse streaming shard — {len(paths_set):,} file(s) from part",
+                f"Parse streaming shard — {len(paths_set):,} file(s), {_fmt_bytes(part_bytes)} in part",
                 stage="parse",
-                metadata={"part_uri": part_uri, "files": len(paths_set)},
+                metadata={"part_uri": part_uri, "files": len(paths_set), "bytes": part_bytes},
             )
-            try:
-                from app.services.progress_agent import note_operation
-
-                note_operation(
-                    db,
-                    job_id,
-                    "parse",
-                    f"parse: streaming {len(paths_set):,} files from shard",
-                    timeout_seconds=900,
-                    advanced=True,
-                )
-            except Exception:
-                log.debug("Parse shard deadline refresh skipped", exc_info=True)
             db.commit()
         except Exception:
             try:
                 db.rollback()
             except Exception:
                 pass
+        _publish_scan(opening, bytes_total=part_bytes, force=True)
 
-        def _on_scan(scanned: int, _yielded: int, _files: int = len(paths_set)) -> None:
-            _touch_scan(_files, scanned)
+        def _on_detail(info: dict, _total: int = part_bytes) -> None:
+            live_scan["detail"] = info
+            live_scan["bytes_total"] = _total
+            _publish_scan(info, bytes_total=_total)
 
         for norm, data in iter_files_from_part(
             part_uri,
             paths_set,
             max_bytes_by_path=budgets,
-            on_progress=_on_scan,
+            on_detail=_on_detail,
         ):
             artifact = by_path.get(norm)
             if not artifact:

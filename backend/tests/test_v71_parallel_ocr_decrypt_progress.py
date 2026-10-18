@@ -45,6 +45,12 @@ def test_progress_agent_reports_active_io_instead_of_fake_99():
     msg = _remaining_summary(state)
     assert 'active I/O / final write' in msg
     assert 'writing extracted shard' in msg
+    shard = _remaining_summary({
+        'remaining': {'io_active': 1}, 'checks_available': True,
+        'operation': 'Shard scan 12/36 files · 1.5 GB / 4.0 GB (37% of shard) · 80 MB/s',
+    })
+    assert shard.startswith('Shard scan 12/36')
+    assert 'active I/O' not in shard
 
 
 def test_progress_agent_handoff_is_immediate_after_stage_queue():

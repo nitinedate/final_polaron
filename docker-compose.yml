@@ -485,6 +485,11 @@ services:
       - .env
     environment:
       <<: *worker-env
+      # The /scratch bind mount below existed but extract_shard_v45 looked for
+      # EXTRACT_SCRATCH_DIR, which was never set. Without this variable each
+      # tar.zst part landed under TMPDIR=/app/data/tmp (the backup drive).
+      # This points the worker at the dedicated host scratch mount instead.
+      EXTRACT_SCRATCH_DIR: /scratch
     # CUDA device is visible; adaptive governor controls heavy GPU admission.
     gpus: all
     volumes:

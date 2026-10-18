@@ -240,10 +240,19 @@ export function AgentPipelineBanner({
                 </div>
                 {typeof job.bytes_extracted === "number" && job.bytes_extracted > 0 ? (
                   <div className="flex items-baseline justify-between gap-4">
-                    <dt className="text-ink-500">Extracted</dt>
+                    <dt className="text-ink-500">Source bytes packed</dt>
                     <dd className="text-ink-800">
                       {formatBytes(job.bytes_extracted)}
                       {bytesTotal && bytesTotal > 0 ? ` / ${formatBytes(bytesTotal)}` : ""}
+                    </dd>
+                  </div>
+                ) : null}
+                {typeof extractActivity?.files_uploaded === "number" ? (
+                  <div className="flex items-baseline justify-between gap-4">
+                    <dt className="text-ink-500">Uploaded and checkpointed</dt>
+                    <dd className="font-semibold text-ink-800">
+                      {extractActivity.files_uploaded.toLocaleString()} files
+                      {typeof extractActivity.bytes_uploaded === "number" ? ` · ${formatBytes(extractActivity.bytes_uploaded)}` : ""}
                     </dd>
                   </div>
                 ) : null}
@@ -255,7 +264,7 @@ export function AgentPipelineBanner({
                 ) : null}
                 {extractMiBps != null && extractMiBps > 0 ? (
                   <div className="flex items-baseline justify-between gap-4">
-                    <dt className="text-ink-500">Rate</dt>
+                    <dt className="text-ink-500">Packing rate</dt>
                     <dd className="text-ink-800">
                       {extractMiBps.toFixed(1)} MiB/s
                       {extractTargetMiBps != null && extractTargetMiBps > 0
@@ -266,7 +275,7 @@ export function AgentPipelineBanner({
                 ) : null}
                 {extractEtaSeconds != null && extractEtaSeconds >= 0 ? (
                   <div className="flex items-baseline justify-between gap-4">
-                    <dt className="text-ink-500">ETA</dt>
+                    <dt className="text-ink-500">Packing ETA (+ upload)</dt>
                     <dd className="text-ink-800">
                       {Math.floor(extractEtaSeconds / 60)}m {String(extractEtaSeconds % 60).padStart(2, "0")}s
                     </dd>

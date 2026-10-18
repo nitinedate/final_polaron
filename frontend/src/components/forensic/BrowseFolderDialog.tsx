@@ -55,6 +55,7 @@ interface BrowseFolderDialogProps {
   refreshing?: boolean;
   startingAgent?: boolean;
   recommendedLetters?: string[];
+  preferredDrive?: string;
 }
 
 /** How often the open dialog re-checks the server's drive letters (V1.10.10). */
@@ -69,7 +70,7 @@ function recommendLetters(volumes: HostDriveVolume[], fromAgent: string[]): stri
   const fromMount = fromAgent.map((x) => x.replace(/:$/, "").toUpperCase()).filter(Boolean);
   if (fromMount.length) return fromMount;
   return volumes
-    .filter((v) => v.drive_type === "removable" || v.mounted === false)
+    .filter((v) => v.ready !== false && (v.drive_type === "removable" || v.mounted === false))
     .map((v) => v.letter.replace(/:$/, "").toUpperCase())
     .filter((letter) => letter && letter !== "C");
 }
@@ -94,6 +95,7 @@ export function BrowseFolderDialog({
   onStartAgent,
   startingAgent = false,
   recommendedLetters: recommendedLettersProp,
+  preferredDrive = "",
 }: BrowseFolderDialogProps) {
   const recommendedLetters = recommendedLettersProp ?? EMPTY_RECOMMENDED;
   const recommendedLettersKey = recommendedLetters
@@ -131,7 +133,7 @@ export function BrowseFolderDialog({
 
   function applyVolumes(next: HostDriveVolume[], { announce }: { announce: boolean }) {
     const key = next
-      .map((v) => `${v.letter.toUpperCase()}|${v.label || ""}|${v.drive_type || ""}|${v.mounted ? 1 : 0}`)
+      .map((v) => `${v.letter.toUpperCase()}|${v.label || ""}|${v.drive_type || ""}|${v.mounted ? 1 : 0}|${v.ready === false ? 0 : 1}`)
       .sort()
       .join(",");
     if (key === volumesKey.current) return;  // nothing changed: no re-render, no flicker
@@ -256,16 +258,24 @@ export function BrowseFolderDialog({
   }
 
   async function openWindowsLetter(letter: string) {
+    const volume = windowsVolumes.find((v) => v.letter.toUpperCase() === letter.toUpperCase());
+    if (volume?.ready === false) {
+      setBrowseError(`Drive ${letter}: is visible but not ready. Unlock, reconnect or mount the device in Windows, then select it again.`);
+      return;
+    }
     await openWindowsPath(`${letter.replace(/:$/, "").toUpperCase()}:\\`);
   }
 
   useEffect(() => {
     if (!open || !windowsVolumes.length || browsePath) return;
-    const pick = recommended.find((letter) => letter !== "C");
+    const explicitlySelected = preferredDrive.replace(/:$/, "").toUpperCase();
+    const readyPreferred = windowsVolumes.some((v) => v.letter.toUpperCase() === explicitlySelected && v.ready !== false);
+    const pick = (readyPreferred ? explicitlySelected : "") || recommended.find((letter) =>
+      letter !== "C" && windowsVolumes.find((v) => v.letter.toUpperCase() === letter)?.ready !== false);
     if (!pick) return;
     void openWindowsLetter(pick);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, windowsVolumes, recommendedKey, browsePath]);
+  }, [open, windowsVolumes, recommendedKey, browsePath, preferredDrive]);
 
   async function openWindowsFolder(name: string) {
     if (!browsePath) return;
@@ -404,6 +414,8 @@ export function BrowseFolderDialog({
                     key={letter}
                     type="button"
                     onClick={() => void openWindowsLetter(letter)}
+                    disabled={vol.ready === false}
+                    title={vol.ready === false ? "Windows volume is locked, disconnected or not ready" : "Open filesystem on the forensic host"}
                     className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs ${
                       active
                         ? "border-brand-400 bg-brand-50 font-semibold text-brand-900"
@@ -414,6 +426,8 @@ export function BrowseFolderDialog({
                   >
                     <HardDrive className="h-3.5 w-3.5 text-brand-600" />
                     {letter}:{vol.label ? <span className="text-ink-500">{vol.label}</span> : null}
+                    {vol.drive_type === "removable" ? <span className="text-brand-800">USB</span> : null}
+                    {vol.ready === false ? <span className="text-amber-700">not ready</span> : null}
                     {suggested ? <span className="text-brand-800">new</span> : null}
                   </button>
                 );

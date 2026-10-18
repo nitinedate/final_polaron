@@ -58,7 +58,10 @@ def iter_files_from_part(
     *,
     max_bytes: int | None = None,
     max_bytes_by_path: dict[str, int | None] | None = None,
+    verify_sha256_by_path: dict[str, str | None] | None = None,
+    verify_size_by_path: dict[str, int] | None = None,
     on_progress=None,
+    on_detail=None,
 ) -> Iterator[tuple[str, bytes | None]]:
     """Yield ``(path, content)`` for wanted members via streamed MinIO/zstd/tar.
 
@@ -66,24 +69,40 @@ def iter_files_from_part(
     ``max_bytes_by_path`` applies a per-file cap in one pass so callers do not
     decompress the same shard once for every read budget. ``on_progress`` is
     ``(members_scanned, files_yielded)`` and lets a long scan stay alive.
+    ``on_detail`` receives bytes read, the current member, and the wanted-file
+    fraction about once a second, including while a large member is draining.
+    Optional hashes/sizes validate each entire source while retaining just the
+    requested prefix: derived forensic header records must never bypass evidence
+    integrity merely because they only need the first 4 KiB.
     """
     wanted = {p.replace("\\", "/") for p in paths}
     if not wanted:
         return
 
-    # Serve tiny cache hits first without touching the stream.
+    # Tiny cache hits are complete bytes. Apply the per-path budget and verify
+    # the entire cached source when the caller requests forensic provenance.
     remaining = set(wanted)
     for p in list(remaining):
-        if max_bytes is None:
-            hit = _cached_file(part_uri, p)
-            if hit is not None:
+        cached = _cached_file(part_uri, p)
+        if cached is None:
+            continue
+        expected_size = (verify_size_by_path or {}).get(p)
+        expected_hash = (verify_sha256_by_path or {}).get(p)
+        if expected_size is not None and len(cached) != int(expected_size):
+            log.error("Cached extracted evidence size mismatch part=%s path=%s", part_uri, p)
+            remaining.discard(p)
+            yield p, None
+            continue
+        if expected_hash:
+            import hashlib
+            if hashlib.sha256(cached).hexdigest().lower() != str(expected_hash).lower():
+                log.error("Cached extracted evidence SHA-256 mismatch part=%s path=%s", part_uri, p)
                 remaining.discard(p)
-                yield p, hit
-        else:
-            cached = _cached_file(part_uri, p)
-            if cached is not None:
-                remaining.discard(p)
-                yield p, cached[:max_bytes]
+                yield p, None
+                continue
+        cap = (max_bytes_by_path or {}).get(p, max_bytes)
+        remaining.discard(p)
+        yield p, cached[:cap] if cap is not None else cached
     if not remaining:
         return
 
@@ -95,52 +114,143 @@ def iter_files_from_part(
 
     scanned = 0
     yielded = 0
+    bytes_seen = 0
+    wanted_total = len(wanted)
     last_progress = time.monotonic()
+    # 8 MiB matches the extractor's write size. The tar/zstd defaults (8–128 KiB)
+    # spend the scan in the Python wrapper, which is what makes a shard of small
+    # files look frozen for tens of minutes.
+    chunk = 8 * 1024 * 1024
 
-    def _note(force: bool = False) -> None:
+    def _emit(*, force: bool = False, current: str | None = None, current_read: int = 0, current_size: int = 0) -> None:
         nonlocal last_progress
-        if on_progress is None:
+        if on_progress is None and on_detail is None:
             return
         now = time.monotonic()
-        if not force and (now - last_progress) < 5.0 and scanned % 400 != 0:
+        if not force and (now - last_progress) < 1.0:
             return
         last_progress = now
-        try:
-            on_progress(scanned, yielded)
-        except Exception:
-            log.debug("Shard scan progress callback failed", exc_info=True)
+        if on_progress is not None:
+            try:
+                on_progress(scanned, yielded)
+            except Exception:
+                log.debug("Shard scan progress callback failed", exc_info=True)
+        if on_detail is not None:
+            try:
+                on_detail({
+                    "members_scanned": scanned,
+                    "files_yielded": yielded,
+                    "files_wanted": wanted_total,
+                    "bytes_seen": bytes_seen,
+                    "current_path": current or "",
+                    "current_read": int(current_read or 0),
+                    "current_size": int(current_size or 0),
+                })
+            except Exception:
+                log.debug("Shard scan detail callback failed", exc_info=True)
+
+    def _drain(handle, nbytes: int, *, current: str) -> None:
+        nonlocal bytes_seen
+        left = int(nbytes or 0)
+        size = left
+        while left > 0:
+            block = handle.read(min(left, chunk))
+            if not block:
+                break
+            left -= len(block)
+            bytes_seen += len(block)
+            _emit(current=current, current_read=size - left, current_size=size)
 
     try:
         dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(stream) as zreader:
-            with tarfile.open(fileobj=zreader, mode="r|") as tar:
+        try:
+            reader = dctx.stream_reader(stream, read_size=chunk)
+        except TypeError:
+            reader = dctx.stream_reader(stream)
+        with reader as zreader:
+            with tarfile.open(fileobj=zreader, mode="r|", bufsize=chunk) as tar:
                 for member in tar:
                     if not remaining:
                         break
                     scanned += 1
-                    if scanned == 1 or scanned % 200 == 0:
-                        _note()
                     if not member.isfile():
+                        _emit(current=getattr(member, "name", "") or "")
                         continue
                     norm = member.name.replace("\\", "/")
+                    member_size = int(member.size or 0)
+                    # Consume skipped members in large reads. Leaving them for
+                    # tarfile's default skip uses a tiny buffer and reports nothing
+                    # until the next header, which is the frozen "streaming N files" card.
                     if norm not in remaining:
+                        handle = tar.extractfile(member)
+                        if handle is not None and member_size > 0:
+                            _drain(handle, member_size, current=norm)
+                        else:
+                            _emit(current=norm)
                         continue
                     f = tar.extractfile(member)
                     if not f:
                         remaining.discard(norm)
                         yielded += 1
+                        _emit(force=True, current=norm)
                         yield norm, None
                         continue
                     cap = max_bytes
                     if max_bytes_by_path is not None:
                         cap = max_bytes_by_path.get(norm, max_bytes)
-                    content = f.read(cap) if cap else f.read()
-                    if cap is None:
+                    expected_hash = (verify_sha256_by_path or {}).get(norm)
+                    expected_size = (verify_size_by_path or {}).get(norm)
+                    if expected_hash or expected_size is not None:
+                        import hashlib
+                        digest = hashlib.sha256() if expected_hash else None
+                        prefix = bytearray()
+                        read_size = 0
+                        while True:
+                            block = f.read(chunk)
+                            if not block:
+                                break
+                            read_size += len(block)
+                            bytes_seen += len(block)
+                            if digest is not None:
+                                digest.update(block)
+                            if cap is None:
+                                prefix.extend(block)
+                            elif len(prefix) < cap:
+                                prefix.extend(block[: cap - len(prefix)])
+                            _emit(current=norm, current_read=read_size, current_size=member_size)
+                        valid_size = expected_size is None or read_size == int(expected_size)
+                        valid_hash = not expected_hash or digest.hexdigest().lower() == str(expected_hash).lower()
+                        if not valid_size or not valid_hash:
+                            log.error("Extracted evidence failed size/SHA-256 check part=%s path=%s size_ok=%s hash_ok=%s",
+                                      part_uri, norm, valid_size, valid_hash)
+                            content = None
+                        else:
+                            content = bytes(prefix)
+                    elif cap is None and member_size > chunk:
+                        buf = bytearray()
+                        while True:
+                            block = f.read(chunk)
+                            if not block:
+                                break
+                            buf.extend(block)
+                            bytes_seen += len(block)
+                            _emit(current=norm, current_read=len(buf), current_size=member_size)
+                        content = bytes(buf)
+                    else:
+                        content = f.read(cap) if cap is not None else f.read()
+                        got = len(content or b"")
+                        bytes_seen += got
+                        if cap is not None and member_size > got:
+                            _drain(f, member_size - got, current=norm)
+                        else:
+                            _emit(current=norm, current_read=got, current_size=member_size)
+                    if cap is None and content is not None:
                         _cache_file(part_uri, norm, content)
                     remaining.discard(norm)
                     yielded += 1
+                    _emit(force=True, current=norm, current_read=member_size, current_size=member_size)
                     yield norm, content
-        _note(force=True)
+        _emit(force=True)
     except Exception as exc:
         # A stage cancel is raised on the main thread from SIGTERM. Do not treat
         # it as a short read and keep parsing the rest of the shard.
@@ -174,8 +284,12 @@ def iter_spilled_files_from_part(part_uri: str, paths: set[str], *, directory: s
         return
     try:
         dctx = zstd.ZstdDecompressor()
-        with dctx.stream_reader(stream) as zreader:
-            with tarfile.open(fileobj=zreader, mode="r|") as tar:
+        try:
+            reader = dctx.stream_reader(stream, read_size=8 * 1024 * 1024)
+        except TypeError:
+            reader = dctx.stream_reader(stream)
+        with reader as zreader:
+            with tarfile.open(fileobj=zreader, mode="r|", bufsize=8 * 1024 * 1024) as tar:
                 for member in tar:
                     if not wanted:
                         break

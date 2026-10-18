@@ -1320,10 +1320,14 @@ def sync_orchestration_from_job(db, job_id: str) -> dict[str, Any]:
             _set_agent(states, "virtual_disk_agent", state="done", pct=100)
         if str(extract_activity.get("subphase") or "") == "enumerating":
             found = int(extract_activity.get("files_found") or 0)
+            dirs = int(extract_activity.get("directories_scanned") or 0)
+            entries = int(extract_activity.get("entries_scanned") or 0)
+            unreadable = int(extract_activity.get("unreadable_directories") or 0)
             extract_detail = (
-                f"Filesystem inventory — {found:,} files discovered; total still growing"
-                if found > 0
-                else "Enumerating filesystem tree — total not known yet"
+                f"TSK inventory — {found:,} files · {dirs:,} directories · {entries:,} entries scanned"
+                + (f" · {unreadable:,} unreadable" if unreadable else "")
+                if (found or dirs or entries)
+                else "TSK filesystem inventory starting — counting files/directories"
             )
         else:
             remaining = max(files_total - files_done, 0)

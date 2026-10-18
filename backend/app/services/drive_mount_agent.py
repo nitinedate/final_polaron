@@ -97,26 +97,42 @@ def mounted_letters(rows: list[dict[str, Any]] | None = None) -> list[str]:
 
 
 def windows_attached_letters(helper: dict[str, Any] | None = None) -> list[str]:
-    """Drive letters Windows currently has attached (helper /drives + volumes)."""
+    """Drive letters Windows reports ready for read-only forensic access.
+
+    Windows considers USB SSDs 'fixed' and flash sticks 'removable', so do not
+    filter based on drive_type. Exclude explicitly unready / locked volumes and
+    CD-ROM placeholders. Keep old helpers compatible when `ready` is absent.
+    """
     helper = helper if helper is not None else probe_helper()
     seen: set[str] = set()
+    blocked: set[str] = set()
     letters: list[str] = []
 
-    def _add(raw: object) -> None:
-        letter = str(raw or "").strip().upper()[:1]
-        if letter.isalpha() and letter not in seen:
-            seen.add(letter)
-            letters.append(letter)
+    def _normalized(raw: object) -> str:
+        candidate = str(raw or "").strip().upper().rstrip(":")
+        return candidate if len(candidate) == 1 and candidate.isalpha() else ""
 
     for vol in helper.get("volumes") or []:
         if not isinstance(vol, dict):
             continue
-        drive_type = str(vol.get("drive_type") or "").lower().replace(" ", "")
-        if drive_type in _SKIP_DRIVE_TYPES:
+        letter = _normalized(vol.get("letter"))
+        if not letter:
             continue
-        _add(vol.get("letter"))
+        drive_type = str(vol.get("drive_type") or "").lower().replace(" ", "")
+        if drive_type in _SKIP_DRIVE_TYPES or vol.get("ready") is False:
+            blocked.add(letter)
+            continue
+        if letter not in seen:
+            seen.add(letter)
+            letters.append(letter)
+
+    # Older Windows helpers only provide a raw drives array. Never re-add a
+    # letter that the structured volumes list explicitly marked as not ready.
     for raw in helper.get("drives") or []:
-        _add(raw)
+        letter = _normalized(raw)
+        if letter and letter not in seen and letter not in blocked:
+            seen.add(letter)
+            letters.append(letter)
     return letters
 
 
@@ -209,6 +225,87 @@ def docker_path_for_windows(required_path: str) -> Path | None:
     rest = match.group(2).replace("\\", "/").strip("/")
     base = _host_mount_prefix() / letter
     return (base / rest) if rest else base
+
+
+# The HostDrive Windows helper sees actual physical/removable volumes, while
+# Docker Desktop may retain a stale /host/<letter> directory after a USB disk
+# is unplugged and a different volume receives the same letter. Before using a
+# selected evidence folder, compare bounded filename/size metadata across the
+# two independently accessed views. Never open an evidence file for writing.
+_EVIDENCE_FILENAME = re.compile(
+    r"(?i)\.(?:e[0-9a-z]{2}|ex[0-9a-z]{2}|s\d{2}|\d{3}|dd|raw|img|aff4?|vmdk|vhdx?|qcow2?|zip)$"
+)
+
+
+def source_media_matches(required_path: str) -> bool:
+    """Check that the mounted folder corresponds to the Windows source.
+
+    On a host without the helper, rely on the local Docker path. On a host
+    where the helper can enumerate the selected folder, reject stale/swapped
+    mounts and size mismatches. The final image hashes are verified separately
+    by the forensic pipeline; this is an early source identity check.
+    """
+    path = docker_path_for_windows(required_path)
+    if path is None:
+        return False
+    try:
+        from app.services.hostdrive_agent import lookup_exact_path
+
+        host = lookup_exact_path(required_path)
+    except Exception:
+        host = None
+    if not host or not host.get("ok"):
+        # The helper might not be installed on single-container/Linux setups.
+        # Do not mistake helper downtime for definitive evidence loss.
+        return True
+
+    actual = follow_host_junction(path)
+    try:
+        directory = actual.parent if actual.is_file() else actual
+        if not directory.is_dir():
+            return False
+        # Windows is case-insensitive while Linux may present names with
+        # different case. Only inspect metadata, never content during probing.
+        local = {e.name.casefold(): e for e in directory.iterdir()}
+    except (OSError, PermissionError):
+        return False
+
+    entries = [e for e in host.get("entries", ()) if isinstance(e, dict)]
+    evidence = [e for e in entries if e.get("kind") == "file"
+                and _EVIDENCE_FILENAME.search(str(e.get("name") or ""))]
+    # When the examiner selected a parent directory instead of a segment
+    # directory, still compare a small deterministic set of entries.
+    sample = sorted(evidence if evidence else entries,
+                    key=lambda e: str(e.get("name") or "").casefold())
+    # Check the first *and last* source segments. EWF images may contain more
+    # than 64 segments, so testing only the first set could miss a replacement
+    # or disconnected later segment of the same evidence family.
+    if len(sample) > 64:
+        sample = sample[:32] + sample[-32:]
+    for row in sample:
+        name = str(row.get("name") or "")
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            return False
+        item = local.get(name.casefold())
+        if item is None:
+            log.warning("Windows/Docker source mismatch: missing selected-media entry %s on %s", name, required_path)
+            return False
+        try:
+            is_dir = row.get("kind") == "dir"
+            if is_dir != item.is_dir():
+                return False
+            if not is_dir and row.get("size_bytes") is not None:
+                if item.stat().st_size != int(row["size_bytes"]):
+                    log.warning("Windows/Docker source mismatch: length changed for %s on %s", name, required_path)
+                    return False
+        except (OSError, ValueError, TypeError):
+            return False
+    return True
+
+
+def selected_media_readable(required_path: str) -> bool:
+    """A Windows file/folder is ready only if the actual media matches."""
+    return path_is_readable(required_path) and source_media_matches(required_path)
 
 
 def path_is_readable(required_path: str) -> bool:
@@ -321,7 +418,7 @@ def ensure_path_mounted(required_path: str, *, wait_sec: float = 90.0) -> dict[s
     refresh: dict[str, Any] = {}
     waited: dict[str, Any] = {}
 
-    if path_is_readable(raw):
+    if selected_media_readable(raw):
         result = _result(
             ok=True,
             helper=helper,
@@ -342,31 +439,31 @@ def ensure_path_mounted(required_path: str, *, wait_sec: float = 90.0) -> dict[s
     # ask the Windows HostDrive refresh job to resolve/remount that path.
     refresh = proxy_refresh_mounts(required_path=raw)
     budget = min(max(float(wait_sec), 8.0), 180.0)
-    if path_is_readable(raw):
+    if selected_media_readable(raw):
         waited = {"status": "done", "ok": True, "required_path": raw, "message": "Selected path is already readable"}
     elif refresh.get("joined_existing"):
         waited = _wait_until_readable(raw, timeout_sec=budget)
         covered = _refresh_covers_path(waited, raw)
-        if not path_is_readable(raw) and not covered:
+        if not selected_media_readable(raw) and not covered:
             # The in-flight job was a general drive scan. It does not mount the
             # folder the examiner just selected. Start that mount now.
             refresh = proxy_refresh_mounts(required_path=raw)
             waited = {}
-    if not path_is_readable(raw) and (refresh.get("started") or refresh.get("ok")):
+    if not selected_media_readable(raw) and (refresh.get("started") or refresh.get("ok")):
         waited = _wait_until_readable(raw, timeout_sec=budget)
     deadline = time.time() + max(float(wait_sec), 8.0)
     after = before
     refresh_failed = str(waited.get("status") or "").lower() == "error" or waited.get("ok") is False
     while time.time() < deadline:
         after = inspect_host_letters()
-        if path_is_readable(raw):
+        if selected_media_readable(raw):
             break
         if refresh_failed or (refresh.get("ok") is False and not refresh.get("started")):
             break
         time.sleep(2.0)
 
     after = inspect_host_letters()
-    ready_path = path_is_readable(raw)
+    ready_path = selected_media_readable(raw)
     letter_ok = bool(letter and letter in mounted_letters(after))
     result = _result(
         ok=bool(ready_path or letter_ok),
@@ -390,8 +487,8 @@ def ensure_path_mounted(required_path: str, *, wait_sec: float = 90.0) -> dict[s
         ).strip()
         result["refresh_error"] = refresh_detail or None
         result["message"] = (
-            f"Office server can see {raw}, but Docker cannot read it "
-            f"(missing or stale /host/{loc})."
+            f"Windows can see {raw}, but Docker cannot read the same selected media "
+            f"(missing, stale or mismatched /host/{loc})."
         )
         if refresh_detail:
             result["message"] += f" Mount recovery detail: {refresh_detail}"

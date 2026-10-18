@@ -1760,6 +1760,20 @@ function Get-WorkstationDriveVolumes {
             -Free $(if ($info -and $info.IsReady) { [int64]$info.TotalFreeSpace } else { 0 })
     }
 
+    # Source availability is a property of the filesystem, not of the device
+    # bus. Many USB/NVMe enclosures report Fixed and many flash readers reserve
+    # letters while no readable medium is inserted. Surface ready separately.
+    foreach ($row in $byLetter.Values) {
+        $isReady = $false
+        try {
+            $driveInfo = [System.IO.DriveInfo]::new("$($row.letter):\")
+            if ($driveInfo.DriveType -ne [System.IO.DriveType]::CDRom -and
+                $driveInfo.DriveType -ne [System.IO.DriveType]::Network) {
+                $isReady = [bool]$driveInfo.IsReady
+            }
+        } catch { $isReady = $false }
+        $row.ready = $isReady
+    }
     $script:DriveCache = @($byLetter.Values | Sort-Object { $_.letter })
     $script:DriveCacheAt = Get-Date
     return $script:DriveCache

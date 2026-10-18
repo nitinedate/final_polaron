@@ -110,9 +110,11 @@ class Settings(BaseSettings):
     parse_max_file_bytes: int = Field(default=50_000_000, validation_alias="PARSE_MAX_FILE_BYTES")
     # Absolute ceiling for a single non-forensic known-parser read (forensic = unlimited via exemption).
     parse_hard_max_bytes: int = Field(default=512_000_000, validation_alias="PARSE_HARD_MAX_BYTES")
-    parse_workers: int = Field(default=16, validation_alias="PARSE_WORKERS")
+    parse_workers: int = Field(default=8, validation_alias="PARSE_WORKERS")
     parse_parallel_enabled: bool = Field(default=True, validation_alias="PARSE_PARALLEL_ENABLED")
     parse_db_commit_batch: int = Field(default=250, validation_alias="PARSE_DB_COMMIT_BATCH")
+    # Persist small shard members regularly even before reaching the byte budget.
+    parse_stream_max_files: int = Field(default=96, validation_alias="PARSE_STREAM_MAX_FILES")
     parse_parallel_buckets: int = Field(default=4, validation_alias="PARSE_PARALLEL_BUCKETS")
     parse_bucket_min_pending: int = Field(default=2000, validation_alias="PARSE_BUCKET_MIN_PENDING")
     parse_drain_forensic_only: bool = Field(default=True, validation_alias="PARSE_DRAIN_FORENSIC_ONLY")

@@ -55,6 +55,14 @@ def merge_pipeline_progress(
     preserved_inv_phase = merged.get("phase") if inventory_progress_active(merged) else None
     preserved_rag = merged.get("rag_progress") if isinstance(merged.get("rag_progress"), dict) else None
 
+    # A same-phase diagnostic write (an E01 read trace) must not replace the
+    # inventory counters with zeros. A real subphase change still replaces them.
+    old_activity = merged.get("extraction_activity")
+    new_activity = update.get("extraction_activity")
+    if isinstance(old_activity, dict) and isinstance(new_activity, dict):
+        if str(new_activity.get("subphase") or "") == str(old_activity.get("subphase") or ""):
+            update["extraction_activity"] = {**old_activity, **new_activity}
+
     inv_active = inventory_progress_active(merged) or inventory_progress_active({**merged, **update})
 
     if writer in ("rag", "parse", "ocr") and inv_active and "inventory_stage" not in update:

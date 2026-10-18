@@ -178,8 +178,20 @@ function Get-ApiImage {
         }
     }
     catch { }
-    # Project image name is stable in both base Compose files.  Do not pull it;
-    # docker run will fail cleanly if it genuinely is absent.
+    # The split-stack API image name changed from rag_new2-api. Before trying
+    # an old hardcoded tag, use a locally available Python-based project image
+    # (or the official Python image, if already cached). Never pull during a
+    # forensic drive probe: a download failure is unrelated to drive access.
+    try {
+        $imgList = Invoke-NativeCapture -FilePath 'docker' -ArgumentList @('image', 'ls', '--format', '{{.Repository}}:{{.Tag}}')
+        if ($imgList.ExitCode -eq 0) {
+            foreach ($prefix in @('aetheris-forensic-api', 'rag_new2-api', 'aetheris-forensic', 'aetheris-mobile-android-api', 'aetheris-mobile-ios-api', 'python')) {
+                $matches = @($imgList.Output | Where-Object { "$_" -match ('^' + [regex]::Escape($prefix) + '(:|-)') })
+                if ($matches.Count) { return ([string]$matches[0]).Trim() }
+            }
+        }
+    }
+    catch { }
     return "rag_new2-api"
 }
 
@@ -195,62 +207,100 @@ function Test-WindowsLetterHasFiles {
     }
 }
 
-function Test-DockerDesktopHostLetter {
-    param([string]$Letter)
-    $lower = ($Letter.ToLower())
-    if ($lower -notmatch '^[a-z]$') { return $false }
-    # An empty /mnt/host/g directory is NOT a mount. Docker Desktop and our own
-    # mkdir leave stubs that make `ls` succeed while G: is invisible. Require a
-    # real 9p/drvfs/virtiofs mount AND at least one directory entry.
-    # Do not use $n / $(...) here: Windows PowerShell expands those before
-    # wsl.exe sees the script, which made a live DrvFs mount look empty.
-    $probe = Invoke-NativeCapture -FilePath 'wsl.exe' -ArgumentList @(
-        '-d', 'docker-desktop', '--', 'sh', '-c',
-        "grep -E ' /mnt/host/$lower ' /proc/mounts 2>/dev/null | grep -Eq '9p|drvfs|virtiofs|fuse' || exit 11; ls -A /mnt/host/$lower 2>/dev/null | grep -q ."
+# A dead Docker Desktop letter share (ENODEV / "No such device") is not the same
+# as a missing disk. Only that one letter is detached and remounted read-only.
+# Healthy letters are left alone, and /mnt/host itself is never unmounted.
+function Repair-StaleWindowsLetter {
+    param(
+        [Parameter(Mandatory = $true)][string]$Letter,
+        [string]$RelativePath = ""
     )
-    return ($probe.ExitCode -eq 0)
+    $lower = $Letter.ToLowerInvariant()
+    $relative = (($RelativePath -replace '\\', '/').Trim('/'))
+    $shell = @'
+set -eu
+LETTER="$1"
+LOWER="$2"
+REL="$3"
+is_mount() {
+  grep -q " $1 " /proc/self/mountinfo 2>/dev/null
+}
+readable() {
+  ls -d "$1" >/dev/null 2>&1
+}
+paths="/mnt/host/${LOWER} /tmp/docker-desktop-root/mnt/host/${LOWER} /tmp/docker-desktop-root/run/desktop/mnt/host/${LOWER}"
+healthy=0
+total=0
+for mp in $paths; do
+  total=$((total + 1))
+  if is_mount "$mp" && readable "$mp"; then
+    healthy=$((healthy + 1))
+  fi
+done
+if [ "$healthy" -eq "$total" ]; then
+  echo "letter already readable"
+  exit 0
+fi
+for mp in $paths; do
+  if ! is_mount "$mp"; then
+    continue
+  fi
+  if readable "$mp"; then
+    continue
+  fi
+  i=0
+  while [ "$i" -lt 8 ]; do
+    i=$((i + 1))
+    if ! is_mount "$mp"; then
+      break
+    fi
+    umount -l "$mp" || true
+  done
+done
+for mp in $paths; do
+  if is_mount "$mp" && readable "$mp"; then
+    continue
+  fi
+  mkdir -p "$mp"
+  mount -t drvfs -o ro,metadata,uid=0,gid=0 "${LETTER}:" "$mp"
+done
+check="/mnt/host/${LOWER}"
+if [ -n "$REL" ]; then
+  check="${check}/${REL}"
+fi
+ls -d "$check" >/dev/null
+dpid=""
+for proc in /proc/[0-9]*; do
+  cmd=$(tr "\0" " " < "$proc/cmdline" 2>/dev/null || true)
+  case "$cmd" in
+    /usr/local/bin/dockerd\ *) dpid=${proc#/proc/}; break ;;
+  esac
+done
+if [ -n "$dpid" ] && command -v nsenter >/dev/null 2>&1; then
+  dockcheck="/run/desktop/mnt/host/${LOWER}"
+  if [ -n "$REL" ]; then
+    dockcheck="${dockcheck}/${REL}"
+  fi
+  nsenter -t "$dpid" -m -- ls -d "$dockcheck" >/dev/null
+fi
+echo "remounted ${LETTER}: read-only"
+'@
+    $shell = $shell -replace "`r", ""
+    try {
+        $run = Invoke-NativeCapture -FilePath 'wsl.exe' -ArgumentList @(
+            '-d', 'docker-desktop', '-u', 'root', '--', 'sh', '-s', '--', $Letter, $lower, $relative
+        ) -StdinText $shell
+        return @{
+            ok     = ($run.ExitCode -eq 0)
+            exit   = $run.ExitCode
+            output = $run.Text
+        }
+    }
+    catch {
+        return @{ ok = $false; exit = -1; output = $_.Exception.Message }
+    }
 }
 
-function Ensure-DockerDesktopHostLetter {
-    # Newly attached Windows letters (G:, USB disks) are often missing from
-    # Docker Desktop's /mnt/host until DrvFs is mounted there. Docker Desktop
-    # also leaves a stale 9p share after a USB reconnect: ls says
-    # "No such device" and a second mount on top of that 9p fails. Lazy-unmount
-    # first, then bind DrvFs at every path the daemon uses.
-    #
-    # CRITICAL: `ls` on an empty stub returns 0. The remount is successful only
-    # when /proc/mounts shows a real filesystem AND the directory has entries
-    # (or Windows itself has no files to show).
-    param([string]$Letter)
-    $L = Normalize-DriveLetter $Letter
-    if (-not $L) { return $false }
-    if (Test-DockerDesktopHostLetter $L) { return $true }
-    $lower = $L.ToLower()
-    $hostPath = "/mnt/host/$lower"
-    $tmpHost = "/tmp/docker-desktop-root/mnt/host/$lower"
-    $tmpRun = "/tmp/docker-desktop-root/run/desktop/mnt/host/$lower"
-    $driveSpec = "${L}:"
-    # Hard-code every path. Shell variables ($t, $n) are eaten by Windows
-    # PowerShell before wsl.exe runs, which unmounted G: and never remounted it.
-    $shell = @"
-set +e
-umount -l $hostPath >/dev/null 2>&1
-umount -l $tmpHost >/dev/null 2>&1
-umount -l $tmpRun >/dev/null 2>&1
-mkdir -p $hostPath $tmpHost $tmpRun
-mount -t drvfs '$driveSpec' $hostPath -o ro,metadata || mount -t drvfs '$driveSpec' $hostPath -o ro || mount -t drvfs '$driveSpec' $hostPath
-mount -t drvfs '$driveSpec' $tmpHost -o ro,metadata || mount -t drvfs '$driveSpec' $tmpHost -o ro || true
-mount -t drvfs '$driveSpec' $tmpRun -o ro,metadata || mount -t drvfs '$driveSpec' $tmpRun -o ro || true
-grep -E ' $hostPath ' /proc/mounts 2>/dev/null | grep -Eq '9p|drvfs|virtiofs|fuse' || exit 11
-ls -A $hostPath 2>/dev/null | grep -q . || exit 12
-exit 0
-"@
-    $mount = Invoke-NativeCapture -FilePath 'wsl.exe' -ArgumentList @(
-        '-d', 'docker-desktop', '--', 'sh', '-c', $shell
-    )
-    if ($mount.ExitCode -ne 0) { return $false }
-    return (Test-DockerDesktopHostLetter $L)
-}
 
 function Test-DockerSource {
     param(
@@ -275,43 +325,27 @@ if rel:
     for part in [p for p in rel.split('/') if p]:
         target = target / part
 ok = root.is_dir() and target.exists()
-if ok and target.is_dir():
-    next(target.iterdir(), None)
+if ok and target.is_dir() and not rel:
+    # An empty Docker Desktop stub is NOT a successfully mounted evidence disk.
+    ok = next(target.iterdir(), None) is not None
 raise SystemExit(0 if ok else 41)
 '@
 
-    $probeVolume = ""
+    # IMPORTANT: resolve native Windows binds with the Windows Docker client.
+    # Never create local-driver volumes for Docker Desktop's /mnt/host/g,
+    # /run/desktop/mnt/host/g, etc. Those are aliases of the SAME broken
+    # device; Docker volume create accepts an unusable device, and the first
+    # container that attaches it fails with "no such device". Worse, it leaves
+    # orphan aetheris_drive_probe_* volumes if the daemon becomes unavailable.
+    # A verified Linux/WSL source is probed separately, from the SAME WSL
+    # distribution, by Test-DockerSourceViaWsl below.
     try {
-        if ($Source.StartsWith('/')) {
-            # The final Compose strategy for Docker-daemon/WSL paths is an
-            # external local-driver volume. Probe through that exact mechanism,
-            # not a Windows-side Compose bind, so a source is accepted only if
-            # the real production mount path can read the selected evidence.
-            $probeVolume = "aetheris_drive_probe_" + [guid]::NewGuid().ToString('N')
-            $created = Invoke-NativeCapture -FilePath 'docker' -ArgumentList @(
-                'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
-                '--opt', ("device={0}" -f $Source), $probeVolume
-            )
-            if ($created.ExitCode -ne 0) {
-                return @{
-                    ok = $false
-                    exit = $created.ExitCode
-                    output = $created.Text
-                }
-            }
-            $run = Invoke-NativeCapture -FilePath 'docker' -ArgumentList @(
-                'run', '--rm', '--network', 'none', '--entrypoint', 'python',
-                '--mount', "type=volume,source=$probeVolume,target=/probe,readonly",
-                $Image, '-c', $code, $relB64
-            )
-        }
-        else {
-            $run = Invoke-NativeCapture -FilePath 'docker' -ArgumentList @(
-                'run', '--rm', '--network', 'none', '--entrypoint', 'python',
-                '--mount', "type=bind,source=$Source,target=/probe,readonly",
-                $Image, '-c', $code, $relB64
-            )
-        }
+        $run = Invoke-NativeCapture -FilePath 'docker' -ArgumentList @(
+            'run', '--rm', '--network', 'none', '--pull', 'never',
+            '--entrypoint', 'python',
+            '--mount', "type=bind,source=$Source,target=/probe,readonly",
+            $Image, '-c', $code, $relB64
+        )
         return @{
             ok     = ($run.ExitCode -eq 0)
             exit   = $run.ExitCode
@@ -323,11 +357,6 @@ raise SystemExit(0 if ok else 41)
             ok     = $false
             exit   = -1
             output = $_.Exception.Message
-        }
-    }
-    finally {
-        if ($probeVolume) {
-            Invoke-NativeCapture -FilePath 'docker' -ArgumentList @('volume', 'rm', '-f', $probeVolume) | Out-Null
         }
     }
 }
@@ -497,14 +526,15 @@ if rel:
     for part in [p for p in rel.split('/') if p]:
         target = target / part
 ok = root.is_dir() and target.exists()
-if ok and target.is_dir():
-    next(target.iterdir(), None)
+if ok and target.is_dir() and not rel:
+    # An empty Docker Desktop stub is NOT a successfully mounted evidence disk.
+    ok = next(target.iterdir(), None) is not None
 raise SystemExit(0 if ok else 41)
 '@
     $mountSpec = "type=bind,source=$Source,target=/probe,readonly"
     try {
         $run = Invoke-NativeCapture -FilePath 'wsl.exe' -ArgumentList @(
-            '-d', $Distro, '--exec', 'docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python',
+            '-d', $Distro, '--exec', 'docker', 'run', '--rm', '--network', 'none', '--pull', 'never', '--entrypoint', 'python',
             '--mount', $mountSpec, $Image, '-c', $code, $relB64
         )
         return @{
@@ -526,11 +556,16 @@ function Get-AttemptSummary {
         $label = "mode=$($a.mode) source=$($a.source)"
         if ($a.distro) { $label += " distro=$($a.distro)" }
         $detail = ("$($a.detail)").Trim()
-        if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 500) }
+        if ($detail -match 'no such device|error evaluating symlinks|invalid mount config') {
+            $detail = 'Docker Desktop reports unavailable device/mount (ENODEV)'
+        }
+        elseif ($detail.Length -gt 180) { $detail = $detail.Substring(0, 180) }
         if ($detail) { $label += " detail=$detail" }
         $parts += $label
     }
-    if ($parts.Count -gt 6) { $parts = @($parts | Select-Object -Last 6) }
+    # Report the decisive failures only; the UI must not print hundreds of
+    # lines of identical Docker Desktop "no such device" errors.
+    if ($parts.Count -gt 2) { $parts = @($parts | Select-Object -First 2) }
     return ($parts -join ' | ')
 }
 
@@ -627,30 +662,29 @@ if (-not $ForceWslBridge -and $normalizedRequired -and -not $driveRootHasFiles) 
 }
 
 if ($RemountOnly) {
-    $ok = Ensure-DockerDesktopHostLetter -Letter $letter
+    # Do not unmount Docker Desktop's internal /mnt/host/ 9p/virtiofs mounts.
+    # Modifying them from inside docker-desktop can disrupt unrelated mounts
+    # and cannot repair a Windows USB device that Docker Desktop cannot see.
+    $readOnlyProbe = Test-DockerSource -Source "${letter}:/" -Image $image -RelativePath $relative
     Write-Result @{
-        ok     = [bool]$ok
+        ok     = [bool]$readOnlyProbe.ok
         drive  = $letter
-        source = "/mnt/host/$lower"
-        mode   = "docker-desktop-host-remount"
-        error  = $(if ($ok) { $null } else { "Could not attach ${letter}: under Docker Desktop /mnt/host/$lower" })
+        source = $(if ($readOnlyProbe.ok) { "${letter}:/" } else { '' })
+        mode   = $(if ($readOnlyProbe.ok) { 'docker-direct' } else { 'unavailable' })
+        error  = $(if ($readOnlyProbe.ok) { $null } else { "Docker Desktop cannot bind ${letter}:. Reconnect the device and restart Docker Desktop after active jobs finish; no daemon-internal mount was modified." })
     }
-    exit $(if ($ok) { 0 } else { 31 })
+    exit $(if ($readOnlyProbe.ok) { 0 } else { 31 })
 }
 
 # Read the Windows letter itself first. A compose bind of G:/ is the path
 # Docker Desktop keeps after a USB replug. /mnt/host/g is an internal stub
 # that becomes "no such device" and must not win while the letter is readable.
-$desktopHostReady = $false
 if (-not $ForceWslBridge) {
-    $directSources = @(
-        "${letter}:/",
-        "${letter}:\",
-        "/mnt/host/$lower",
-        "/run/desktop/mnt/host/$lower",
-        "/host_mnt/$lower",
-        "/$lower"
-    ) | Select-Object -Unique
+    # All daemon aliases point to the same Docker Desktop G: share. After a
+    # native G:/ failure, retrying those aliases is not a new data path and
+    # creates misleading errors and temporary Docker volumes. Try one direct
+    # bind, then fall back to verified Docker Desktop WSL Integration.
+    $directSources = @( "${letter}:/" )
 
     foreach ($source in $directSources) {
         $probe = Test-DockerSource -Source $source -Image $image -RelativePath $relative
@@ -673,6 +707,109 @@ if (-not $ForceWslBridge) {
                 message        = "Docker can read ${letter}: directly."
             }
             exit 0
+        }
+    }
+}
+
+# Some external SSD/HDD/USB bridges refuse a whole-letter bind but permit a
+# narrowly scoped folder bind. Do this ONLY for the selected evidence directory;
+# don't build a fake /host/g from a stale root or create Docker local volumes.
+# The early exact-path probe above already covered an empty/unreadable root.
+if (-not $ForceWslBridge -and $normalizedRequired -and $driveRootHasFiles) {
+    $exactPlan = Get-ExactMountPlan -Path $normalizedRequired -Letter $letter
+    if ($exactPlan) {
+        $exactProbe = Test-DockerSource -Source ([string]$exactPlan.source) -Image $image -RelativePath ([string]$exactPlan.probe_relative)
+        $attempts += [pscustomobject]@{
+            source = [string]$exactPlan.source
+            mode = "docker-exact-path"
+            target = [string]$exactPlan.target
+            ok = [bool]$exactProbe.ok
+            detail = $exactProbe.output
+        }
+        if ($exactProbe.ok) {
+            Write-Result @{
+                ok = $true
+                drive = $letter
+                source = [string]$exactPlan.source
+                mode = "docker-exact-path"
+                mount_target = [string]$exactPlan.target
+                source_scope = "selected-folder"
+                required_path = $normalizedRequired
+                probe_relative = [string]$exactPlan.probe_relative
+                api_image = $image
+                attempts = $attempts
+                message = "Selected evidence directory is verified directly from Docker, read-only; full-drive sharing was unavailable."
+            }
+            exit 0
+        }
+    }
+}
+
+# Direct and exact-folder binds both use Docker Desktop's letter share. When
+# that share is a dead device, retrying the same bind cannot succeed. Detach
+# only this letter and mount it read-only, then probe once more.
+$staleShare = $false
+foreach ($attempt in @($attempts)) {
+    if (-not $attempt.ok -and "$($attempt.detail)" -match 'no such device|ENODEV|error evaluating symlinks') {
+        $staleShare = $true
+        break
+    }
+}
+if (-not $ForceWslBridge -and $staleShare) {
+    $repair = Repair-StaleWindowsLetter -Letter $letter -RelativePath $relative
+    $attempts += [pscustomobject]@{
+        source = "${letter}:/"
+        mode   = "stale-letter-repair"
+        ok     = [bool]$repair.ok
+        detail = $repair.output
+    }
+    if ($repair.ok) {
+        $probe = Test-DockerSource -Source "${letter}:/" -Image $image -RelativePath $relative
+        $attempts += [pscustomobject]@{ source = "${letter}:/"; mode = "direct"; ok = [bool]$probe.ok; detail = $probe.output }
+        if ($probe.ok) {
+            Write-Result @{
+                ok             = $true
+                drive          = $letter
+                source         = "${letter}:/"
+                mode           = "docker-direct"
+                mount_target   = "/host/$lower"
+                source_scope   = "drive"
+                required_path  = $(if ($normalizedRequired) { $normalizedRequired } else { $null })
+                probe_relative = $relative
+                api_image      = $image
+                attempts       = $attempts
+                message        = "Docker Desktop had a dead ${letter}: share. It was remounted read-only and the selected evidence path is readable. No evidence was copied."
+            }
+            exit 0
+        }
+        if ($normalizedRequired) {
+            $exactPlan = Get-ExactMountPlan -Path $normalizedRequired -Letter $letter
+            if ($exactPlan) {
+                $exactProbe = Test-DockerSource -Source ([string]$exactPlan.source) -Image $image -RelativePath ([string]$exactPlan.probe_relative)
+                $attempts += [pscustomobject]@{
+                    source = [string]$exactPlan.source
+                    mode   = "docker-exact-path"
+                    target = [string]$exactPlan.target
+                    ok     = [bool]$exactProbe.ok
+                    detail = $exactProbe.output
+                }
+                if ($exactProbe.ok) {
+                    Write-Result @{
+                        ok             = $true
+                        drive          = $letter
+                        source         = [string]$exactPlan.source
+                        mode           = "docker-exact-path"
+                        mount_target   = [string]$exactPlan.target
+                        source_scope   = "selected-folder"
+                        required_path  = $normalizedRequired
+                        probe_relative = [string]$exactPlan.probe_relative
+                        api_image      = $image
+                        attempts       = $attempts
+                        message        = "Docker Desktop had a dead ${letter}: share. The selected evidence folder is readable after a read-only remount. No evidence was copied."
+                    }
+                    exit 0
+                }
+            }
         }
     }
 }
@@ -793,20 +930,14 @@ foreach ($distro in $distros) {
 }
 
 $summary = Get-AttemptSummary -Attempts $attempts
-if (-not $desktopHostReady) {
-    $errorText = "Windows can read '$normalizedRequired', but Docker Desktop left an empty stub for ${letter}:. HostDrive could not attach DrvFs at /mnt/host/$lower. Retry Select disk folder. If this persists, restart Docker Desktop and remount the drive."
-}
-elseif (-not $integrationAvailable) {
-    $errorText = "Windows can read '$normalizedRequired' and Docker Desktop /mnt/host/$lower was remounted, but the container probe still failed. Retry Select disk folder so HostDrive can recreate the forensic API with the verified mount."
+$evidenceDescription = $(if ($normalizedRequired) { "selected evidence path '$normalizedRequired'" } else { "drive ${letter}:" })
+if (-not $integrationAvailable) {
+    $errorText = "Windows can access $evidenceDescription, but the Docker Desktop Linux engine cannot bind the drive. Close case processing, reconnect the disk, restart Docker Desktop, then retry the selected folder. If this drive must be used without Docker Desktop direct sharing, enable Docker Desktop WSL Integration for an installed WSL2 distribution. No evidence was copied or marked processed."
 }
 else {
-    $errorText = $(if ($normalizedRequired) {
-        "Windows and WSL can see '$normalizedRequired', but the Docker Desktop WSL-integrated bind probe still could not expose it to Linux containers."
-    } else {
-        "Windows can read ${letter}:, but the Docker Desktop WSL-integrated bind probe could not expose the drive to Linux containers."
-    })
+    $errorText = "Windows can access $evidenceDescription, but neither Docker Desktop direct sharing nor the WSL2 integrated bind probe can access its contents. Reconnect the drive, restart Docker Desktop when jobs are idle, and verify it in a read-only container before processing. No evidence was copied or marked processed."
 }
-if ($summary) { $errorText += " Attempts: $summary" }
+if ($summary) { $errorText += " Diagnostic: $summary" }
 Write-Result @{
     ok            = $false
     drive         = $letter

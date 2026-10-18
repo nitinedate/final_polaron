@@ -3122,3 +3122,90 @@ def forensic_failure_email_task(schema_name: str) -> dict:
 def forensic_shard_overlap_task(schema_name: str, job_id: str, shard_id: int) -> dict:
     from app.services.forensic_shard_overlap import process_overlap_shard
     return process_overlap_shard(schema_name, job_id, shard_id)
+
+
+@celery.task(
+    name="app.tasks.disk_vector_sidecar_task",
+    bind=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=90,
+)
+def disk_vector_sidecar_task(self, schema_name: str, job_id: str, task_id: str) -> dict:
+    """Resumable CUDA pgvector indexing without re-extracting or rewriting evidence.
+
+    This runs on ``rag-index`` (one physical GPU worker). CPU parsing/graph work
+    can proceed simultaneously; GPU OCR and embedding use the host GPU lease
+    and never run expensive models on the same 12 GiB card concurrently.
+    """
+    import json
+
+    from app.db.sql_helpers import execute
+    from app.services.job_locks import GpuHeavySlotTimeout
+    from app.services.safe_parallel import finish_sidecar, sidecar_execution
+    from app.services.disk_vector_sidecar import embed_missing_disk_vectors
+
+    task_id = str(task_id or getattr(self.request, "id", "") or "")
+    try:
+        with firm_session(schema_name) as db:
+            with sidecar_execution(
+                db, job_id, "disk_vectors", task_id, schema_name=schema_name
+            ) as owns:
+                if not owns:
+                    return {"status": "held", "reason": "duplicate or obsolete vector job"}
+
+                def heartbeat(embedded: int, initial: int, device: str) -> None:
+                    execute(
+                        db,
+                        """UPDATE pipeline_sidecar_runs
+                           SET heartbeat_at=NOW(), updated_at=NOW(),
+                               details=COALESCE(details,'{}'::jsonb)
+                               || CAST(:progress AS jsonb)
+                           WHERE job_id=:jid AND sidecar='disk_vectors'
+                             AND task_id=:tid AND status='running'""",
+                        {"jid": job_id, "tid": task_id,
+                         "progress": json.dumps({
+                             "vectors_embedded": embedded,
+                             "initial_pending_vectors": initial,
+                             "embedding_device": device,
+                         })},
+                    )
+                    db.commit()
+
+                outcome = embed_missing_disk_vectors(db, job_id, on_batch=heartbeat)
+                if outcome.get("status") == "partial" and outcome.get("pending", 0):
+                    # A late chunk can have a lower UUID than our last cursor.
+                    # Revisit NULL embeddings in another delivery, never update
+                    # already completed vectors or duplicate source chunks.
+                    execute(
+                        db,
+                        """UPDATE pipeline_sidecar_runs SET status='queued',
+                               heartbeat_at=NOW(),updated_at=NOW()
+                           WHERE job_id=:jid AND sidecar='disk_vectors'
+                             AND task_id=:tid""",
+                        {"jid": job_id, "tid": task_id},
+                    )
+                    db.commit()
+                    try:
+                        disk_vector_sidecar_task.apply_async(
+                            args=(schema_name, job_id, task_id),
+                            queue="rag-index", countdown=3,
+                        )
+                    except Exception:
+                        finish_sidecar(db, job_id, "disk_vectors", task_id,
+                                       status="failed", details=outcome)
+                        raise
+                    return {**outcome, "requeued": True}
+                finish_sidecar(db, job_id, "disk_vectors", task_id,
+                               status="done", details=outcome)
+                return outcome
+    except GpuHeavySlotTimeout as exc:
+        # GPU may be occupied by forensic OCR; keep the sidecar queued instead
+        # of falsely declaring semantic indexing complete or crashing the job.
+        if int(getattr(self.request, "retries", 0) or 0) < 90:
+            raise self.retry(exc=exc, countdown=45, max_retries=90)
+        _sidecar_failed("disk_vectors", schema_name, job_id, task_id, exc)
+        raise
+    except Exception as exc:
+        _sidecar_failed("disk_vectors", schema_name, job_id, task_id, exc)
+        raise

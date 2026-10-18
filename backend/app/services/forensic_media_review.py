@@ -16,8 +16,10 @@ import math
 import os
 import re
 import shutil
+import queue
 import subprocess
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import threading
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -567,9 +569,9 @@ def media_review_workers() -> int:
     """
     raw = str(os.environ.get("MEDIA_REVIEW_WORKERS") or "").strip()
     if raw.isdigit() and int(raw) > 0:
-        return min(int(raw), 64)
+        return min(int(raw), 8)
     cpus = os.cpu_count() or 8
-    return max(4, min(16, cpus - 2))
+    return max(1, min(8, cpus - 2))
 
 
 _PROGRESS_EVERY_FILES = 50
@@ -650,71 +652,87 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
         except Exception as exc:
             return {"error": str(exc), "kind": _kind(row), "details": {"frames": [], "model": "tesseract", "ocr_engine": "tesseract"}}
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        inflight = {}
+    workers = max(1, min(int(workers), 8))
+    gate = threading.BoundedSemaphore(workers)
+    inflight: dict[threading.Thread, tuple] = {}
 
-        def _drain(block: bool) -> None:
-            if not inflight:
+    def _drain(block: bool) -> None:
+        if not inflight:
+            return
+        if block:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not any(not thread.is_alive() for thread in inflight):
+                time.sleep(0.05)
+            if not any(not thread.is_alive() for thread in inflight):
+                note_operation(db, job_id, "media_review", "Tesseract image/video text", advanced=True, timeout_seconds=900)
                 return
-            if block:
-                finished, _ = wait(inflight, timeout=20, return_when=FIRST_COMPLETED)
-                if not finished:
-                    note_operation(db, job_id, "media_review", "Tesseract image/video text", advanced=True, timeout_seconds=900)
-                    return
-            else:
-                finished = [fut for fut in list(inflight) if fut.done()]
-            for fut in finished:
-                row, temp = inflight.pop(fut)
-                try:
-                    _publish(row, fut.result())
-                except Exception:
-                    log.exception("Media observation save failed for %s", row.get("file_path"))
-                finally:
-                    if temp:
-                        Path(temp).unlink(missing_ok=True)
-
-        def _submit(row, temp) -> None:
-            if pipeline_should_stop(db, job_id):
+        finished = [thread for thread in list(inflight) if not thread.is_alive()]
+        for thread in finished:
+            row, temp, box = inflight.pop(thread)
+            try:
+                ok, value = box.get_nowait()
+                if not ok:
+                    raise value
+                _publish(row, value)
+            except Exception:
+                log.exception("Media observation save failed for %s", row.get("file_path"))
+            finally:
                 if temp:
                     Path(temp).unlink(missing_ok=True)
-                raise StageWaiting("Media observations paused by user")
-            while len(inflight) >= workers:
-                _drain(True)
-            inflight[pool.submit(_inspect, temp, row)] = (row, temp)
 
-        for _part, wanted in by_part.items():
-            note_operation(
-                db,
-                job_id,
-                "media_review",
-                f"Reading the next image/video shard ({len(wanted)} files)",
-                timeout_seconds=1800,
-                advanced=True,
-            )
-            from app.services.tar_cache import iter_spilled_files_from_part
+    def _submit(row, temp) -> None:
+        if pipeline_should_stop(db, job_id):
+            if temp:
+                Path(temp).unlink(missing_ok=True)
+            raise StageWaiting("Media observations paused by user")
+        while len(inflight) >= workers:
+            _drain(True)
+        box: queue.Queue = queue.Queue(maxsize=1)
 
-            seen = set()
-            for norm, spilled in iter_spilled_files_from_part(_part, set(wanted)):
-                seen.add(norm)
-                row = wanted.get(norm)
-                if row is None or not spilled:
-                    if spilled:
-                        Path(spilled).unlink(missing_ok=True)
-                    continue
-                _submit(row, spilled)
-            while inflight:
-                _drain(True)
-            for path, row in wanted.items():
-                if path not in seen:
-                    temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
-                    _submit(row, temp)
-            while inflight:
-                _drain(True)
-        for row in loose:
-            temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
-            _submit(row, temp)
+        def _run(temp=temp, row=row, box=box) -> None:
+            with gate:
+                try:
+                    box.put((True, _inspect(temp, row)))
+                except Exception as exc:
+                    box.put((False, exc))
+
+        thread = threading.Thread(target=_run, name="disk-media")
+        thread.start()
+        inflight[thread] = (row, temp, box)
+
+    for _part, wanted in by_part.items():
+        note_operation(
+            db,
+            job_id,
+            "media_review",
+            f"Reading the next image/video shard ({len(wanted)} files)",
+            timeout_seconds=1800,
+            advanced=True,
+        )
+        from app.services.tar_cache import iter_spilled_files_from_part
+
+        seen = set()
+        for norm, spilled in iter_spilled_files_from_part(_part, set(wanted)):
+            seen.add(norm)
+            row = wanted.get(norm)
+            if row is None or not spilled:
+                if spilled:
+                    Path(spilled).unlink(missing_ok=True)
+                continue
+            _submit(row, spilled)
         while inflight:
             _drain(True)
+        for path, row in wanted.items():
+            if path not in seen:
+                temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
+                _submit(row, temp)
+        while inflight:
+            _drain(True)
+    for row in loose:
+        temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
+        _submit(row, temp)
+    while inflight:
+        _drain(True)
     _report(force=True)
 
 

@@ -49,7 +49,11 @@ def ensure_progress_schema(db):
     execute(db, """CREATE TABLE IF NOT EXISTS pipeline_progress_checks (
         job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
         fingerprint text NOT NULL,last_change_at timestamptz NOT NULL DEFAULT NOW(),
-        checked_at timestamptz NOT NULL DEFAULT NOW(),decision text,reason text)""")
+        checked_at timestamptz NOT NULL DEFAULT NOW(),decision text,reason text,
+        acquisition_recoveries integer NOT NULL DEFAULT 0,
+        acquisition_last_dispatch_at timestamptz)""")
+    execute(db, "ALTER TABLE pipeline_progress_checks ADD COLUMN IF NOT EXISTS acquisition_recoveries integer NOT NULL DEFAULT 0")
+    execute(db, "ALTER TABLE pipeline_progress_checks ADD COLUMN IF NOT EXISTS acquisition_last_dispatch_at timestamptz")
     execute(db, 'ALTER TABLE pipeline_stage_runs ADD COLUMN IF NOT EXISTS recovery_dispatches integer NOT NULL DEFAULT 0')
     from app.services.suspicious_activity import ensure_suspicious_schema
     ensure_suspicious_schema(db)
@@ -152,7 +156,7 @@ def _event(db, job_id, stage, decision, reason, *, details=None):
             "Delivery is within", "Paused by the user", "Owning stage is still running",
             "Chunk barrier", "OCR quality triage", "A bounded dependency",
             "Quality triage", "No unfinished work found", "Neo4j unavailable",
-            "Deadlock",
+            "Deadlock", "Priority evidence",
         ))
         logged = f"progressAgent: {reason}"
         last = None if noisy else fetchone(
@@ -282,6 +286,10 @@ def _remaining_summary(state: dict) -> str:
              for key, value in remaining.items() if int(value or 0) > 0 and not key.endswith("_unavailable")]
     if parts:
         op = str(state.get("operation") or "")
+        # Shard and priority lines already name the fraction, rate, and current
+        # file. Prefixing "1 active I/O" hid that and left the 99% card opaque.
+        if op.startswith(("Shard scan", "Parsing ", "Priority evidence")):
+            return op
         suffix = f" — {op}" if op else ""
         return "Still writing / processing: " + ", ".join(parts) + suffix
     if not state.get("checks_available", True):
@@ -347,6 +355,11 @@ def monitor_job(db, job_id, *, schema_name):
             except Exception: pass
     if not current_service_owns_job(db, job_id):
         return {"status": "held", "reason": "missing_or_other_product", "job_id": job_id}
+    # An extraction barrier always outranks leftover serial stage rows. A
+    # partially processed historical case must not evade acquisition watchdogs.
+    if (str(job.get("status") or "") in {"processing", "building_disk", "extracting"}
+            and not job.get("extracted_disk_uri")):
+        return _monitor_acquisition(db, job, schema_name=schema_name)
     report = _monitor_report(db, job, schema_name=schema_name)
     if report is not None:
         return report
@@ -448,6 +461,156 @@ def progress_events_page(db,job_id,*,limit=100):
     return {'events':fetchall(db,"SELECT * FROM pipeline_progress_events WHERE job_id=:jid ORDER BY id DESC LIMIT :lim",{'jid':job_id,'lim':max(1,min(int(limit),200))}),'coordinator':'progressAgent'}
 
 
+
+def acquisition_fingerprint(job: dict) -> str:
+    """Fingerprint actual acquisition work, not liveness touches or periodic logs."""
+    activity = _obj(job.get("pipeline_progress")).get("extraction_activity") or {}
+    checkpoint = _obj(job.get("extraction_checkpoint"))
+    payload = [
+        activity.get("subphase"), activity.get("files_found"),
+        activity.get("entries_scanned"), activity.get("directories_scanned"),
+        activity.get("files_extracted"), activity.get("bytes_extracted"),
+        activity.get("shards_done"), activity.get("unreadable_directories"),
+        activity.get("last_path"), activity.get("alias_directories_skipped"),
+        len(checkpoint.get("completed_shards") or []),
+        checkpoint.get("files_extracted"), checkpoint.get("bytes_extracted"),
+    ]
+    return "extract:" + hashlib.sha256(json.dumps(payload, default=str).encode()).hexdigest()
+
+
+def acquisition_diagnosis(job: dict, age_seconds: float) -> str:
+    """Explain exactly which slow sub-operation the examiner should inspect."""
+    activity = _obj(job.get("pipeline_progress")).get("extraction_activity") or {}
+    subphase = str(activity.get("subphase") or "preparing")
+    if subphase == "enumerating":
+        files = int(activity.get("files_found") or 0)
+        dirs = int(activity.get("directories_scanned") or 0)
+        entries = int(activity.get("entries_scanned") or 0)
+        errors = int(activity.get("unreadable_directories") or 0)
+        last = str(activity.get("last_path") or "unknown")[:180]
+        phase = str(activity.get("reader_phase") or "unknown")
+        method = str(activity.get("root_open_strategy") or "unknown")
+        attempt = int(activity.get("reader_attempt") or 0)
+        inventory_mode = str(activity.get("inventory_mode") or "unknown")
+        last_read = activity.get("last_source_read_offset")
+        io_detail = (f"; last E01 byte offset={last_read}" if last_read is not None else "")
+        if files == 0 and dirs == 0 and entries == 0:
+            if phase in {"root_open", "root_first_entry"}:
+                if last_read is not None:
+                    detail = (f"native reader phase={phase}, root method={method}; "
+                              f"still reading E01 metadata at byte {last_read} "
+                              f"while the TSK root directory is opening{io_detail}")
+                else:
+                    detail = (f"native reader phase={phase}, root method={method}; "
+                              f"blocked opening the TSK root or obtaining its first entry{io_detail}")
+            else:
+                detail = f"native reader phase={phase}; inspect image reopen/partition mount and segment I/O"
+        else:
+            detail = f"reader phase={phase}; last path={last}"
+        return (f"TSK filesystem walk: no useful entry progress for {int(age_seconds)}s; "
+                f"attempt={attempt} ({inventory_mode}), files={files:,}, dirs={dirs:,}, "
+                f"entries={entries:,}, unreadable={errors:,}; "
+                f"{detail}. Isolated watchdog will use serial fallback before alternating the root method; "
+                "do not start a duplicate extraction.")
+    if subphase == "copying":
+        return (f"MinIO copy: no committed file/byte/shard progress for {int(age_seconds)}s; "
+                "check S3 writes, disk source reads, extraction lock and storage capacity.")
+    return (f"Extraction/{subphase}: no useful progress for {int(age_seconds)}s; "
+            "check worker queue, evidence mount, CPU admission and source image read.")
+
+
+def inspect_acquisition_progress(db, job: dict, *, schema_name: str, now=None) -> dict:
+    """Acquisition-specific progressAgent rules. Never duplicate a live extractor.
+
+    Native E01 readers now have their own disposable subprocess watchdog.
+    progressAgent records the specific stall reason, and only requeues if *both*
+    the extraction lock and the Celery task are known absent.
+    """
+    from app.services.job_locks import extract_task_in_flight, extract_celery_work_active
+
+    now = now or datetime.now(timezone.utc)
+    jid = str(job["id"])
+    fp = acquisition_fingerprint(job)
+    execute(db, """INSERT INTO pipeline_progress_checks(job_id,fingerprint) VALUES(:jid,:fp)
+        ON CONFLICT(job_id) DO UPDATE SET
+            last_change_at=CASE WHEN pipeline_progress_checks.fingerprint<>EXCLUDED.fingerprint
+                THEN NOW() ELSE pipeline_progress_checks.last_change_at END,
+            acquisition_recoveries=CASE WHEN pipeline_progress_checks.fingerprint<>EXCLUDED.fingerprint
+                THEN 0 ELSE pipeline_progress_checks.acquisition_recoveries END,
+            acquisition_last_dispatch_at=CASE WHEN pipeline_progress_checks.fingerprint<>EXCLUDED.fingerprint
+                THEN NULL ELSE pipeline_progress_checks.acquisition_last_dispatch_at END,
+            fingerprint=EXCLUDED.fingerprint,checked_at=NOW()""", {"jid": jid, "fp": fp})
+    row = fetchone(db, "SELECT last_change_at,acquisition_recoveries,acquisition_last_dispatch_at FROM pipeline_progress_checks WHERE job_id=:jid", {"jid": jid}) or {}
+    age = _age(row.get("last_change_at"), now)
+    warn_at = max(45, int(os.environ.get("PROGRESS_AGENT_EXTRACT_WARN_SECONDS", "90")))
+    # Per-child diagnostic clock is distinct from TRUE evidence progress.
+    # Do not add an attempt restart to acquisition_fingerprint: doing so would
+    # reset acquisition_recoveries and could allow unlimited job redispatches.
+    activity = _obj(job.get("pipeline_progress")).get("extraction_activity") or {}
+    attempt_age = float("inf")
+    if str(activity.get("subphase") or "") == "enumerating":
+        try:
+            attempt_age = _age(activity.get("reader_attempt_started_at"), now)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    diagnostic_age = min(age, attempt_age)
+    if age < warn_at:
+        db.commit()
+        return {"status": "progressing", "reason": "Useful extraction progress observed", "job_id": jid,
+                "useful_progress_age_sec": int(age)}
+    if diagnostic_age < warn_at:
+        db.commit()
+        return {"status": "valid_wait", "reason": "New isolated reader attempt is inside its monitoring grace period; no new evidence entries yet",
+                "job_id": jid, "reader_attempt_age_sec": int(attempt_age),
+                "useful_progress_age_sec": int(age)}
+    # Keep log/event output stable for a window instead of changing a duration
+    # number every 15s and flooding the case's immutable forensic audit log.
+    elapsed_bucket = warn_at * max(1, int(diagnostic_age // warn_at))
+    diagnosis = acquisition_diagnosis(job, elapsed_bucket)
+    live_task = extract_celery_work_active(jid)
+    # Avoid releasing a lock based on DB heartbeats. Celery absence must be
+    # confirmed before extract_task_in_flight is allowed to inspect stale locks.
+    if live_task is True or live_task is None:
+        status = "investigate" if live_task is True else "valid_wait"
+        reason = diagnosis + (" Isolated TSK watchdog owns bounded recovery; no duplicate task queued."
+                              if live_task is True else " Worker inspection unavailable; no unsafe redispatch.")
+    else:
+        has_lock = extract_task_in_flight(db, jid, idle_sec=180)
+        if has_lock:
+            status = "investigate"
+            reason = diagnosis + " Extract lock still active; waiting for owner/watchdog."
+        else:
+            status = "recover"
+            reason = diagnosis + " No worker or extraction lease found; resume from checkpoint."
+    # Log a diagnosable event instead of silently returning 'progressing' from
+    # jobs.updated_at which the heartbeat thread updates without evidence work.
+    _event(db, jid, "extract", status, reason)
+    attempts = int(row.get("acquisition_recoveries") or 0)
+    if status == "recover":
+        # Queued Celery delivery can take a minute to acquire its lease. Never
+        # post duplicate deliveries in that grace window.
+        since_dispatch = _age(row.get("acquisition_last_dispatch_at"), now)
+        if since_dispatch < 120:
+            db.commit()
+            return {"status": "valid_wait", "reason": "Checkpoint recovery was queued recently; waiting for its owner", "job_id": jid}
+        if attempts >= MAX_RECOVERY_ATTEMPTS:
+            status = "blocked"
+            reason = "Acquisition recovery budget exhausted. " + diagnosis
+            _event(db, jid, "extract", status, reason)
+        else:
+            execute(db, """UPDATE pipeline_progress_checks SET acquisition_recoveries=acquisition_recoveries+1
+                    , acquisition_last_dispatch_at=NOW()
+                WHERE job_id=:jid""", {"jid": jid})
+            db.commit()
+            from app.services.pipeline_supervisor import dispatch_stage_agent
+            recommendation = {"agent_id": "extract_agent", "action": "resume_extraction",
+                              "reason": "progressAgent repair: " + diagnosis}
+            return dispatch_stage_agent(db, jid, schema_name=schema_name,
+                                        recommendation=recommendation, coordinator="progressAgent")
+    db.commit()
+    return {"status": status, "reason": reason, "stage": "extract", "job_id": jid,
+            "useful_progress_age_sec": int(age)}
+
 def _monitor_acquisition(db, job, *, schema_name):
     """Recover abandoned extraction claims; never duplicate a live extractor."""
     from app.services.forensic_serial_pipeline import start_serial_pipeline
@@ -467,11 +630,13 @@ def _monitor_acquisition(db, job, *, schema_name):
         return {'status':'valid_wait','reason':'Registered evidence manifest is complete but no extraction worker owns the job','job_id':str(job['id'])}
     if job.get('extracted_disk_uri') and job.get('status') in {'extracted','indexing','indexed','parsed','artifacts_registered'}:
         return start_serial_pipeline(db,str(job['id']),schema_name=schema_name)
-    if _age(job.get('updated_at'),datetime.now(timezone.utc)) < CHECK_AFTER_SECONDS:
-        return {'status':'progressing','job_id':str(job['id'])}
     checkpoint=_obj(job.get('extraction_checkpoint'))
     if checkpoint.get('state')=='completed' or checkpoint.get('completed') is True:
         return start_serial_pipeline(db,str(job['id']),schema_name=schema_name)
+    # A refreshed jobs.updated_at does not mean that an E01 reader made useful
+    # progress. Observe stable source counters even while its heartbeat is alive.
+    if str(job.get('status') or '') in {'processing', 'building_disk', 'extracting'} and not job.get('extracted_disk_uri'):
+        return inspect_acquisition_progress(db, job, schema_name=schema_name)
     # Existing extraction locks and worker heartbeats are examined by the
     # domain engine. This coordinator is the only caller of its stage dispatch.
     from app.services.pipeline_supervisor import analyze_job_pipeline, dispatch_stage_agent

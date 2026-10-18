@@ -43,26 +43,22 @@ function Test-HelperOnline {
 }
 
 function Get-HostDriveLetterSet {
+    # Windows reports both fixed USB SSD enclosures and removable pen drives in
+    # GetLogicalDrives(), regardless of USB bus/adapter or drive-letter order.
+    # Query the drive table, not 26 Test-Path calls: a disconnected NAS mapping
+    # or empty card-reader slot must never hang the 10-second watcher.
     $found = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($driveRoot in [System.IO.Directory]::GetLogicalDrives()) {
+        if ($driveRoot -match '^([A-Za-z]):[\\/]') {
+            [void]$found.Add($Matches[1].ToUpperInvariant())
+        }
+    }
     try {
         Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^[A-Z]$' } |
-            ForEach-Object {
-                $letter = $_.Name.ToUpper()
-                if (Test-Path -LiteralPath "${letter}:\") { [void]$found.Add($letter) }
-            }
-    }
-    catch { }
-    # Fresh removable drives can appear in Explorer before PSDrive updates.
-    # Do not query Win32_LogicalDisk here: a stale letter makes that call hang
-    # and the new drive never gets announced.
-    # Probe all possible letters so G/H/I/J/K/L/M/N/... work automatically.
-    foreach ($code in ([int][char]'A')..([int][char]'Z')) {
-        $letter = [string][char]$code
-        if ($found.Contains($letter)) { continue }
-        if (Test-Path -LiteralPath "${letter}:\") { [void]$found.Add($letter) }
-    }
-    return (@($found | Sort-Object) -join ",")
+            Where-Object { $_.Name -match '^[A-Za-z]$' } |
+            ForEach-Object { [void]$found.Add($_.Name.ToUpperInvariant()) }
+    } catch { }
+    return (@($found | Sort-Object) -join ',')
 }
 
 function Invoke-EnsureHelper {

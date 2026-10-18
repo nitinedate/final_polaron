@@ -573,6 +573,14 @@ def build_capacity_plan(snap: HostSnapshot | None = None) -> CapacityPlan:
     if snap.cpu_temp_c is not None and snap.cpu_temp_c >= 85:
         inv_workers = max(1, inv_workers // 2)
 
+    # Disk E01 reads and independent CPU parse units share a documented
+    # eight-slot ceiling. Hardware/media/thermal profiles may lower it but
+    # must never suggest extra workers that the disk semaphore cannot admit.
+    from app.services.disk_slots import DISK_SLOTS
+    extract_readers = min(extract_readers, DISK_SLOTS)
+    parse_workers = min(parse_workers, DISK_SLOTS)
+    parse_buckets = min(parse_buckets, max(1, parse_workers))
+
     from app.services.ollama_model_plan import plan_ollama_models
 
     ollama_plan = plan_ollama_models(
@@ -633,7 +641,13 @@ def build_capacity_plan(snap: HostSnapshot | None = None) -> CapacityPlan:
             "AXIOM_INVENTORY_BATCH_SIZE": "200" if vram >= 11000 else "100",
             "CATALOG_INVENTORY_WORKERS": str(inv_workers),
             "CATALOG_INVENTORY_BATCH_SIZE": "200" if vram >= 11000 else "100",
-            "RAG_EMBEDDING_ENABLED": "false",
+            # Vector indexing is a quality control, not a speed-mode casualty.
+            # Respect an explicit user override; auto-enable on a CUDA-capable
+            # host, where the existing exclusive GPU lease prevents OCR VRAM
+            # contention. CPU-only hosts may opt in deliberately.
+            "RAG_EMBEDDING_ENABLED": str(_truthy(
+                os.environ.get("RAG_EMBEDDING_ENABLED"), bool(snap.gpu_available)
+            )).lower(),
             "RAG_AUTO_AFTER_DISK": "false",
             "RAG_BACKGROUND_AFTER_BASELINE": "false",
             "RAG_BATCH_SIZE": str(rag_batch),

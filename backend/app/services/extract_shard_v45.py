@@ -19,7 +19,7 @@ Fixes shipped here
    then scratch disk) straight into the tar, with SHA-256 computed in the same
    pass.  No more ``read_full_file_from_disk`` → ``io.BytesIO`` copies.
 
-3. **Bounded read semaphore.**  ``EXTRACT_READ_SEMAPHORE`` (default 8, max 12) caps
+3. **Bounded read semaphore.**  ``EXTRACT_READ_SEMAPHORE`` (default 8, max 8) caps
    *concurrent image reads* independently of the shard count, so 14 resumable
    shards no longer mean 14 random-seeking pyewf handles.  Rotational/USB
    sources get an automatic cap of ``EXTRACT_HDD_READERS`` (default 2) via
@@ -43,7 +43,6 @@ import tarfile
 import tempfile
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -67,13 +66,19 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
-READ_SEMAPHORE_SIZE = _env_int("EXTRACT_READ_SEMAPHORE", 8, 1, 12)
+READ_SEMAPHORE_SIZE = _env_int("EXTRACT_READ_SEMAPHORE", 8, 1, 8)
 HDD_READERS = _env_int("EXTRACT_HDD_READERS", 2, 1, 2)
 SPOOL_MAX_BYTES = _env_int("EXTRACT_SPOOL_MAX_BYTES", 128 * 1024 * 1024, 1 << 20, 1 << 30)
 READ_CHUNK_BYTES = _env_int("EXTRACT_READ_CHUNK_BYTES", 8 * 1024 * 1024, 64 * 1024, 64 * 1024 * 1024)
 HDD_READ_CHUNK_BYTES = _env_int("EXTRACT_HDD_CHUNK_BYTES", 16 * 1024 * 1024, 1 << 20, 64 * 1024 * 1024)
 UPLOAD_POOL_SIZE = _env_int("EXTRACT_UPLOAD_CONCURRENCY", 8, 1, 12)
 SCRATCH_DIR = (os.environ.get("EXTRACT_SCRATCH_DIR") or "").strip() or None
+# Opt in on a representative case first.  For a known-size TSK regular file
+# direct streaming eliminates the per-file RAM/disk spool and second copy.
+# A size mismatch must fail the *whole uncommitted part*: after tar.addfile has
+# started, attempting to skip a damaged member would corrupt the tar stream.
+DIRECT_TAR_STREAM = (os.environ.get("EXTRACT_DIRECT_TAR_STREAM", "false").strip().lower()
+                     in {"1", "true", "yes", "on"})
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +93,7 @@ _read_gate_size = 0
 def configure_read_gate(size: int) -> threading.BoundedSemaphore:
     """(Re)size the process-wide image-read semaphore. Safe to call per job."""
     global _read_gate, _read_gate_size
-    size = max(1, min(12, int(size)))
+    size = max(1, min(8, int(size)))
     with _read_gate_lock:
         if _read_gate is None or _read_gate_size != size:
             _read_gate = threading.BoundedSemaphore(size)
@@ -100,16 +105,7 @@ def read_gate() -> threading.BoundedSemaphore:
     return configure_read_gate(_read_gate_size or READ_SEMAPHORE_SIZE)
 
 
-_upload_pool: ThreadPoolExecutor | None = None
-_upload_pool_lock = threading.Lock()
-
-
-def upload_pool() -> ThreadPoolExecutor:
-    global _upload_pool
-    with _upload_pool_lock:
-        if _upload_pool is None:
-            _upload_pool = ThreadPoolExecutor(max_workers=UPLOAD_POOL_SIZE, thread_name_prefix="extract-upload")
-        return _upload_pool
+# Uploads share the disk semaphore. There is no process-wide thread pool.
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +254,36 @@ class _ChunkReader:
         return self.exhausted()
 
 
+class _VerifiedTarReader:
+    """A counting/hash reader used by tarfile for known-size TSK files.
+
+    Unlike spooling, the tar member is written as the evidence is read.  The
+    caller MUST discard the entire shard on short reads, unexpectedly long
+    files, or native-reader exceptions, since tarfile may have emitted a
+    partial member by that point.  This reader never changes evidence bytes.
+    """
+
+    def __init__(self, chunks: Iterator[bytes], *, hash_files: bool) -> None:
+        self._source = _ChunkReader(chunks)
+        self._hash = _CountingHasher(hash_files)
+        self.read_seconds = 0.0
+
+    def read(self, size: int = -1) -> bytes:
+        started = time.monotonic()
+        block = self._source.read(size)
+        self.read_seconds += time.monotonic() - started
+        if block:
+            self._hash.update(block)
+        return block
+
+    def verify(self, expected_size: int) -> tuple[int, str]:
+        if self._hash.n != expected_size:
+            raise IOError(f"TSK streamed {self._hash.n} bytes; expected {expected_size}")
+        if not self._source.exhausted():
+            raise IOError("TSK file exceeds its recorded size; discard incomplete tar shard")
+        return self._hash.n, self._hash.hexdigest()
+
+
 def _stream_into_spool(
     chunks: Iterator[bytes],
     *,
@@ -377,6 +403,10 @@ def shard_worker_v45(
     file_idx = 0
     detail_every = max(stop_check_interval * 10, 5_000)
     t0 = time.monotonic()
+    read_seconds = 0.0
+    pack_seconds = 0.0
+    upload_seconds = 0.0
+    directly_streamed = 0
 
     try:
         cctx = zstd.ZstdCompressor(level=zstd_level, threads=1)
@@ -409,21 +439,51 @@ def shard_worker_v45(
                 nbytes = 0
                 digest = ""
                 try:
-                    if forward is not None and inode is not None and not hash_files:
+                    if forward is not None and inode is not None:
+                        # A ZIP member is already iterable in source order. Use
+                        # the *same* read to hash and pack it: the previous code
+                        # disabled this fast path when SHA-256 was enabled and
+                        # returned to a costly read/spool/re-read cycle.
                         progress.set_current(rel, action="packing", shard_id=shard_id)
-                        reader = _ChunkReader(forward.iter_member(int(inode), chunk))
+                        reader = _VerifiedTarReader(
+                            forward.iter_member(int(inode), chunk), hash_files=hash_files,
+                        )
                         info = tarfile.TarInfo(name=rel.replace("\\", "/"))
                         info.size = size_hint
                         info.mtime = int(node.get("mtime") or 0) or int(time.time())
+                        started = time.monotonic()
                         with gate:
                             tar.addfile(info, reader if size_hint else None)
-                        # Empty members still have a local header. Exhaust the
-                        # reader so the next member stays aligned.
-                        if not reader.exhausted():
-                            raise RuntimeError(f"{rel} is longer than its listed size")
-                        nbytes = size_hint
+                            nbytes, digest = reader.verify(size_hint)
+                        took = time.monotonic() - started
+                        read_seconds += reader.read_seconds
+                        pack_seconds += max(took - reader.read_seconds, 0.0)
+                        directly_streamed += 1
+                        streamed = True
+                    elif DIRECT_TAR_STREAM and vd.mode in ("ewf", "raw") and inode is not None and size_hint > 0:
+                        # Direct input-to-tar for regular known-size E01 files.
+                        # Keep the original source read gate and independent
+                        # EWF reader.  Failure here is fatal to this shard,
+                        # not a silently skipped forensic file.
+                        info = tarfile.TarInfo(name=rel.replace("\\", "/"))
+                        info.size = size_hint
+                        info.mtime = int(node.get("mtime") or 0) or int(time.time())
+                        reader = _VerifiedTarReader(
+                            iter_file_from_disk(vd, rel, inode=int(inode), chunk_size=chunk),
+                            hash_files=hash_files,
+                        )
+                        started = time.monotonic()
+                        with gate:
+                            progress.set_current(rel, action="streaming", shard_id=shard_id)
+                            tar.addfile(info, reader)
+                            nbytes, digest = reader.verify(size_hint)
+                        took = time.monotonic() - started
+                        read_seconds += reader.read_seconds
+                        pack_seconds += max(took - reader.read_seconds, 0.0)
+                        directly_streamed += 1
                         streamed = True
                     else:
+                        started = time.monotonic()
                         with gate:   # bounded concurrent image reads
                             spool, nbytes, digest = _stream_into_spool(
                                 iter_file_from_disk(
@@ -432,13 +492,16 @@ def shard_worker_v45(
                                 hash_files=hash_files,
                                 spool_dir=spool_dir,
                             )
+                        read_seconds += time.monotonic() - started
                         progress.set_current(rel, action="packing", shard_id=shard_id)
                         info = tarfile.TarInfo(name=rel.replace("\\", "/"))
                         info.size = nbytes
                         info.mtime = int(node.get("mtime") or 0) or int(time.time())
+                        started = time.monotonic()
                         tar.addfile(info, spool if nbytes else None)
+                        pack_seconds += time.monotonic() - started
                 except Exception as exc:
-                    if streamed or (forward is not None and inode is not None and not hash_files):
+                    if streamed or (DIRECT_TAR_STREAM and vd.mode in ("ewf", "raw") and inode is not None and size_hint > 0) or (forward is not None and inode is not None):
                         emit(
                             f"Shard {shard_id} failed: {exc}",
                             level="error",
@@ -477,7 +540,9 @@ def shard_worker_v45(
             progress.set_current(f"part-{shard_id:05d}.tar.zst", action="uploading", shard_id=shard_id)
             # Upload on this evidence slot; a nested uploader pool multiplied the
             # real concurrency beyond the four source work units.
+            started = time.monotonic()
             part_uri = put_file(part_key, tmp_path, "application/zstd")
+            upload_seconds = time.monotonic() - started
     except JobStopRequested:
         stopped = True
     except Exception as exc:
@@ -500,8 +565,9 @@ def shard_worker_v45(
     emit(
         f"Shard {shard_id} complete — {len(index_entries):,} files, {bytes_written:,} bytes "
         f"in {elapsed:,.0f}s ({bytes_written / elapsed / 1048576:,.1f} MiB/s)"
+        f"; source/spool={read_seconds:.1f}s, tar={pack_seconds:.1f}s, upload={upload_seconds:.1f}s, direct={directly_streamed}"
         + (f", {skip_count} read skips" if skip_count else ""),
-        metadata={"shard_id": shard_id, "files": len(index_entries), "bytes": bytes_written, "seconds": round(elapsed, 1), "mib_per_s": round(bytes_written / elapsed / 1048576, 2)},
+        metadata={"shard_id": shard_id, "files": len(index_entries), "bytes": bytes_written, "seconds": round(elapsed, 1), "mib_per_s": round(bytes_written / elapsed / 1048576, 2), "source_read_seconds": round(read_seconds, 3), "tar_pack_seconds": round(pack_seconds, 3), "upload_seconds": round(upload_seconds, 3), "direct_files": directly_streamed},
     )
     progress.mark_shard_done(shard_id)
     return {

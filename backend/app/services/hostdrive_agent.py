@@ -278,6 +278,16 @@ def proxy_drives() -> dict[str, Any]:
             return
         seen.add(letter)
         vol["mounted"] = letter in docker_mounted
+        # USB SSD enclosures often identify as DriveType.Fixed. Treat every
+        # ready Windows filesystem volume the same, independent of bus type.
+        # A visible letter is not evidence that Docker can read its contents.
+        ready = vol.get("ready")
+        vol["access_status"] = (
+            "unlock_or_reconnect" if ready is False
+            else "docker_mount_present" if vol["mounted"]
+            else "select_folder_to_mount"
+        )
+        vol["access_mode"] = "read_only_bind" if vol["mounted"] else "windows_helper"
         volumes.append(vol)
 
     if helper.get("ok"):

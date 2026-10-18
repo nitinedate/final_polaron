@@ -18,7 +18,9 @@ param(
     [ValidateSet("Windows", "Wsl")][string]$ExecutionMode = "Windows",
     [string]$OutputPath = "",
     [string[]]$ServiceNames = @(),
-    [switch]$KeepRequiredForResolution
+    [switch]$KeepRequiredForResolution,
+    # Main startup: generate ALL split-stack overrides from ONE verified inventory.
+    [switch]$WriteStartupStackOverrides
 )
 
 # `powershell -File` only binds the first token of an array. Allow a comma-separated
@@ -334,8 +336,8 @@ function Test-DockerBindableWindowsDrive {
     # C: is always required for the stack; Docker Desktop shares it.
     if ($L -eq 'C') { return $true }
     $ctx = Get-DockerProbeContext
-    if (-not $ctx.Docker) { return $true }
-    if (-not $ctx.Image) { return $true }
+    if (-not $ctx.Docker) { return $false }
+    if (-not $ctx.Image) { return $false }
 
     $src = "${L}:/"
     $name = "aetheris-drive-probe-{0}-{1}" -f $L.ToLower(), $PID
@@ -345,7 +347,7 @@ function Test-DockerBindableWindowsDrive {
     try {
         # A docker run against an unreachable drive can hang inside Docker
         # Desktop file sharing; bound it and clean up the probe container.
-        $argLine = 'run --rm --pull never --name {0} -v "{1}:/probe:ro" --entrypoint /bin/true {2}' -f $name, $src, $ctx.Image
+        $argLine = 'run --rm --pull never --name {0} --mount "type=bind,source={1},target=/probe,readonly" --entrypoint /bin/true {2}' -f $name, $src, $ctx.Image
         $proc = Start-Process -FilePath $ctx.Docker -ArgumentList $argLine -NoNewWindow -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
         $null = $proc.Handle  # keeps ExitCode readable after exit (Windows PowerShell 5.1)
@@ -377,7 +379,10 @@ function Invoke-DockerDriveProbes {
     if (-not $Letters -or -not $Letters.Count) { return $status }
     $ctx = Get-DockerProbeContext
     if (-not $ctx.Docker -or -not $ctx.Image) {
-        foreach ($L in $Letters) { $status[$L] = 'yes' }  # cannot probe: same as before, keep
+        # Never turn an unverified drive into a mounted forensic source. A stale
+        # removable letter can appear in Windows while Docker Desktop cannot stat it.
+        foreach ($L in $Letters) { $status[$L] = 'unverified' }
+        Write-ScanNote 'No local Docker probe image available; skipping unverified optional drives.'
         return $status
     }
     $limitSec = 90
@@ -388,7 +393,9 @@ function Invoke-DockerDriveProbes {
     $running = @{}
     foreach ($L in $Letters) {
         $name = "aetheris-drive-probe-{0}-{1}" -f $L.ToLower(), $PID
-        $argLine = 'run --rm --pull never --name {0} -v "{1}:/:/probe:ro" --entrypoint /bin/true {2}' -f $name, $L, $ctx.Image
+        # --mount, unlike -v, MUST NOT create a nonexistent source directory.
+        # The Docker engine checks the same Windows-drive bind used by Compose.
+        $argLine = 'run --rm --pull never --name {0} --mount "type=bind,source={1}:/,target=/probe,readonly" --entrypoint /bin/true {2}' -f $name, $L, $ctx.Image
         $outFile = [System.IO.Path]::GetTempFileName()
         $errFile = [System.IO.Path]::GetTempFileName()
         try {
@@ -448,8 +455,11 @@ function Get-PreviousMappedLetters {
 }
 
 $detected = @(Get-HostDriveLetters)
+# Strict startup check, for example when an active case requires G:. Setting
+# this makes a missing/unshareable drive an error instead of omitting it.
+$envRequired = @(("$env:AETHERIS_REQUIRED_DRIVES" -split '[,;\s]+') | Where-Object { $_ })
 $requested = @(
-    @($AlwaysInclude) + @($RequireDrive) |
+    @($AlwaysInclude) + @($RequireDrive) + $envRequired |
         ForEach-Object { Normalize-DriveLetter $_ } |
         Where-Object { $_ }
 )
@@ -459,12 +469,20 @@ if ($missingRequested.Count) {
     throw "Requested drive(s) are not available in Windows: $($missingRequested -join ', ')"
 }
 
+# Optional persistent setting in the current PowerShell environment, e.g.
+#   $env:AETHERIS_EXCLUDED_DRIVES = 'G'
+# Never use it for a drive that contains the selected case evidence.
+$envExcluded = @( ("$env:AETHERIS_EXCLUDED_DRIVES" -split '[,;\s]+') | Where-Object { $_ } )
 $excluded = @(
-    @($ExcludeDrive) |
+    @($ExcludeDrive) + $envExcluded |
         ForEach-Object { Normalize-DriveLetter $_ } |
         Where-Object { $_ } |
         Sort-Object -Unique
 )
+$contradiction = @($requested | Where-Object { $excluded -contains $_ } | Sort-Object -Unique)
+if ($contradiction.Count) {
+    throw "Required evidence drive(s) cannot also be excluded: $($contradiction -join ', '). Unset AETHERIS_EXCLUDED_DRIVES or choose a different evidence path."
+}
 
 $letters = @(
     $detected + $requested |
@@ -487,7 +505,12 @@ $toProbe = New-Object System.Collections.Generic.List[string]
 $projectDrive = if ("$root" -match '^([A-Za-z]):') { $Matches[1].ToUpper() } else { '' }
 foreach ($letter in $letters) {
     $resolved = if ($sourceMap.ContainsKey($letter)) { $sourceMap[$letter] } else { $null }
-    if ($resolved -and [string]$resolved.source) {
+    # An old successful source-state JSON does NOT prove the device is still
+    # attached to Docker Desktop. In Windows mode, probe the real bind again.
+    # WSL mode is used after refresh-drive-mounts-job has explicitly checked
+    # the source from the integrated distro; a Windows G:/ probe would be
+    # irrelevant there.
+    if ($ExecutionMode -eq 'Wsl' -and $resolved -and [string]$resolved.source) {
         $kept.Add($letter) | Out-Null
         continue
     }
@@ -506,27 +529,28 @@ foreach ($letter in $letters) {
 }
 if ($toProbe.Count) {
     $probe = Invoke-DockerDriveProbes -Letters @($toProbe)
-    $previous = Get-PreviousMappedLetters -Path $out
-    $keptUnverified = New-Object System.Collections.Generic.List[string]
     foreach ($letter in $toProbe) {
         $state = [string]$probe[$letter]
         if ($state -eq 'yes') {
             $kept.Add($letter) | Out-Null
-        } elseif ($state -eq 'timeout' -and $previous.ContainsKey($letter)) {
-            # Slow Docker is not proof the drive is unreadable: the last run mapped it.
-            $kept.Add($letter) | Out-Null
-            $keptUnverified.Add($letter) | Out-Null
-        } else {
+        }
+        else {
+            # On timeout, missing image, or bind failure, exclude the drive.
+            # The previous mapping is NOT proof it is connected now.
+            Write-ScanNote ("Excluding {0}: Docker probe returned {1}" -f $letter, $(if ($state) { $state } else { 'unknown' }))
             $skippedDocker.Add($letter) | Out-Null
         }
     }
-    if ($keptUnverified.Count) {
-        Write-ScanNote ("Docker answered too slowly for {0}; kept because the previous mapping had them." -f ($keptUnverified -join ', '))
-    }
 }
 $letters = @($kept | Sort-Object -Unique)
+# Explicitly selected/required evidence cannot be silently lost. This guard
+# applies to optional startup scans and manual remounts alike.
+$unavailableRequired = @($skippedDocker | Where-Object { $requested -contains $_ })
+if ($unavailableRequired.Count) {
+    throw ("Required evidence drive(s) are visible in Windows but not bindable in Docker Desktop: {0}. Reconnect the drive or use the verified HostDrive/WSL remount; no substitute directory will be created." -f ($unavailableRequired -join ', '))
+}
 if ($skippedDocker.Count) {
-    Write-Warning ("Skipping unresolved drive(s) Docker Desktop cannot bind-mount: {0}. A drive with a verified HostDrive/WSL source is kept automatically. If Docker was only slow, run the start again or pass -RequireDrive." -f ($skippedDocker -join ', '))
+    Write-Warning ("Unavailable OPTIONAL drive(s) omitted from Compose: {0}. If evidence is on one of these drives, reconnect it and refresh HostDrive before extraction. No evidence is marked processed." -f ($skippedDocker -join ', '))
 }
 
 if (-not $letters.Count) {
@@ -582,55 +606,86 @@ foreach ($letter in $letters) {
     }
 }
 
-$lines = New-Object System.Collections.Generic.List[string]
-$lines.Add('# Auto-generated dynamic Windows drive mounts. Do not edit by hand.') | Out-Null
-$lines.Add('# Regenerate: powershell -File scripts/generate-drive-mounts.ps1') | Out-Null
-$lines.Add($(if ($ExecutionMode -eq 'Wsl') { '# WSL execution mode: Linux-visible paths are mounted directly by Docker Desktop WSL Integration.' } else { '# Direct Windows paths use bind mounts. Verified daemon paths use pre-created external volumes.' })) | Out-Null
-$lines.Add('') | Out-Null
-$lines.Add('services:') | Out-Null
-
-foreach ($service in $serviceNames) {
-    $lines.Add("  ${service}:") | Out-Null
-    $lines.Add('    volumes:') | Out-Null
-    foreach ($letter in $letters) {
-        $lower = $letter.ToLower()
-        $m = $driveMounts[$letter]
-        if ($m.daemon_path) {
-            $lines.Add('      - type: volume') | Out-Null
-            $lines.Add(("        source: {0}" -f $m.volume_name)) | Out-Null
-            $lines.Add(('        target: {0}' -f (Convert-ToYamlSingleQuoted ([string]$m.target)))) | Out-Null
-            $lines.Add('        read_only: true') | Out-Null
-            $lines.Add('        volume:') | Out-Null
-            $lines.Add('          nocopy: true') | Out-Null
-        }
-        else {
-            $lines.Add('      - type: bind') | Out-Null
-            $lines.Add(('        source: {0}' -f (Convert-ToYamlSingleQuoted ([string]$m.source)))) | Out-Null
-            $lines.Add(('        target: {0}' -f (Convert-ToYamlSingleQuoted ([string]$m.target)))) | Out-Null
-            $lines.Add('        read_only: true') | Out-Null
-            $lines.Add('        bind:') | Out-Null
-            $lines.Add('          create_host_path: false') | Out-Null
-        }
-    }
-}
-
-$daemonLetters = @($letters | Where-Object { $driveMounts[$_].daemon_path })
-if ($daemonLetters.Count) {
+function New-DriveComposeText {
+    param([string[]]$TargetServices)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('# Auto-generated dynamic Windows drive mounts. Do not edit by hand.') | Out-Null
+    $lines.Add('# Regenerate: powershell -File scripts/generate-drive-mounts.ps1') | Out-Null
+    $lines.Add($(if ($ExecutionMode -eq 'Wsl') { '# WSL execution mode: Linux-visible paths are mounted directly by Docker Desktop WSL Integration.' } else { '# Direct Windows paths use bind mounts. Verified daemon paths use pre-created external volumes.' })) | Out-Null
     $lines.Add('') | Out-Null
-    $lines.Add('volumes:') | Out-Null
-    foreach ($letter in $daemonLetters) {
-        $m = $driveMounts[$letter]
-        $lines.Add(("  {0}:" -f $m.volume_name)) | Out-Null
-        $lines.Add('    external: true') | Out-Null
-        $lines.Add(("    name: {0}" -f $m.volume_name)) | Out-Null
+    $lines.Add('services:') | Out-Null
+
+    foreach ($service in $TargetServices) {
+        $lines.Add("  ${service}:") | Out-Null
+        $lines.Add('    volumes:') | Out-Null
+        foreach ($letter in $letters) {
+            $lower = $letter.ToLower()
+            $m = $driveMounts[$letter]
+            if ($m.daemon_path) {
+                $lines.Add('      - type: volume') | Out-Null
+                $lines.Add(("        source: {0}" -f $m.volume_name)) | Out-Null
+                $lines.Add(('        target: {0}' -f (Convert-ToYamlSingleQuoted ([string]$m.target)))) | Out-Null
+                $lines.Add('        read_only: true') | Out-Null
+                $lines.Add('        volume:') | Out-Null
+                $lines.Add('          nocopy: true') | Out-Null
+            }
+            else {
+                $lines.Add('      - type: bind') | Out-Null
+                $lines.Add(('        source: {0}' -f (Convert-ToYamlSingleQuoted ([string]$m.source)))) | Out-Null
+                $lines.Add(('        target: {0}' -f (Convert-ToYamlSingleQuoted ([string]$m.target)))) | Out-Null
+                $lines.Add('        read_only: true') | Out-Null
+                $lines.Add('        bind:') | Out-Null
+                $lines.Add('          create_host_path: false') | Out-Null
+            }
+        }
+    }
+
+    $daemonLetters = @($letters | Where-Object { $driveMounts[$_].daemon_path })
+    if ($daemonLetters.Count) {
+        $lines.Add('') | Out-Null
+        $lines.Add('volumes:') | Out-Null
+        foreach ($letter in $daemonLetters) {
+            $m = $driveMounts[$letter]
+            $lines.Add(("  {0}:" -f $m.volume_name)) | Out-Null
+            $lines.Add('    external: true') | Out-Null
+            $lines.Add(("    name: {0}" -f $m.volume_name)) | Out-Null
+        }
+    }
+
+    return (($lines -join "`n") + "`n")
+}
+
+function Write-VerifiedDriveOverride {
+    param([string]$Path, [string[]]$Services)
+    $content = New-DriveComposeText -TargetServices $Services
+    # Always write to a sibling temp file first. The live override is never a
+    # half-written YAML document, even if the process is interrupted mid-write.
+    $tempPath = "${Path}.${PID}.tmp"
+    try {
+        [System.IO.File]::WriteAllText($tempPath, $content, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+    Write-ScanNote ("Updated {0}: {1}" -f ([System.IO.Path]::GetFileName($Path)), ($letters -join ', '))
+}
+
+# All three product overlays must be derived from the SAME verified drive
+# inventory. The former launcher refreshed only the unused generic override;
+# stale G:/ binds remained in docker-compose.drives.forensic.yml forever.
+Write-VerifiedDriveOverride -Path $out -Services $serviceNames
+if ($WriteStartupStackOverrides) {
+    $startupOverrides = @(
+        @{ File = 'docker-compose.drives.forensic.yml'; Services = @('api', 'worker-disk', 'worker-parse', 'worker-report', 'worker-agent') },
+        @{ File = 'docker-compose.drives.mobile-android.yml'; Services = @('api', 'worker-build', 'worker-parse') },
+        @{ File = 'docker-compose.drives.mobile-ios.yml'; Services = @('api', 'worker-build', 'worker-parse') }
+    )
+    foreach ($row in $startupOverrides) {
+        Write-VerifiedDriveOverride -Path (Join-Path $root $row.File) -Services $row.Services
     }
 }
 
-# UTF-8 without BOM avoids odd characters at the start of Compose YAML.
-$text = ($lines -join "`n") + "`n"
-[System.IO.File]::WriteAllText($out, $text, [System.Text.UTF8Encoding]::new($false))
-
-Write-Host "Wrote $($letters.Count) drive mount(s) to $out"
 # Release probe runspaces without waiting for one that is stuck in a driver call.
 if ($script:ProbePool) { try { [void]$script:ProbePool.BeginClose($null, $null) } catch { } }
 # IMPORTANT: Invoke-DriveGenerator captures the success/output stream. Write-Host

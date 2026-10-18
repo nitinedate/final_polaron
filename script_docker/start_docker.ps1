@@ -145,53 +145,53 @@ function Assert-RuntimeHealth {
 }
 
 function Invoke-DriveMountRefresh {
-    # V1.10.8: run the drive generator with a time limit. On some PCs a Windows
-    # storage query or a Docker probe of a removable/network drive never returns,
-    # and startup sat forever at this step with no output.
+    # Refresh ALL split-stack overrides with a single verified Windows/Docker
+    # inventory. Generic docker-compose.drives.generated.yml is NOT consumed by
+    # Get-StackComposeArgs for forensic or mobile stacks.
+    # A timed-out or failed scan MUST NOT reuse yesterday's G:/ mapping.
     param([string]$Generator, [bool]$Public)
     $timeoutSec = 240
     if ("$env:AETHERIS_DRIVE_SCAN_TIMEOUT_SEC" -match '^[0-9]+$' -and [int]$env:AETHERIS_DRIVE_SCAN_TIMEOUT_SEC -gt 0) {
         $timeoutSec = [int]$env:AETHERIS_DRIVE_SCAN_TIMEOUT_SEC
     }
-    $outFile = Join-Path $root 'docker-compose.drives.generated.yml'
-    $startedUtc = [DateTime]::UtcNow
-    Write-Host ("    Scanning drives (time limit {0}s; set AETHERIS_DRIVE_SCAN_TIMEOUT_SEC to change)..." -f $timeoutSec)
+    $required = @(
+        'docker-compose.drives.generated.yml',
+        'docker-compose.drives.forensic.yml',
+        'docker-compose.drives.mobile-android.yml',
+        'docker-compose.drives.mobile-ios.yml'
+    )
+    $startedUtc = [DateTime]::UtcNow.AddSeconds(-2)
+    Write-Host ("    Scanning drives for ALL product stacks (time limit {0}s)..." -f $timeoutSec)
     $proc = Start-Process -FilePath 'powershell.exe' -NoNewWindow -PassThru -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $Generator))
-    $null = $proc.Handle  # keeps ExitCode readable after exit (Windows PowerShell 5.1)
-    $exited = $proc.WaitForExit($timeoutSec * 1000)
-    $fresh = (Test-Path -LiteralPath $outFile) -and ((Get-Item -LiteralPath $outFile).LastWriteTimeUtc -ge $startedUtc)
-    $previousUsable = $false
-    $previousWhen = ''
-    if (Test-Path -LiteralPath $outFile) {
-        $text = (Get-Content -LiteralPath $outFile -Raw)
-        $previousUsable = [bool]($text -and $text.Trim() -and $text.Trim() -ne 'services:')
-        $previousWhen = (Get-Item -LiteralPath $outFile).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
-    }
-    if (-not $exited) {
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $Generator),
+        '-WriteStartupStackOverrides')
+    $null = $proc.Handle  # keeps ExitCode readable after exit in PowerShell 5.1
+    if (-not $proc.WaitForExit($timeoutSec * 1000)) {
         & taskkill.exe /PID $proc.Id /T /F *> $null
-        if ($fresh -and $previousUsable) {
-            Write-Warn 'Drive scan wrote the drive mapping but did not exit; stopped it and continuing.'
-            return
+        throw ("Drive scan timed out after {0}s. Refusing stale drive mappings (e.g. disconnected G:). Check/remove offline USB/network drives or raise AETHERIS_DRIVE_SCAN_TIMEOUT_SEC, then retry." -f $timeoutSec)
+    }
+    if ($proc.ExitCode -ne 0) {
+        throw ("Drive scan failed (exit {0}). No stale drive override will be reused. Reconnect required evidence disks or inspect the scan output." -f $proc.ExitCode)
+    }
+    foreach ($file in $required) {
+        $path = Join-Path $root $file
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Drive scan did not produce required product override: $file"
         }
-        if ($previousUsable) {
-            Write-Warn ("Drive scan did not finish within {0}s; it was stopped. Keeping the previous drive mapping from {1}." -f $timeoutSec, $previousWhen)
-            Write-Warn 'Drives connected since then are mapped by the next successful start or by the HostDrive refresh in the app.'
-            Write-Warn 'A disconnected network drive or a stuck USB card reader is the usual cause; disconnect it and restart.'
-            return
+        $item = Get-Item -LiteralPath $path
+        $content = Get-Content -LiteralPath $path -Raw
+        if ($item.LastWriteTimeUtc -lt $startedUtc -or
+            -not $content -or $content -notmatch '(?m)^services:\s*$' -or
+            $content -notmatch '(?m)^\s+target:') {
+            throw "Drive override is stale or empty: $file. Refusing the previous G: bind configuration."
         }
-        throw ("Drive scan did not finish within {0}s and no previous drive mapping exists. Disconnect stuck USB card readers / offline network drives, or raise AETHERIS_DRIVE_SCAN_TIMEOUT_SEC, then retry." -f $timeoutSec)
     }
-    $code = $proc.ExitCode
-    if ($code -eq 0 -or ($null -eq $code -and $fresh)) {
-        Write-Ok 'Drive mapping refreshed.'
-        return
-    }
-    if (-not $Public -and $previousUsable) {
-        Write-Warn ("Drive scan failed (exit {0}); keeping the previous drive mapping from {1} for this local start." -f $code, $previousWhen)
-        return
-    }
-    throw "Drive-mount generation failed (exit $code)."
+    $forensicFile = Join-Path $root 'docker-compose.drives.forensic.yml'
+    $forensicText = Get-Content -LiteralPath $forensicFile -Raw
+    $mapped = @([regex]::Matches($forensicText, "/host/([a-z])'") |
+        ForEach-Object { $_.Groups[1].Value.ToUpper() } | Sort-Object -Unique)
+    Write-Ok ("Current forensic drive mounts: {0}" -f $(if ($mapped.Count) { $mapped -join ', ' } else { 'none' }))
+    Write-Ok 'Generic, forensic, Android and iOS drive overlays refreshed from one verified scan.'
 }
 
 function Assert-DockerReady {
@@ -799,6 +799,16 @@ try {
 
     Assert-DockerReady
     Assert-StartupAssets -Public $isPublic
+
+    # Refresh BEFORE Compose preflight; a stale removable G:/ bind from the last
+    # deployment must never fail validation or reach the Docker daemon.
+    $driveGenerator = Join-Path $root 'scripts/generate-drive-mounts.ps1'
+    if (Test-Path -LiteralPath $driveGenerator -PathType Leaf) {
+        Write-Step 'Refresh Windows drive/evidence mount configuration'
+        Invoke-DriveMountRefresh -Generator $driveGenerator -Public $isPublic
+    } else {
+        throw "Missing drive generator: $driveGenerator"
+    }
     Assert-AllComposeFiles -CreateRuntimeDirectories:(-not $ValidateOnly)
 
     if ($ValidateOnly) {
@@ -815,14 +825,6 @@ try {
         if (-not $settings.AcmeEmail) { throw 'An email address is required for trusted public HTTPS.' }
     }
     if ($isPublic) { Save-DeploymentSettings -Settings $settings -Profile $Profile }
-
-    # Generate dynamic drive overrides when the helper is present. Failures here should be
-    # actionable because silent drive omissions are unsafe for a forensic deployment.
-    $driveGenerator = Join-Path $root 'scripts/generate-drive-mounts.ps1'
-    if (Test-Path -LiteralPath $driveGenerator -PathType Leaf) {
-        Write-Step 'Refresh Windows drive/evidence mount configuration'
-        Invoke-DriveMountRefresh -Generator $driveGenerator -Public $isPublic
-    }
 
     # Stop existing containers only after preflight and drive generation succeed.
     # No docker down -v, prune or global stop: preserve evidence and unrelated projects.

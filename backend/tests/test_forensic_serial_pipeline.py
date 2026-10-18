@@ -44,14 +44,20 @@ def rows_at(stage, status="running"):
 
 
 @pytest.mark.parametrize(
-    "requested,expected", [(1, 1), (2, 2), (4, 4), (16, 4), (64, 4), (0, 1)]
+    "requested,expected", [(1, 1), (2, 2), (4, 4), (16, None), (64, None), (0, 1)]
 )
 def test_parallelism_is_hard_capped(requested, expected):
-    assert policy.parallelism(requested) == expected
+    got = policy.parallelism(requested)
+    if expected is None:
+        assert got == policy.MAX_PARALLELISM
+    else:
+        assert got == expected
 
 
 def test_work_is_bounded_and_all_items_are_processed():
-    barrier = threading.Barrier(4, timeout=5)
+    from app.services.disk_slots import DISK_SLOTS
+
+    barrier = threading.Barrier(DISK_SLOTS, timeout=5)
     guard = threading.Lock()
     active = peak = 0
 
@@ -65,8 +71,9 @@ def test_work_is_bounded_and_all_items_are_processed():
             active -= 1
         return item
 
-    assert sorted(policy.bounded_map(work, range(12), workers=32)) == list(range(12))
-    assert peak == 4
+    count = DISK_SLOTS * 2
+    assert sorted(policy.bounded_map(work, range(count), workers=32)) == list(range(count))
+    assert peak == DISK_SLOTS
     assert active == 0
 
 
@@ -374,7 +381,9 @@ def test_ocr_cpu_workers_are_capped_even_with_old_settings(monkeypatch):
     monkeypatch.setattr(
         ocr_gpu, "get_settings", lambda: SimpleNamespace(ocr_cpu_workers=32)
     )
-    assert ocr_gpu._ocr_cpu_worker_count(gpu=True, n_items=100) == 4
+    from app.services.forensic_serial_policy import MAX_PARALLELISM
+
+    assert ocr_gpu._ocr_cpu_worker_count(gpu=True, n_items=100) == MAX_PARALLELISM
     assert ocr_gpu._ocr_cpu_worker_count(gpu=True, n_items=2) == 2
 
 

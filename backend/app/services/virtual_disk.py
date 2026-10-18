@@ -11,6 +11,7 @@ import threading
 import time
 import zipfile
 import zlib
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,17 +132,42 @@ if _pytsk3 is not None:
     class EwfImgInfo(_pytsk3.Img_Info):
         def __init__(self, ewf_handle):
             self._ewf_handle = ewf_handle
+            self._block_cache: OrderedDict = OrderedDict()
             super().__init__(url="", type=_pytsk3.TSK_IMG_TYPE_EXTERNAL)
 
         def close(self):
             self._ewf_handle.close()
 
         def read(self, offset, size):
-            self._ewf_handle.seek(offset)
-            return self._ewf_handle.read(size)
+            callback = getattr(self, "_diagnostic_emit", None)
+            if callback is not None:
+                try:
+                    now = time.monotonic()
+                    if now >= getattr(self, "_next_read_diagnostic_at", 0.0):
+                        period = max(5., float(os.environ.get("EXTRACT_TSK_EWF_READ_TRACE_SEC", "20")))
+                        self._next_read_diagnostic_at = now + period
+                        callback("EWF/TSK source read - waiting on image bytes", {
+                            "action": "ewf_read_enter",
+                            "reader_phase": getattr(self, "_diagnostic_state", {}).get("reader_phase", "root_open"),
+                            "last_source_read_offset": int(offset),
+                            "last_source_read_size": int(size),
+                        })
+                except Exception:
+                    # A diagnostic failure must never interrupt evidence I/O.
+                    log.debug("EWF read diagnostic failed", exc_info=True)
+            return cached_image_read(self._ewf_handle, self._block_cache, int(offset), int(size))
 
         def get_size(self):
             return self._ewf_handle.get_media_size()
+
+        def set_read_diagnostic(self, emit: ProgressCb, state: dict) -> None:
+            # A read callback is entered before a potentially blocked libewf
+            # seek/read. Rate limiting keeps the audit log bounded.
+            self._diagnostic_emit = emit
+            self._diagnostic_state = state
+            self._next_read_diagnostic_at = 0.0
+            self._read_requests = 0
+
 
 else:
 
@@ -853,14 +879,97 @@ def _tsk_meta_type(value) -> int:
     return value.value if hasattr(value, "value") else int(value)
 
 
+def filesystem_root_inode(fs_info) -> int | None:
+    """Inode of the filesystem root. NTFS uses 5 when TSK does not report one.
+
+    ``open_dir(path='/')`` resolves that same directory by name and, on a
+    multi-segment E01, seeks tens of gigabytes apart before the first entry.
+    Opening the inode skips that lookup.
+    """
+    info = getattr(fs_info, "info", None)
+    raw = getattr(info, "root_inum", None)
+    try:
+        inode = int(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        inode = None
+    if inode:
+        return inode
+    ftype = getattr(info, "ftype", None)
+    name = str(getattr(ftype, "name", "") or "")
+    value = getattr(ftype, "value", ftype)
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        numeric = None
+    if "NTFS" in name.upper() or numeric == 1:
+        return 5
+    return None
+
+
+_EWF_CACHE_BLOCK = 256 * 1024
+_EWF_CACHE_BLOCKS = 128
+_EWF_CACHE_DIRECT = 4 * 1024 * 1024
+
+
+def cached_image_read(handle, cache: OrderedDict, offset: int, size: int) -> bytes:
+    """Read image bytes, reusing 256 KiB windows.
+
+    TSK root-open issues many small reads of the same NTFS metadata. Each one
+    otherwise seeks and decompresses the E01 again.
+    """
+    if size <= 0:
+        return b""
+    if size > _EWF_CACHE_DIRECT:
+        handle.seek(int(offset))
+        return handle.read(int(size))
+    end = int(offset) + int(size)
+    pos = int(offset)
+    out = bytearray()
+    while pos < end:
+        block_off = pos - (pos % _EWF_CACHE_BLOCK)
+        block = cache.get(block_off)
+        if block is None:
+            handle.seek(block_off)
+            block = handle.read(_EWF_CACHE_BLOCK) or b""
+            cache[block_off] = block
+            while len(cache) > _EWF_CACHE_BLOCKS:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(block_off)
+        start = pos - block_off
+        if start >= len(block):
+            break
+        take = min(len(block) - start, end - pos)
+        out += block[start:start + take]
+        pos += take
+    return bytes(out)
+
+
 def enumerate_all_files(
     vd: VirtualDisk,
     *,
     on_progress: ProgressCb | None = None,
     progress_every: int = 25_000,
     progress_interval_sec: float = 15.0,
+    root_open_strategy: str = "inode",
 ) -> list[dict]:
-    """Walk filesystem and return every regular file (complete disk index)."""
+    """Walk filesystem and return every regular file (complete disk index).
+
+    Open the TSK root by its filesystem inode first: this avoids pathname
+    resolution in an image with damaged/huge directory metadata. A bounded
+    parent process may retry with the alternate path-based strategy; never
+    switch strategies inside a potentially blocked native call.
+    """
+    # EWF/RAW directory enumeration can be parallelized safely only with
+    # independent handles. The isolated watchdog still owns termination.
+    if (vd._fs_info and _pytsk3 and vd.mode in ("ewf", "raw")
+            and getattr(vd, "segment_paths", None) and getattr(vd, "job_id", None)):
+        from app.services.tsk_parallel_inventory import inventory_readers, enumerate_tsk_parallel
+        readers, _ = inventory_readers(vd)
+        if readers > 1:
+            return enumerate_tsk_parallel(
+                vd, on_progress=on_progress, root_open_strategy=root_open_strategy,
+                workers=readers, progress_interval_sec=progress_interval_sec)
     nodes: list[dict] = []
     last_emit = time.monotonic()
     every_n = max(int(progress_every), 1_000)
@@ -884,40 +993,126 @@ def enumerate_all_files(
     if vd._fs_info and _pytsk3:
         reg_type = _tsk_meta_type(_pytsk3.TSK_FS_META_TYPE_ENUM.TSK_FS_META_TYPE_REG)
         dir_type = _tsk_meta_type(_pytsk3.TSK_FS_META_TYPE_ENUM.TSK_FS_META_TYPE_DIR)
-        _emit(on_progress, "Starting TSK filesystem walk…", {"mode": vd.mode})
+        if root_open_strategy not in {"inode", "path"}:
+            raise ValueError(f"Invalid TSK root-open strategy: {root_open_strategy}")
+        root_inode = filesystem_root_inode(vd._fs_info)
+        actual_strategy = "inode" if root_open_strategy == "inode" and root_inode is not None else "path"
+        _emit(on_progress, "Starting TSK filesystem walk…", {
+            "mode": vd.mode, "action": "tsk_walk_start", "reader_phase": "root_open",
+            "root_open_strategy": actual_strategy, "root_inode": root_inode})
 
-        def walk_dir(directory, prefix: str = ""):
-            for entry in directory:
-                if not entry.info.name.name or entry.info.name.name in (b".", b".."):
+        # An iterative walk avoids recursion-depth crashes on deeply nested
+        # NTFS images, and protects against cycles through directory aliases.
+        # Track *directory* inodes only; file hardlinks remain visible as paths.
+        seen_directories: set[int] = set()
+        directories_scanned = 0
+        entries_scanned = 0
+        unreadable_directories = 0
+        alias_directories_skipped = 0
+        last_path = "/"
+        _emit(on_progress, f"TSK: opening root directory ({actual_strategy})...", {
+            "action": "tsk_root_open", "reader_phase": "root_open",
+            "root_open_strategy": actual_strategy, "root_inode": root_inode})
+        root_start = time.monotonic()
+        if actual_strategy == "inode":
+            root_dir = vd._fs_info.open_dir(inode=root_inode)
+        else:
+            root_dir = vd._fs_info.open_dir(path="/")
+        root_elapsed = time.monotonic() - root_start
+        _emit(on_progress, f"TSK root directory opened in {root_elapsed:.1f}s; reading first entry...", {
+            "action": "tsk_root_opened", "reader_phase": "root_first_entry",
+            "root_open_strategy": actual_strategy,
+            "root_open_elapsed_sec": round(root_elapsed, 3), "root_inode": root_inode})
+        pending = [(root_dir, "<root>", None)]
+        last_emit = time.monotonic()
+
+        while pending:
+            directory, prefix, inode = pending.pop()
+            if inode is not None:
+                if inode in seen_directories:
+                    alias_directories_skipped += 1
                     continue
-                name = entry.info.name.name.decode("utf-8", errors="replace")
-                rel = f"{prefix}/{name}".lstrip("/")
-                meta = entry.info.meta
-                if meta and meta.type == reg_type:
-                    nodes.append({
-                        "path": rel,
-                        "name": name,
-                        "size_bytes": meta.size or 0,
-                        # Inode enables open_meta() — far faster than path open on large NTFS/E01
-                        "inode": int(meta.addr) if getattr(meta, "addr", None) is not None else None,
-                    })
-                    _maybe_progress()
-                elif meta and meta.type == dir_type:
+                seen_directories.add(inode)
+            directories_scanned += 1
+            last_path = prefix
+            try:
+                for entry in directory:
+                    entries_scanned += 1
+                    if entries_scanned == 1:
+                        _emit(on_progress, "TSK root first entry readable; traversing filesystem...", {
+                            "action": "tsk_root_first_entry", "reader_phase": "walking",
+                            "files_found": len(nodes), "directories_scanned": directories_scanned,
+                            "entries_scanned": entries_scanned, "last_path": prefix})
                     try:
-                        walk_dir(entry.as_directory(), rel)
-                    except Exception:
-                        pass
-
-        try:
-            walk_dir(vd._fs_info.open_dir(path="/"))
-        except Exception as e:
-            log.warning("TSK walk failed: %s", e)
-            _emit(on_progress, f"TSK walk failed: {e}", {"error": str(e)})
-        _emit(
-            on_progress,
-            f"Filesystem walk complete — {len(nodes):,} files enumerated",
-            {"files_found": len(nodes)},
-        )
+                        info = entry.info
+                        name_bytes = info.name.name if info and info.name else None
+                        if not name_bytes or name_bytes in (b".", b".."):
+                            continue
+                        name = (name_bytes.decode("utf-8", errors="replace")
+                                if isinstance(name_bytes, bytes) else str(name_bytes))
+                        rel = name if prefix == "<root>" else f"{prefix}/{name}"
+                        meta = info.meta
+                        if not meta:
+                            continue
+                        typ = _tsk_meta_type(meta.type)
+                        addr = getattr(meta, "addr", None)
+                        inode_number = int(addr) if addr is not None else None
+                        if typ == reg_type:
+                            nodes.append({
+                                "path": rel,
+                                "name": name,
+                                "size_bytes": meta.size or 0,
+                                "inode": inode_number,
+                            })
+                        elif typ == dir_type:
+                            if inode_number is not None and inode_number in seen_directories:
+                                continue
+                            try:
+                                child = entry.as_directory()
+                            except Exception as exc:
+                                unreadable_directories += 1
+                                if unreadable_directories <= 5:
+                                    _emit(on_progress, f"Unreadable TSK directory {rel}: {exc}", {
+                                        "action": "tsk_directory_error", "path": rel,
+                                        "unreadable_directories": unreadable_directories,
+                                    })
+                            else:
+                                pending.append((child, rel, inode_number))
+                    except Exception as exc:
+                        unreadable_directories += 1
+                        if unreadable_directories <= 5:
+                            _emit(on_progress, f"TSK entry error at {prefix}: {exc}", {
+                                "action": "tsk_entry_error", "path": prefix,
+                                "unreadable_directories": unreadable_directories,
+                            })
+                    now = time.monotonic()
+                    if now - last_emit >= every_sec:
+                        last_emit = now
+                        _emit(on_progress,
+                            f"TSK filesystem walk — {len(nodes):,} files, "
+                            f"{directories_scanned:,} directories, {entries_scanned:,} entries",
+                            {"action": "tsk_walk_progress", "files_found": len(nodes),
+                             "directories_scanned": directories_scanned,
+                             "entries_scanned": entries_scanned,
+                             "pending_directories": len(pending),
+                             "unreadable_directories": unreadable_directories,
+                             "alias_directories_skipped": alias_directories_skipped,
+                             "reader_phase": "walking", "last_path": rel if 'rel' in locals() else prefix})
+            except Exception as exc:
+                unreadable_directories += 1
+                _emit(on_progress, f"TSK directory iteration failed at {prefix}: {exc}", {
+                    "action": "tsk_directory_error", "path": prefix,
+                    "unreadable_directories": unreadable_directories,
+                })
+        _emit(on_progress,
+              f"TSK walk complete — {len(nodes):,} files, {directories_scanned:,} directories"
+              + (f", {unreadable_directories:,} unreadable entries/directories" if unreadable_directories else ""),
+              {"action": "tsk_walk_complete", "reader_phase": "complete", "files_found": len(nodes),
+               "directories_scanned": directories_scanned,
+               "entries_scanned": entries_scanned,
+               "unreadable_directories": unreadable_directories,
+               "alias_directories_skipped": alias_directories_skipped,
+               "last_path": last_path})
         return nodes
 
     root = Path(vd.root_folder) if vd.root_folder else _path_from_uri(f"file://{vd.segment_paths[0]}").parent

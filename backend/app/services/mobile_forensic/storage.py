@@ -23,7 +23,11 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         raw = bytes(value)
         return {"binary_length": len(raw), "hex_prefix": raw[:32].hex()}
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        # PostgreSQL jsonb rejects \\u0000. One null inside a browser history
+        # row used to abort the entire priority transaction.
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
 

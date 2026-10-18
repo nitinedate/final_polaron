@@ -100,9 +100,15 @@ export interface PipelineProgress {
     label?: string;
     files_found?: number;
     files_extracted?: number;
+    /** Files packed locally; not necessarily uploaded to object storage. */
+    files_packed?: number;
+    /** Files in parts uploaded to MinIO AND checkpoint-committed. */
+    files_uploaded?: number;
     files_total?: number;
     files_remaining?: number;
     bytes_extracted?: number;
+    bytes_packed?: number;
+    bytes_uploaded?: number;
     bytes_total?: number | null;
     bytes_remaining?: number | null;
     shards_done?: number;

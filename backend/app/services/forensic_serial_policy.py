@@ -1,22 +1,20 @@
-"""Disk/Mobile policy: dependency-safe stages with up to ten independent evidence units."""
+"""Disk/Mobile policy: dependency-safe stages with eight independent evidence units."""
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import contextmanager
 from contextvars import ContextVar
-from threading import BoundedSemaphore
 import multiprocessing
 import os
 
-# File-level workers are independent evidence units. Keep one authoritative stage
-# writer, but permit more CPU readers/parsers on capable hosts. The ceiling can be
-# tuned without code changes and remains bounded to avoid DB/thermal collapse.
+from app.services.disk_slots import DISK_SLOTS, run_bounded
+
+# CPU-bound helpers stay within the host. Disk shard and parse work uses DISK_SLOTS
+# (eight) instead, because those waits are storage waits.
 _CPU_COUNT = max(int(os.cpu_count() or 4), 1)
-MAX_PARALLELISM = max(2, min(int(os.environ.get("FORENSIC_MAX_PARALLELISM", min(10, _CPU_COUNT)) or 10), 16))
-# One job may have several independent CPU/DB helpers, but the shared evidence
-# pipeline never admits more than this many concurrent units by default.
-PIPELINE_PARALLEL_SLOTS = max(2, min(int(os.environ.get("PIPELINE_PARALLEL_SLOTS", "10") or 10), 16))
+MAX_PARALLELISM = max(2, min(int(os.environ.get("FORENSIC_MAX_PARALLELISM", min(8, _CPU_COUNT)) or 8), 8))
+PIPELINE_PARALLEL_SLOTS = max(2, min(int(os.environ.get("PIPELINE_PARALLEL_SLOTS", "8") or 8), 8))
 # Character windows for complete forensic evidence, including any source header.
 CHUNK_SIZE = 3000
 CHUNK_OVERLAP = 800
@@ -58,35 +56,14 @@ def stage_context(stage: str):
 
 
 def bounded_map(fn, items, *, workers: int = MAX_PARALLELISM):
-    """Bound both running work and queued inputs; never submit the whole evidence set.
+    """Run evidence units through the disk semaphore. No thread-pool executor.
 
     Database Sessions must be created inside fn, never shared across these threads.
-    Exceptions propagate at the barrier after the executor joins its workers.
     """
-    slots = parallelism(workers)
-    gate = BoundedSemaphore(slots)
-    source = iter(items)
-
-    def run(item):
-        with gate:
-            return fn(item)
-
-    with ThreadPoolExecutor(
-        max_workers=slots, thread_name_prefix="forensic-stage"
-    ) as pool:
-        pending = set()
-        exhausted = False
-        while pending or not exhausted:
-            while len(pending) < slots and not exhausted:
-                try:
-                    pending.add(pool.submit(run, next(source)))
-                except StopIteration:
-                    exhausted = True
-            if not pending:
-                break
-            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in finished:
-                yield future.result()
+    # Disk stages admit eight slots even when the host CPU cap is lower.
+    # The work is storage-bound. OCR and other CPU helpers keep parallelism().
+    slots = max(1, min(int(workers or 1), DISK_SLOTS))
+    yield from run_bounded(fn, items, slots=slots)
 
 
 def bounded_process_map(fn, items, *, workers: int = MAX_PARALLELISM):
@@ -97,15 +74,14 @@ def bounded_process_map(fn, items, *, workers: int = MAX_PARALLELISM):
     than failing with "daemonic processes are not allowed to have children".
     Inputs and outputs must be picklable and database access must stay outside fn.
     """
-    slots = parallelism(workers)
+    slots = min(parallelism(workers), DISK_SLOTS)
+    if multiprocessing.current_process().daemon:
+        # A daemonic worker cannot spawn processes. Use the same eight slots.
+        yield from run_bounded(fn, items, slots=slots)
+        return
     source = iter(items)
-    executor_cls = ThreadPoolExecutor if multiprocessing.current_process().daemon else ProcessPoolExecutor
-    kwargs = {"max_workers": slots}
-    if executor_cls is ProcessPoolExecutor:
-        kwargs["mp_context"] = multiprocessing.get_context("spawn")
-    else:
-        kwargs["thread_name_prefix"] = "forensic-cpu"
-    with executor_cls(**kwargs) as pool:
+    kwargs = {"max_workers": slots, "mp_context": multiprocessing.get_context("spawn")}
+    with ProcessPoolExecutor(**kwargs) as pool:
         pending = set()
         exhausted = False
         while pending or not exhausted:

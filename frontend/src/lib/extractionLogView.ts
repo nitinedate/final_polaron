@@ -46,7 +46,7 @@ function formatBytes(value: number): string {
 
 function liveCountKey(message: string): string | null {
   const text = message.trim();
-  if (/^Extracting files\b/i.test(text)) return "extract";
+  if (/^(Extracting|Packing) files\b/i.test(text)) return "extract";
   if (/^Native forensic parsing\b/i.test(text)) return "parse";
   if (/^Parse streaming shard\b/i.test(text)) return "parse-shard";
   if (/^DECRYPTING\b/i.test(text)) return "decrypt";
@@ -66,9 +66,9 @@ function parseProcess(message: string): { process: string; counts: LogCount[] } 
   }
 
   for (const part of parts.slice(1)) {
-    if (/bytes$/i.test(part)) {
-      const n = Number(part.replace(/,/g, "").replace(/bytes/i, "").trim());
-      counts.push({ label: "Transferred", value: Number.isFinite(n) ? formatBytes(n) : part });
+    if (/\bbytes(?:\s+packed)?$/i.test(part)) {
+      const n = Number(part.replace(/,/g, "").replace(/\b(?:source\s+)?bytes(?:\s+packed)?\b/i, "").trim());
+      counts.push({ label: "Packed locally", value: Number.isFinite(n) ? formatBytes(n) : part });
     } else if (/MiB\/s/i.test(part)) {
       counts.push({ label: "Rate", value: part });
     } else if (/^SLA\b/i.test(part)) {

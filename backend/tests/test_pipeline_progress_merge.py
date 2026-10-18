@@ -36,6 +36,58 @@ def test_inventory_active_helper():
     assert inventory_progress_active({"phase": "rag", "completed": 1, "total": 10}) is False
 
 
+def test_read_trace_keeps_enumeration_counters():
+    existing = {
+        "phase": "extract",
+        "completed": 52,
+        "label": "Filesystem inventory — 52 files, 4 directories, 13,365 entries",
+        "extraction_activity": {
+            "subphase": "enumerating",
+            "files_found": 52,
+            "directories_scanned": 4,
+            "entries_scanned": 13365,
+            "last_path": "Windows/WinSxS/component",
+        },
+    }
+    update = {
+        "phase": "extract",
+        "extraction_activity": {
+            "subphase": "enumerating",
+            "reader_phase": "walking",
+            "last_source_read_offset": 3699068928,
+        },
+    }
+    merged = merge_pipeline_progress(existing, update, writer="extract")
+    activity = merged["extraction_activity"]
+    assert activity["files_found"] == 52
+    assert activity["entries_scanned"] == 13365
+    assert activity["last_path"] == "Windows/WinSxS/component"
+    assert activity["last_source_read_offset"] == 3699068928
+    assert merged["label"].startswith("Filesystem inventory — 52")
+
+
+def test_copy_phase_replaces_enumeration_activity():
+    existing = {
+        "extraction_activity": {
+            "subphase": "enumerating",
+            "files_found": 52,
+            "entries_scanned": 100,
+        },
+    }
+    update = {
+        "extraction_activity": {
+            "subphase": "copying",
+            "files_extracted": 1,
+            "files_total": 52,
+        },
+    }
+    merged = merge_pipeline_progress(existing, update, writer="extract")
+    activity = merged["extraction_activity"]
+    assert activity["subphase"] == "copying"
+    assert activity["files_extracted"] == 1
+    assert "files_found" not in activity
+
+
 def test_ocr_writer_preserves_orchestration():
     existing = {
         "phase": "artifact_inventory",
