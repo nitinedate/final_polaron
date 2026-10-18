@@ -5,8 +5,11 @@ from __future__ import annotations
 from app.services.mobile_forensic.crypt_formats import is_crypt_file
 
 import json
+import logging
 import re
 from pathlib import PurePosixPath
+
+log = logging.getLogger("forensic_priority_evidence")
 
 from app.db.sql_helpers import execute, fetchall, fetchone
 from app.services.forensic_serial_policy import CHUNK_OVERLAP, CHUNK_POLICY, CHUNK_SIZE
@@ -231,50 +234,62 @@ def run_disk_priority_evidence(db, job_id):
         nonlocal written, last_heartbeat, committed_processed
         if not pending_sources and not pending_records:
             return
+        from app.db.sql_helpers import lock_job_artifacts_in_id_order, retry_on_deadlock
+
+        def _write():
+            # Lock lowest id first, before the record insert takes key-share locks.
+            # OCR marks pending rows in the same id order, so the two writers wait
+            # instead of deadlocking and aborting this stage.
+            ids = [source_id for source_id, _art in pending_records]
+            ids.extend(source_id for source_id, _reason in pending_sources)
+            lock_job_artifacts_in_id_order(writer_db[0], ids)
+            if pending_records:
+                write_started = time.monotonic()
+                # Source ids travel with individual records (not the whole batch).
+                unique = {art.artifact_id: (source_id, add_record_links(art))
+                          for source_id, art in pending_records}
+                values = [
+                    (art.artifact_id, job_id, source_id, art.artifact_type,
+                     art.source_domain, art.forensic.get("state") or "allocated",
+                     art.timestamp_utc, _dumps(art.data), _dumps(art.forensic))
+                    for source_id, art in unique.values()
+                ]
+                with writer_db[0].connection().connection.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """INSERT INTO forensic_priority_records
+                           (artifact_id,job_id,job_artifact_id,artifact_type,source_domain,state,timestamp_utc,data,forensic)
+                           VALUES %s ON CONFLICT(artifact_id) DO UPDATE
+                           SET data=EXCLUDED.data,forensic=EXCLUDED.forensic""",
+                        values,
+                        template="(%s,%s,%s,%s,%s,%s,%s::timestamptz,%s::jsonb,%s::jsonb)",
+                        page_size=500,
+                    )
+                time_by_phase["db_insert"] += time.monotonic() - write_started
+            if pending_sources:
+                # One ordered UPDATE per bounded batch instead of 1 UPDATE + COMMIT
+                # per media file; deterministic order also prevents lock inversion.
+                source_by_id = {str(source_id): (source_id, reason)
+                                for source_id, reason in pending_sources}
+                values = [source_by_id[key] for key in sorted(source_by_id)]
+                with writer_db[0].connection().connection.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """UPDATE job_artifacts AS ja SET
+                           metadata=COALESCE(ja.metadata,'{}'::jsonb) ||
+                             jsonb_build_object('priority_parsed_v4',true,
+                                                'priority_parse_exception',v.reason)
+                           FROM (VALUES %s) AS v(id,reason)
+                           WHERE ja.id=v.id::uuid""",
+                        values,
+                        template="(%s,%s::text)",
+                        page_size=500,
+                    )
+            writer_db[0].commit()
+
+        retry_on_deadlock(writer_db[0], _write, attempts=8)
         if pending_records:
-            write_started = time.monotonic()
-            # Source ids travel with individual records (not the whole batch).
-            unique = {art.artifact_id: (source_id, add_record_links(art))
-                      for source_id, art in pending_records}
-            values = [
-                (art.artifact_id, job_id, source_id, art.artifact_type,
-                 art.source_domain, art.forensic.get("state") or "allocated",
-                 art.timestamp_utc, _dumps(art.data), _dumps(art.forensic))
-                for source_id, art in unique.values()
-            ]
-            with writer_db[0].connection().connection.cursor() as cur:
-                execute_values(
-                    cur,
-                    """INSERT INTO forensic_priority_records
-                       (artifact_id,job_id,job_artifact_id,artifact_type,source_domain,state,timestamp_utc,data,forensic)
-                       VALUES %s ON CONFLICT(artifact_id) DO UPDATE
-                       SET data=EXCLUDED.data,forensic=EXCLUDED.forensic""",
-                    values,
-                    template="(%s,%s,%s,%s,%s,%s,%s::timestamptz,%s::jsonb,%s::jsonb)",
-                    page_size=500,
-                )
-            written += len(values)
-            time_by_phase["db_insert"] += time.monotonic() - write_started
-        if pending_sources:
-            # One ordered UPDATE per bounded batch instead of 1 UPDATE + COMMIT
-            # per media file; deterministic order also prevents lock inversion.
-            source_by_id = {str(source_id): (source_id, reason)
-                            for source_id, reason in pending_sources}
-            values = [source_by_id[key] for key in sorted(source_by_id)]
-            with writer_db[0].connection().connection.cursor() as cur:
-                execute_values(
-                    cur,
-                    """UPDATE job_artifacts AS ja SET
-                       metadata=COALESCE(ja.metadata,'{}'::jsonb) ||
-                         jsonb_build_object('priority_parsed_v4',true,
-                                            'priority_parse_exception',v.reason)
-                       FROM (VALUES %s) AS v(id,reason)
-                       WHERE ja.id=v.id::uuid""",
-                    values,
-                    template="(%s,%s::text)",
-                    page_size=500,
-                )
-        writer_db[0].commit()
+            written += len({art.artifact_id for _source_id, art in pending_records})
         committed_processed += len(pending_sources)
         diagnostic["flushes"] += 1
         pending_records.clear()
@@ -283,7 +298,8 @@ def run_disk_priority_evidence(db, job_id):
 
     def heartbeat() -> None:
         with db_lock:
-            _heartbeat_locked()
+            from app.db.sql_helpers import retry_on_deadlock
+            retry_on_deadlock(writer_db[0], _heartbeat_locked, attempts=8)
 
     def _heartbeat_locked() -> None:
         nonlocal last_heartbeat, last_progress_reported
@@ -334,15 +350,16 @@ def run_disk_priority_evidence(db, job_id):
 
     def emit(kind, value):
         """Backpressure to the one DB writer; fail rather than silently drop data."""
-        while not writer_finished.is_set():
+        while True:
             if writer_error:
                 raise RuntimeError("Priority evidence writer stopped") from writer_error[0]
+            if writer_finished.is_set():
+                raise RuntimeError("Priority evidence writer stopped before processing finished")
             try:
                 output.put((kind, value), timeout=0.25)
                 return
             except queue.Full:
                 continue
-        raise RuntimeError("Priority evidence writer stopped before processing finished")
 
     def _local_context(base=None):
         ctx = copy.copy(base or context)
@@ -500,6 +517,8 @@ def run_disk_priority_evidence(db, job_id):
                 _drain_writer()
         except BaseException as exc:
             writer_error.append(exc)
+            if not isinstance(exc, StageWaiting):
+                log.exception("Priority evidence writer stopped")
             try:
                 writer_db[0].rollback()
             except Exception:
@@ -587,6 +606,9 @@ def run_disk_priority_evidence(db, job_id):
     def _parse_regular(entry):
         process(*entry)
 
+    # Drop the planning transaction before parsers run. An idle snapshot here
+    # used to sit under the database lock while the writer waited on the same rows.
+    db.commit()
     sink = threading.Thread(target=writer, name="disk-priority-db-writer", daemon=False)
     sink.start()
     try:
@@ -678,6 +700,10 @@ def run_disk_priority_evidence(db, job_id):
             pass
         for _ in run_bounded(_parse_regular, ordinary, slots=DISK_SLOTS):
             pass
+    except BaseException:
+        if writer_error:
+            raise writer_error[0] from None
+        raise
     finally:
         # The sentinel is inserted after every submitted record/source event.
         # A failed writer cannot leave us permanently blocked on a full queue.
