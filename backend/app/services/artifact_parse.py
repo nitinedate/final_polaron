@@ -661,15 +661,17 @@ def _defer_or_skip_forensic(
     return False, reason
 
 def _sanitize_for_jsonb(value):
-    """PostgreSQL jsonb rejects NUL (\\u0000) in any string value."""
+    """PostgreSQL jsonb rejects NUL and lone surrogates in any string value."""
+    from app.services.evidence_paths import storage_text
+
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace").replace("\x00", "")
+        return storage_text(value.decode("utf-8", errors="replace"))
     if isinstance(value, str):
-        return value.replace("\x00", "").replace("\u0000", "")
+        return storage_text(value)
     if isinstance(value, list):
         return [_sanitize_for_jsonb(v) for v in value]
     if isinstance(value, dict):
-        return {str(k).replace("\x00", ""): _sanitize_for_jsonb(v) for k, v in value.items()}
+        return {storage_text(str(k)): _sanitize_for_jsonb(v) for k, v in value.items()}
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return _sanitize_for_jsonb(str(value))
@@ -1444,7 +1446,7 @@ def _run_claimed_parse_batch(
                 """UPDATE pipeline_stage_runs SET
                    details=COALESCE(details,'{}'::jsonb) || CAST(:patch AS jsonb)
                    WHERE job_id=:jid AND stage='parse' AND status='running'""",
-                {"jid": job_id, "patch": json.dumps({"parse_io": payload})},
+                {"jid": job_id, "patch": _json_for_pg({"parse_io": payload})},
             )
             from app.services.progress_agent import note_operation
 
@@ -1459,9 +1461,26 @@ def _run_claimed_parse_batch(
     for part_uri, part_artifacts in by_part.items():
         # One pass per shard. Splitting the same tar by read budget used to
         # decompress a multi-GB part several times while the card stood still.
-        by_path = {a["file_path"].replace("\\", "/"): a for a in part_artifacts}
-        budgets = {norm: _read_budget_for_artifact(art) for norm, art in by_path.items()}
-        paths_set = set(by_path)
+        queues: dict[str, list[dict]] = {}
+        budgets = {}
+        for art in part_artifacts:
+            meta = art.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except json.JSONDecodeError:
+                    meta = {}
+            source = str((meta or {}).get("source_path") or art["file_path"]).replace("\\", "/")
+            queues.setdefault(source, []).append(art)
+            budget = _read_budget_for_artifact(art)
+            previous = budgets.get(source)
+            if previous is None or (budget is not None and (previous is None or budget > previous)):
+                budgets[source] = budget
+        for rows in queues.values():
+            rows.sort(key=lambda art: int((art.get("metadata") or {}).get("extracted_part_offset") or 0)
+                      if isinstance(art.get("metadata"), dict) else 0)
+        paths_set = set(queues)
+        repeat = {name: len(rows) for name, rows in queues.items()}
         part_bytes = 0
         try:
             row = fetchone(
@@ -1512,11 +1531,13 @@ def _run_claimed_parse_batch(
             part_uri,
             paths_set,
             max_bytes_by_path=budgets,
+            repeat_by_path=repeat,
             on_detail=_on_detail,
         ):
-            artifact = by_path.get(norm)
-            if not artifact:
+            waiting = queues.get(norm) or []
+            if not waiting:
                 continue
+            artifact = waiting.pop(0)
             _enqueue(artifact, artifact["file_path"], data)
             # Drop reference ASAP for large SQLite blobs after enqueue/flush.
             data = None

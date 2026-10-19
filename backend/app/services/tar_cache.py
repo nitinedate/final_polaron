@@ -60,6 +60,7 @@ def iter_files_from_part(
     max_bytes_by_path: dict[str, int | None] | None = None,
     verify_sha256_by_path: dict[str, str | None] | None = None,
     verify_size_by_path: dict[str, int] | None = None,
+    repeat_by_path: dict[str, int] | None = None,
     on_progress=None,
     on_detail=None,
 ) -> Iterator[tuple[str, bytes | None]]:
@@ -81,8 +82,23 @@ def iter_files_from_part(
 
     # Tiny cache hits are complete bytes. Apply the per-path budget and verify
     # the entire cached source when the caller requests forensic provenance.
-    remaining = set(wanted)
+    # A path extracted more than once is read from the archive in member order,
+    # not served twice from the first cached copy.
+    remaining = {
+        p: max(1, int((repeat_by_path or {}).get(p, 1)))
+        for p in wanted
+    }
+
+    def _consume(name: str) -> None:
+        left = int(remaining.get(name, 0))
+        if left <= 1:
+            remaining.pop(name, None)
+        else:
+            remaining[name] = left - 1
+
     for p in list(remaining):
+        if remaining[p] != 1:
+            continue
         cached = _cached_file(part_uri, p)
         if cached is None:
             continue
@@ -90,26 +106,27 @@ def iter_files_from_part(
         expected_hash = (verify_sha256_by_path or {}).get(p)
         if expected_size is not None and len(cached) != int(expected_size):
             log.error("Cached extracted evidence size mismatch part=%s path=%s", part_uri, p)
-            remaining.discard(p)
+            _consume(p)
             yield p, None
             continue
         if expected_hash:
             import hashlib
             if hashlib.sha256(cached).hexdigest().lower() != str(expected_hash).lower():
                 log.error("Cached extracted evidence SHA-256 mismatch part=%s path=%s", part_uri, p)
-                remaining.discard(p)
+                _consume(p)
                 yield p, None
                 continue
         cap = (max_bytes_by_path or {}).get(p, max_bytes)
-        remaining.discard(p)
+        _consume(p)
         yield p, cached[:cap] if cap is not None else cached
     if not remaining:
         return
 
     stream = open_object_stream(part_uri)
     if stream is None:
-        for p in remaining:
-            yield p, None
+        for name, left in list(remaining.items()):
+            for _ in range(int(left)):
+                yield name, None
         return
 
     scanned = 0
@@ -190,7 +207,7 @@ def iter_files_from_part(
                         continue
                     f = tar.extractfile(member)
                     if not f:
-                        remaining.discard(norm)
+                        _consume(norm)
                         yielded += 1
                         _emit(force=True, current=norm)
                         yield norm, None
@@ -244,9 +261,9 @@ def iter_files_from_part(
                             _drain(f, member_size - got, current=norm)
                         else:
                             _emit(current=norm, current_read=got, current_size=member_size)
-                    if cap is None and content is not None:
+                    if cap is None and content is not None and remaining.get(norm) == 1:
                         _cache_file(part_uri, norm, content)
-                    remaining.discard(norm)
+                    _consume(norm)
                     yielded += 1
                     _emit(force=True, current=norm, current_read=member_size, current_size=member_size)
                     yield norm, content
@@ -263,8 +280,9 @@ def iter_files_from_part(
         except Exception:
             pass
 
-    for p in remaining:
-        yield p, None
+    for name, left in list(remaining.items()):
+        for _ in range(int(left)):
+            yield name, None
 
 
 def iter_spilled_files_from_part(part_uri: str, paths: set[str], *, directory: str | None = None):

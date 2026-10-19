@@ -80,6 +80,47 @@ def _index_map(db, job_id):
     return {path.replace("\\", "/"): uri for path, uri in build_index_map(ds).items()}
 
 
+def prepare_extracted_members(entries: list[dict], manifest: dict) -> list[dict]:
+    """Keep every extracted member, including a second copy of the same path.
+
+    The combined index and the per-shard indexes list the same members. Those
+    identical lines collapse. A path that was extracted again at a different
+    part or offset stays, under an inventory name that does not collide, with
+    ``source_path`` set to the archive member name.
+    """
+    from app.services.disk_manifest import resolve_part_uri
+    from app.services.evidence_paths import inventory_path, storage_text
+
+    seen: set[tuple] = set()
+    kept: list[dict] = []
+    for entry in entries:
+        path = storage_text((entry.get("path") or "").replace("\\", "/"))
+        if not path:
+            raise RuntimeError("Extracted manifest contains an entry without a path")
+        part_id = int(entry.get("part_id") or 0)
+        try:
+            offset = int(entry.get("offset") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        key = (path, part_id, offset)
+        if key in seen:
+            continue
+        seen.add(key)
+        part = resolve_part_uri(manifest, part_id)
+        if not part:
+            raise RuntimeError(f"Extracted part is missing for {path}")
+        kept.append({**entry, "source_path": path, "part_uri": part, "path": path})
+    used: dict[str, int] = {}
+    for entry in kept:
+        source = entry["source_path"]
+        ordinal = used.get(source, 0)
+        used[source] = ordinal + 1
+        entry["path"] = inventory_path(source, ordinal)
+        if ordinal:
+            entry["copy_ordinal"] = ordinal
+    return kept
+
+
 def _materialize_full(db, job_id):
     from app.services.forensic_shard_overlap import unfinished_shards
     from app.services.forensic_serial_pipeline import StageWaiting
@@ -89,7 +130,7 @@ def _materialize_full(db, job_id):
     from psycopg2.extras import execute_values
 
     from app.services.artifact_materialize import materialize_index_entries
-    from app.services.disk_manifest import load_index_entries, resolve_part_uri
+    from app.services.disk_manifest import load_index_entries
 
     row = fetchone(
         db, "SELECT disk_source,files_extracted FROM jobs WHERE id=:id", {"id": job_id}
@@ -99,24 +140,12 @@ def _materialize_full(db, job_id):
         if isinstance(row["disk_source"], str)
         else row["disk_source"] or {}
     )
-    by_path = {}
-    for entry in load_index_entries(manifest):
-        path = (entry.get("path") or "").replace("\\", "/")
-        if not path:
-            raise RuntimeError("Extracted manifest contains an entry without a path")
-        part = resolve_part_uri(manifest, int(entry.get("part_id") or 0))
-        if not part:
-            raise RuntimeError(f"Extracted part is missing for {path}")
-        previous = by_path.get(path)
-        if previous and previous.get("sha256") and not entry.get("sha256"):
-            continue
-        by_path[path] = {**entry, "path": path, "part_uri": part}
-    expected = len(by_path)
+    entries = prepare_extracted_members(load_index_entries(manifest), manifest)
+    expected = len(entries)
     if expected < int(row.get("files_extracted") or 0):
         raise RuntimeError(
             f"Extracted manifest accounts for {expected:,} / {int(row['files_extracted']):,} extracted files"
         )
-    entries = list(by_path.values())
     # Every extracted file enters inventory. Unsupported/no-text files are
     # explicit stage exceptions, never discarded by hash or path filters.
     # V1.10.9: one pass. Each row is inserted with its provenance (extracted part)
@@ -130,6 +159,8 @@ def _materialize_full(db, job_id):
             "extracted_part_id": entry.get("part_id"),
             "extracted_part_offset": entry.get("offset"),
             "source_sha256": entry.get("sha256"),
+            "source_path": entry.get("source_path") or entry.get("path"),
+            **({"copy_ordinal": int(entry["copy_ordinal"])} if entry.get("copy_ordinal") else {}),
         }
 
     result = materialize_index_entries(
@@ -168,7 +199,7 @@ def _materialize_full(db, job_id):
         label="Registering all extracted evidence with provenance",
     )
     from app.services.mobile_forensic.key_intake import capture_registered_keys, is_whatsapp_key_path
-    if any(is_whatsapp_key_path(entry["path"]) for entry in entries):
+    if any(is_whatsapp_key_path(entry.get("source_path") or entry["path"]) for entry in entries):
         capture_registered_keys(db, job_id)
         db.commit()
     # Platform-aware WhatsApp preparation is part of materialization, before

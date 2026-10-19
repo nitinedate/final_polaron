@@ -10,6 +10,7 @@ Hot paths (measured on ~130k job_artifacts rows):
 from __future__ import annotations
 
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
@@ -189,6 +190,37 @@ _PRIORITY_PAGE_INDEXES = (
 )
 
 
+_INDEX_NAME = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def index_already_present(db, sql: str) -> bool:
+    """True when this CREATE INDEX names an index the schema already has.
+
+    CREATE INDEX IF NOT EXISTS still takes a share lock and waits behind any
+    writer. A catalog read does not, so a live registration is not stuck behind
+    an unrelated delete of another job.
+    """
+    match = _INDEX_NAME.search(sql or "")
+    if not match:
+        return False
+    try:
+        from app.db.sql_helpers import fetchone
+
+        return bool(
+            fetchone(
+                db,
+                """SELECT 1 AS ok FROM pg_indexes
+                   WHERE schemaname = current_schema() AND indexname = :name""",
+                {"name": match.group(1)},
+            )
+        )
+    except Exception:
+        return False
+
+
 def ensure_evidence_browse_indexes(db: Session) -> None:
     """Idempotent DDL for evidence-list SQL. No-op after the first success per Session."""
     key = id(db)
@@ -203,6 +235,8 @@ def ensure_evidence_browse_indexes(db: Session) -> None:
         except Exception:
             pass
     for sql in (*_BROWSE_INDEX_SQL, *_family_page_index_sql(), *_PRIORITY_PAGE_INDEXES):
+        if index_already_present(db, sql):
+            continue
         nested = None
         try:
             nested = db.begin_nested()
@@ -227,6 +261,8 @@ def ensure_evidence_browse_indexes(db: Session) -> None:
             pass
     else:
         for sql in _TRGM_INDEX_SQL:
+            if index_already_present(db, sql):
+                continue
             try:
                 execute(db, sql)
             except Exception as exc:

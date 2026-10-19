@@ -49,10 +49,11 @@ def ensure_priority_schema(db):
         artifact_type text NOT NULL,source_domain text NOT NULL,state text NOT NULL,
         timestamp_utc timestamptz,data jsonb NOT NULL,forensic jsonb NOT NULL)""",
     )
-    execute(
-        db,
-        "CREATE INDEX IF NOT EXISTS ix_priority_job_record ON forensic_priority_records(job_id,artifact_id)",
-    )
+    from app.services.evidence_browse_indexes import index_already_present
+
+    index_sql = "CREATE INDEX IF NOT EXISTS ix_priority_job_record ON forensic_priority_records(job_id,artifact_id)"
+    if not index_already_present(db, index_sql):
+        execute(db, index_sql)
 
 
 def add_record_links(art):
@@ -608,20 +609,32 @@ def run_disk_priority_evidence(db, job_id):
             local._byte_cache = OrderedDict()
             with db_lock:
                 diagnostic["shard_opens"] += 1
-            wanted: dict[str, tuple] = {}
+            def _tar_name(it) -> str:
+                src = sources.get(it.path.replace("\\", "/")) or {}
+                meta = _source_meta(src)
+                return str(meta.get("source_path") or it.path).replace("\\", "/")
+
+            waiting: dict[str, list[tuple]] = defaultdict(list)
             budgets: dict[str, int] = {}
             hashes: dict[str, str] = {}
             sizes: dict[str, int] = {}
             for entry in entries:
                 bundle, parsers, web_text, _storage = entry
                 for index, it in enumerate(bundle):
-                    path = it.path.replace("\\", "/")
-                    wanted[path] = entry
-                    budgets[path] = _content_budget(it, parsers, web_text, primary=index == 0)
-                    if it.sha256:
-                        hashes[path] = it.sha256
-                    if int(it.size or 0) > 0:
-                        sizes[path] = int(it.size)
+                    path = _tar_name(it)
+                    waiting[path].append((entry, it))
+                    budget = _content_budget(it, parsers, web_text, primary=index == 0)
+                    budgets[path] = max(int(budgets.get(path) or 0), int(budget or 0))
+                    if len(waiting[path]) == 1:
+                        if it.sha256:
+                            hashes[path] = it.sha256
+                        if int(it.size or 0) > 0:
+                            sizes[path] = int(it.size)
+                    else:
+                        # Two archive members share this name. One hash cannot
+                        # describe both, so each copy is read on its own.
+                        hashes.pop(path, None)
+                        sizes.pop(path, None)
             cache: dict[str, bytes | None] = {}
             finished: set[int] = set()
 
@@ -655,14 +668,18 @@ def run_disk_priority_evidence(db, job_id):
                     cache.pop(it.path.replace("\\", "/"), None)
 
             for path, header in iter_files_from_part(
-                part, set(wanted), max_bytes_by_path=budgets,
+                part, set(waiting), max_bytes_by_path=budgets,
                 verify_sha256_by_path=hashes, verify_size_by_path=sizes,
+                repeat_by_path={name: len(items) for name, items in waiting.items()},
             ):
-                cache[path] = header
-                entry = wanted.get(path)
-                if entry is None or id(entry) in finished:
+                queued = waiting.get(path) or []
+                if not queued:
                     continue
-                if any(it.path.replace("\\", "/") not in cache for it in entry[0]):
+                entry, it = queued.pop(0)
+                cache[it.path.replace("\\", "/")] = header
+                if id(entry) in finished:
+                    continue
+                if any(member.path.replace("\\", "/") not in cache for member in entry[0]):
                     continue
                 finished.add(id(entry))
                 finish(entry, header if len(entry[0]) == 1 else _not_streamed)

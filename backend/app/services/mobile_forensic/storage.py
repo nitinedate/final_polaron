@@ -9,24 +9,29 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from app.db.sql_helpers import execute, fetchall, fetchone
+from app.services.evidence_paths import storage_text
 from app.services.mobile_forensic.models import InventoryItem, NormalizedArtifact
 
 log = logging.getLogger("mobile_forensic.storage")
 _SCHEMA_READY: set[str] = set()
 
 
+def _has_surrogate(value: str) -> bool:
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
+        return {storage_text(str(k)): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
     if isinstance(value, (bytes, bytearray, memoryview)):
         raw = bytes(value)
         return {"binary_length": len(raw), "hex_prefix": raw[:32].hex()}
     if isinstance(value, str):
-        # PostgreSQL jsonb rejects \\u0000. One null inside a browser history
-        # row used to abort the entire priority transaction.
-        return value.replace("\x00", "") if "\x00" in value else value
+        # PostgreSQL jsonb rejects NUL, and lone surrogates are not legal UTF-8.
+        # One null inside a browser history row used to abort the whole transaction.
+        return storage_text(value) if ("\x00" in value or "\u0000" in value or _has_surrogate(value)) else value
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)

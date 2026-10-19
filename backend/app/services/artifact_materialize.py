@@ -147,6 +147,8 @@ def materialize_index_entries(
         return {"status": "ok", "artifacts_total": 0, "encyclopedia_matched": 0}
 
     from app.config import get_settings
+    from app.services.evidence_paths import storage_text
+    from app.services.mobile_forensic.storage import _dumps
     from app.services.phase1_artifact_scope import should_materialize_path
 
     if phase1_filter is None:
@@ -211,7 +213,7 @@ def materialize_index_entries(
 
     for e in entries:
         inspected += 1
-        path = e.get("path", "")
+        path = storage_text((e.get("path") or "").replace("\\", "/"))
         if not path:
             continue
         include, skip_reason = should_materialize_path(path, enabled=phase1_filter)
@@ -273,7 +275,7 @@ def materialize_index_entries(
             "size": int(e.get("size_bytes") or 0),
             "sha": e.get("sha256") or "",
             "enc": enc_id,
-            "meta": json.dumps(del_meta or {}),
+            "meta": _dumps(del_meta or {}),
         })
         created += 1
         if len(batch) >= _BATCH_SIZE:
