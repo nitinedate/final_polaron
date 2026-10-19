@@ -122,6 +122,9 @@ function Convert-DaemonHostPathToWindowsBind {
     param([string]$Letter, [string]$Source)
     $fallback = "${Letter}:/"
     if (-not $Source) { return $fallback }
+    # Private DrvFs lives in dockerd's mount namespace. Turning it back into
+    # G:/ makes Compose reinstall Docker Desktop's dead 9p share.
+    if ($Source -match '^/mnt/aetheris-host-drives/[a-z]/?$') { return $Source.TrimEnd('/') }
     if ($Source -match '^[A-Za-z]:[/\\]?$') {
         return ("{0}:/" -f $Source.Substring(0, 1).ToUpper())
     }
@@ -193,6 +196,76 @@ function Get-DaemonVolumeName {
         $sha.Dispose()
     }
     return ("aetheris_hostdrive_{0}_{1}" -f $Letter.ToLower(), $hash.Substring(0, 12))
+}
+
+function Invoke-AttachedDriveResolver {
+    param(
+        [Parameter(Mandatory = $true)][string]$Letter,
+        [switch]$PrivateDrive
+    )
+    $resolver = Join-Path $root 'scripts\resolve-docker-drive-source.ps1'
+    if (-not (Test-Path -LiteralPath $resolver)) { return $null }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("aetheris-drive-resolve-{0}-{1}.json" -f $Letter.ToLower(), [guid]::NewGuid().ToString('N'))
+    $psArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $resolver,
+        '-DriveLetter', $Letter, '-Root', $root, '-OutputFile', $tmp
+    )
+    if ($PrivateDrive) { $psArgs += '-PrivateDrive' }
+    try {
+        $ErrorActionPreference = 'Continue'
+        & powershell.exe @psArgs | Out-Null
+        if (-not (Test-Path -LiteralPath $tmp)) { return $null }
+        $result = Get-Content -LiteralPath $tmp -Raw | ConvertFrom-Json
+        if (-not $result.ok) { return $null }
+        return $result
+    }
+    catch {
+        return $null
+    }
+    finally {
+        $ErrorActionPreference = 'Stop'
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-RescuedDriveSource {
+    param([string]$Letter, [object]$Rescued)
+    $source = if ($Rescued) { [string]$Rescued.source } else { '' }
+    if (-not $source) { return $false }
+    $mode = [string]$Rescued.mode
+    if ($mode -eq 'docker-drvfs' -and $source -notmatch '^/mnt/aetheris-host-drives/[a-z]$') { return $false }
+    $sourceMap[$Letter] = @{
+        source       = $source
+        mode         = $mode
+        wsl_distro   = $(if ($Rescued.wsl_distro) { [string]$Rescued.wsl_distro } else { '' })
+        wsl_mount    = $(if ($Rescued.wsl_mount) { [string]$Rescued.wsl_mount } else { '' })
+        mount_target = $(if ($Rescued.mount_target) { [string]$Rescued.mount_target } else { "/host/$($Letter.ToLower())" })
+        source_scope = $(if ($Rescued.source_scope) { [string]$Rescued.source_scope } else { 'drive' })
+    }
+    return $true
+}
+
+function Ensure-EngineBindVolume {
+    param([string]$Name, [string]$Device)
+    if ($Device -notmatch '^/') { return }
+    $outFile = Join-Path ([System.IO.Path]::GetTempPath()) ("aetheris-vol-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    $errFile = Join-Path ([System.IO.Path]::GetTempPath()) ("aetheris-vol-{0}.err" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $inspect = Start-Process -FilePath 'docker' -ArgumentList @('volume', 'inspect', $Name) -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if ($inspect.ExitCode -eq 0) { return }
+        $create = Start-Process -FilePath 'docker' -ArgumentList @(
+            'volume', 'create', '--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind',
+            '--opt', "device=$Device", $Name
+        ) -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if ($create.ExitCode -ne 0) {
+            $detail = ''
+            if (Test-Path -LiteralPath $errFile) { $detail = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue) }
+            throw "Could not create Docker engine volume $Name for $Device. $detail"
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-DriveLetterPresent {
@@ -525,6 +598,20 @@ foreach ($letter in $letters) {
         $kept.Add($letter) | Out-Null
         continue
     }
+    # A letter Docker Desktop could not share is mounted read-only in the
+    # engine. Re-mount it on every refresh so a Docker Desktop restart does
+    # not leave a dead G:/ bind in Compose.
+    if ($resolved -and [string]$resolved.mode -eq 'docker-drvfs') {
+        $rescued = Invoke-AttachedDriveResolver -Letter $letter -PrivateDrive
+        if ($rescued -and [string]$rescued.mode -eq 'docker-drvfs' -and (Set-RescuedDriveSource -Letter $letter -Rescued $rescued)) {
+            $kept.Add($letter) | Out-Null
+            Write-ScanNote ("Docker mounted {0}: read-only at {1}" -f $letter, [string]$rescued.source)
+            continue
+        }
+        Write-ScanNote ("Excluding {0}: private read-only mount failed" -f $letter)
+        $skippedDocker.Add($letter) | Out-Null
+        continue
+    }
     $toProbe.Add($letter) | Out-Null
 }
 if ($toProbe.Count) {
@@ -535,14 +622,38 @@ if ($toProbe.Count) {
             $kept.Add($letter) | Out-Null
         }
         else {
-            # On timeout, missing image, or bind failure, exclude the drive.
-            # The previous mapping is NOT proof it is connected now.
-            Write-ScanNote ("Excluding {0}: Docker probe returned {1}" -f $letter, $(if ($state) { $state } else { 'unknown' }))
-            $skippedDocker.Add($letter) | Out-Null
+            # Docker Desktop did not share this letter. Mount it read-only in
+            # the engine and keep that daemon path. A timeout is not a dead
+            # share, so it stays excluded.
+            $rescued = $null
+            if ($state -eq 'no') {
+                $rescued = Invoke-AttachedDriveResolver -Letter $letter -PrivateDrive
+            }
+            if ($rescued -and [string]$rescued.mode -eq 'docker-drvfs' -and (Set-RescuedDriveSource -Letter $letter -Rescued $rescued)) {
+                $kept.Add($letter) | Out-Null
+                Write-ScanNote ("Docker mounted {0}: read-only at {1}" -f $letter, [string]$rescued.source)
+            }
+            else {
+                Write-ScanNote ("Excluding {0}: Docker probe returned {1}" -f $letter, $(if ($state) { $state } else { 'unknown' }))
+                $skippedDocker.Add($letter) | Out-Null
+            }
         }
     }
 }
 $letters = @($kept | Sort-Object -Unique)
+if ($SourceMapPath) {
+    $persisted = Read-DriveSourceMap -Path $SourceMapPath
+    foreach ($letter in $letters) {
+        $entry = if ($sourceMap.ContainsKey($letter)) { $sourceMap[$letter] } else { $null }
+        if ($entry -and [string]$entry.mode -eq 'docker-drvfs') { $persisted[$letter] = $entry }
+    }
+    $parent = Split-Path -Parent $SourceMapPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    $payload = @{ drives = $persisted }
+    [System.IO.File]::WriteAllText($SourceMapPath, ($payload | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+}
 # Explicitly selected/required evidence cannot be silently lost. This guard
 # applies to optional startup scans and manual remounts alike.
 $unavailableRequired = @($skippedDocker | Where-Object { $requested -contains $_ })
@@ -603,6 +714,9 @@ foreach ($letter in $letters) {
         source_scope = $(if ($entry -and $entry.source_scope) { [string]$entry.source_scope } else { 'drive' })
         daemon_path = $daemonPath
         volume_name = $(if ($daemonPath) { Get-DaemonVolumeName -Letter $letter -Source $source } else { "" })
+    }
+    if ($daemonPath) {
+        Ensure-EngineBindVolume -Name $driveMounts[$letter].volume_name -Device $source
     }
 }
 

@@ -22,7 +22,8 @@ param(
     [string]$ApiImage = "",
     [string]$OutputFile = "",
     [switch]$ForceWslBridge,
-    [switch]$RemountOnly
+    [switch]$RemountOnly,
+    [switch]$PrivateDrive
 )
 
 $ErrorActionPreference = "Stop"
@@ -158,6 +159,7 @@ function Get-RootSentinelRelativePath {
     $rootPath = "${Letter}:\"
     try {
         $item = Get-ChildItem -LiteralPath $rootPath -Force -ErrorAction Stop |
+            Where-Object { $_.Name -notmatch '\$' } |
             Select-Object -First 1
         if ($item) { return [string]$item.Name }
     }
@@ -409,6 +411,139 @@ function Get-WslDistros {
     catch { }
 
     return $ordered
+}
+
+function Mount-DockerDesktopPrivateLetter {
+    param(
+        [Parameter(Mandatory = $true)][string]$Letter,
+        [string]$RelativePath = ""
+    )
+    # Docker Desktop's /mnt/host/<letter> 9p share is what `source: G:/` uses.
+    # On a drive attached after Desktop started, that share is ENODEV, and a
+    # later Compose bind of G:/ puts the dead share back. DrvFs is mounted in
+    # the docker-desktop init namespace (dockerd itself has no drvfs), then
+    # bind-mounted into dockerd at a path the file-sharing agent does not own.
+    $lower = $Letter.ToLowerInvariant()
+    $relative = (($RelativePath -replace '\\', '/').Trim('/'))
+    $relativeB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($relative))
+    $shell = @'
+:
+set -eu
+LETTER="$1"
+LOWER="$2"
+B64="$3"
+MP="/mnt/aetheris-host-drives/${LOWER}"
+RELFILE=/tmp/aetheris-rel-$$
+CHECKFILE=/tmp/aetheris-check-$$
+: > "$RELFILE"
+if [ -n "$B64" ]; then
+  printf '%s' "$B64" | base64 -d > "$RELFILE"
+fi
+printf '%s' "$MP" > "$CHECKFILE"
+if [ -s "$RELFILE" ]; then
+  printf '/' >> "$CHECKFILE"
+  cat "$RELFILE" >> "$CHECKFILE"
+fi
+mkdir -p "$MP"
+if grep -qs " ${MP} " /proc/mounts 2>/dev/null; then
+  if ! ls -d "$MP" >/dev/null 2>&1; then
+    umount -l "$MP" >/dev/null 2>&1 || true
+  fi
+fi
+if ! ls -d "$MP" >/dev/null 2>&1; then
+  mkdir -p "$MP"
+fi
+if ! grep -qs " ${MP} " /proc/mounts 2>/dev/null; then
+  mount -t drvfs -o ro,metadata,uid=0,gid=0 "${LETTER}:" "$MP"
+fi
+printf '\0' >> "$CHECKFILE"
+cat "$CHECKFILE" | xargs -0 ls -d >/dev/null
+dpid=""
+for proc in /proc/[0-9]*; do
+  cmd=$(tr "\0" " " < "$proc/cmdline" 2>/dev/null || true)
+  case "$cmd" in
+    *dockerd*) dpid=${proc#/proc/}; break ;;
+  esac
+done
+if [ -z "$dpid" ]; then
+  echo "dockerd not found"
+  exit 1
+fi
+nsenter -t "$dpid" -m -- mkdir -p "$MP"
+if ! nsenter -t "$dpid" -m -- ls -d "$MP" >/dev/null 2>&1; then
+  nsenter -t "$dpid" -m -- umount -l "$MP" >/dev/null 2>&1 || true
+  nsenter -t "$dpid" -m -- mkdir -p "$MP"
+  nsenter -t "$dpid" -m -- mount --bind "/proc/1/root${MP}" "$MP"
+fi
+nsenter -t "$dpid" -m -- ls -d "$MP" >/dev/null
+echo "mounted ${LETTER}: read-only at ${MP}"
+'@
+    $shell = $shell.TrimStart([char]0xFEFF) -replace "`r", ""
+    try {
+        $run = Invoke-NativeCapture -FilePath 'wsl.exe' -ArgumentList @(
+            '-d', 'docker-desktop', '-u', 'root', '--', 'sh', '-s', '--', $Letter, $lower, $relativeB64
+        ) -StdinText $shell
+        return @{
+            ok          = ($run.ExitCode -eq 0)
+            exit        = $run.ExitCode
+            output      = $run.Text
+            source      = "/mnt/aetheris-host-drives/$lower"
+            mount_point = "/mnt/aetheris-host-drives/$lower"
+        }
+    }
+    catch {
+        return @{
+            ok          = $false
+            exit        = -1
+            output      = $_.Exception.Message
+            source      = "/mnt/aetheris-host-drives/$lower"
+            mount_point = "/mnt/aetheris-host-drives/$lower"
+        }
+    }
+}
+
+function Try-PrivateDriveResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Letter,
+        [string]$RelativePath = "",
+        [string]$Image = "",
+        [object[]]$Attempts = @()
+    )
+    $mounted = Mount-DockerDesktopPrivateLetter -Letter $Letter -RelativePath $RelativePath
+    $Attempts += [pscustomobject]@{
+        source = $mounted.source
+        mode   = "docker-drvfs"
+        ok     = [bool]$mounted.ok
+        detail = $mounted.output
+    }
+    if (-not $mounted.ok) {
+        return @{ ok = $false; attempts = $Attempts }
+    }
+    $probe = Test-DockerSource -Source $mounted.source -Image $Image -RelativePath $RelativePath
+    $Attempts += [pscustomobject]@{
+        source = $mounted.source
+        mode   = "docker-drvfs-probe"
+        ok     = [bool]$probe.ok
+        detail = $probe.output
+    }
+    if (-not $probe.ok) {
+        return @{ ok = $false; attempts = $Attempts }
+    }
+    $lower = $Letter.ToLowerInvariant()
+    Write-Result @{
+        ok             = $true
+        drive          = $Letter
+        source         = $mounted.source
+        mode           = "docker-drvfs"
+        mount_target   = "/host/$lower"
+        source_scope   = "drive"
+        required_path  = $(if ($script:normalizedRequired) { $script:normalizedRequired } else { $null })
+        probe_relative = $RelativePath
+        api_image      = $Image
+        attempts       = $Attempts
+        message        = "Docker Desktop could not share ${Letter}:. The drive was mounted read-only for the engine. No evidence was copied."
+    }
+    exit 0
 }
 
 function Ensure-WslDrvFsBridge {
@@ -676,6 +811,29 @@ if ($RemountOnly) {
     exit $(if ($readOnlyProbe.ok) { 0 } else { 31 })
 }
 
+# Docker Desktop's letter share is dead. Mount the Windows drive read-only
+# where Compose cannot replace it with that share.
+if ($PrivateDrive) {
+    $privateTried = $true
+    $private = Try-PrivateDriveResult -Letter $letter -RelativePath $relative -Image $image -Attempts $attempts
+    $attempts = @($private.attempts)
+    # A failed private mount must not fall through to source G:/. Compose
+    # would then reinstall Docker Desktop's dead letter share.
+    $summary = Get-AttemptSummary -Attempts $attempts
+    $errorText = "Windows can see ${letter}:, but the read-only engine mount failed. No evidence was copied or marked processed."
+    if ($summary) { $errorText += " Diagnostic: $summary" }
+    Write-Result @{
+        ok            = $false
+        drive         = $letter
+        source        = ""
+        mode          = "none"
+        required_path = $(if ($normalizedRequired) { $normalizedRequired } else { $null })
+        attempts      = $attempts
+        error         = $errorText
+    }
+    exit 30
+}
+
 # Read the Windows letter itself first. A compose bind of G:/ is the path
 # Docker Desktop keeps after a USB replug. /mnt/host/g is an internal stub
 # that becomes "no such device" and must not win while the letter is readable.
@@ -749,13 +907,19 @@ if (-not $ForceWslBridge -and $normalizedRequired -and $driveRootHasFiles) {
 # that share is a dead device, retrying the same bind cannot succeed. Detach
 # only this letter and mount it read-only, then probe once more.
 $staleShare = $false
+$privateTried = $false
 foreach ($attempt in @($attempts)) {
-    if (-not $attempt.ok -and "$($attempt.detail)" -match 'no such device|ENODEV|error evaluating symlinks') {
+    if (-not $attempt.ok -and "$($attempt.detail)" -match 'no such device|ENODEV|error evaluating symlinks|invalid mount config|bind source path does not exist') {
         $staleShare = $true
         break
     }
 }
 if (-not $ForceWslBridge -and $staleShare) {
+    # Private DrvFs first. Repairing /mnt/host and returning source G:/ lets
+    # the next Compose bind put the dead 9p share back over the letter.
+    $privateTried = $true
+    $private = Try-PrivateDriveResult -Letter $letter -RelativePath $relative -Image $image -Attempts $attempts
+    $attempts = @($private.attempts)
     $repair = Repair-StaleWindowsLetter -Letter $letter -RelativePath $relative
     $attempts += [pscustomobject]@{
         source = "${letter}:/"
@@ -927,6 +1091,11 @@ foreach ($distro in $distros) {
         }
         exit 0
     }
+}
+
+if (-not $privateTried) {
+    $private = Try-PrivateDriveResult -Letter $letter -RelativePath $relative -Image $image -Attempts $attempts
+    $attempts = @($private.attempts)
 }
 
 $summary = Get-AttemptSummary -Attempts $attempts

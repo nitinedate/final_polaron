@@ -29,6 +29,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: volume
+        source: aetheris_hostdrive_g_af4116e87edf
+        target: '/host/g'
+        read_only: true
+        volume:
+          nocopy: true
   worker-build:
     volumes:
       - type: bind
@@ -55,6 +61,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: volume
+        source: aetheris_hostdrive_g_af4116e87edf
+        target: '/host/g'
+        read_only: true
+        volume:
+          nocopy: true
   worker-parse:
     volumes:
       - type: bind
@@ -81,3 +93,14 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: volume
+        source: aetheris_hostdrive_g_af4116e87edf
+        target: '/host/g'
+        read_only: true
+        volume:
+          nocopy: true
+
+volumes:
+  aetheris_hostdrive_g_af4116e87edf:
+    external: true
+    name: aetheris_hostdrive_g_af4116e87edf

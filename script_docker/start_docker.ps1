@@ -162,9 +162,11 @@ function Invoke-DriveMountRefresh {
     )
     $startedUtc = [DateTime]::UtcNow.AddSeconds(-2)
     Write-Host ("    Scanning drives for ALL product stacks (time limit {0}s)..." -f $timeoutSec)
+    $sourceMap = Join-Path $env:LOCALAPPDATA 'Aetheris\docker-drive-sources.json'
     $proc = Start-Process -FilePath 'powershell.exe' -NoNewWindow -PassThru -ArgumentList @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $Generator),
-        '-WriteStartupStackOverrides')
+        '-WriteStartupStackOverrides',
+        '-SourceMapPath', ('"{0}"' -f $sourceMap))
     $null = $proc.Handle  # keeps ExitCode readable after exit in PowerShell 5.1
     if (-not $proc.WaitForExit($timeoutSec * 1000)) {
         & taskkill.exe /PID $proc.Id /T /F *> $null

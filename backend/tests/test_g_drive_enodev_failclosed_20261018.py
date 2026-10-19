@@ -33,6 +33,9 @@ def test_resolver_does_not_alter_docker_desktop_daemon_mounts():
     assert 'function Test-DockerDesktopHostLetter' not in s
     assert 'umount -l /mnt/host/' not in s
     assert 'function Repair-StaleWindowsLetter' in s
+    assert 'function Mount-DockerDesktopPrivateLetter' in s
+    assert 'mode           = "docker-drvfs"' in s
+    assert '/mnt/aetheris-host-drives/' in s
     assert 'mount -t drvfs -o ro,metadata,uid=0,gid=0' in s
     assert 'stale-letter-repair' in s
     # The repair may detach only the dead letter. It must not wipe every host share.
@@ -77,4 +80,6 @@ def test_preset_mounts_dont_include_unavailable_g():
                 'docker-compose.drives.mobile-ios.yml'):
         s = txt(rel)
         assert "source: 'G:/" not in s
-        assert "target: '/host/g'" not in s
+        assert "source: G:/" not in s
+        # /host/g is allowed only as an external engine volume. A G:/ bind
+        # reinstalls Docker Desktop's dead 9p share.

@@ -541,6 +541,7 @@ function Wait-ApiHealthy {
 function Convert-DaemonHostPathToWindowsBind {
     param([string]$Source)
     if (-not $Source) { return $Source }
+    if ($Source -match '^/mnt/aetheris-host-drives/[a-z]/?$') { return $Source.TrimEnd('/') }
     if ($Source -match '^[A-Za-z]:[/\\]?$') {
         return ("{0}:/" -f $Source.Substring(0, 1).ToUpper())
     }
@@ -661,7 +662,8 @@ function Invoke-DriveSourceResolver {
     param(
         [Parameter(Mandatory = $true)][string]$Letter,
         [string]$ExactPath = "",
-        [switch]$ForceWslBridge
+        [switch]$ForceWslBridge,
+        [switch]$PrivateDrive
     )
     if (-not (Test-Path -LiteralPath $resolveSourceScript)) {
         throw "Missing Docker drive source resolver: $resolveSourceScript"
@@ -677,6 +679,7 @@ function Invoke-DriveSourceResolver {
         )
         if ($ExactPath) { $psArgs += @('-RequiredPath', $ExactPath) }
         if ($ForceWslBridge) { $psArgs += '-ForceWslBridge' }
+        if ($PrivateDrive) { $psArgs += '-PrivateDrive' }
         $run = Invoke-NativeCapture -FilePath 'powershell.exe' -ArgumentList $psArgs
         $exit = $run.ExitCode
         if (-not (Test-Path -LiteralPath $tmp)) {
@@ -946,7 +949,23 @@ try {
         }
         # The folder is already on a mounted drive, often through a junction onto
         # D:. Recreating the APIs here is what makes folder selection return 502.
-        if (Test-RequiredPathInContainer -Path $normalizedRequiredPath) {
+        # A readable Windows-letter bind is not finished: that is the share that
+        # becomes ENODEV after the disk is attached.
+        $apiMountType = ''
+        try {
+            $apiId = Get-ServiceContainerId -Service 'api'
+            if ($apiId) {
+                $mountTarget = "/host/$($requiredLetter.ToLower())"
+                $typeRun = Invoke-NativeCapture -FilePath 'docker' -ArgumentList @(
+                    'inspect', '--format',
+                    "{{range .Mounts}}{{if eq .Destination `"$mountTarget`"}}{{.Type}}{{end}}{{end}}",
+                    $apiId
+                )
+                if ($typeRun.ExitCode -eq 0) { $apiMountType = ("$($typeRun.Output -join '')").Trim() }
+            }
+        }
+        catch { $apiMountType = '' }
+        if ((Test-RequiredPathInContainer -Path $normalizedRequiredPath) -and $apiMountType -eq 'volume') {
             Write-Status @{
                 status       = 'done'
                 ok           = $true
@@ -1022,7 +1041,12 @@ try {
             continue
         }
         try {
-            $resolved = Invoke-DriveSourceResolver -Letter $letter -ExactPath $exact
+            $storedMode = ''
+            if ($sourceState.ContainsKey($letter)) { $storedMode = [string]$sourceState[$letter].mode }
+            # Once a letter is on the private read-only mount, keep it there.
+            # A later G:/ probe can look healthy and then Compose puts the dead
+            # Docker Desktop share back.
+            $resolved = Invoke-DriveSourceResolver -Letter $letter -ExactPath $exact -PrivateDrive:($storedMode -eq 'docker-drvfs')
             Update-SourceStateEntry -State $sourceState -Result $resolved
             $resolutionByLetter[$letter] = $resolved
             if ($letter -eq $requiredLetter) { $requiredResolution = $resolved }
@@ -1142,6 +1166,13 @@ try {
                     if (-not $actual -or -not $actual[0].Source) {
                         $mustRecreate = $true
                     }
+                    elseif ([string]$sourceState[$requiredLetter].mode -eq 'docker-drvfs' -and [string]$actual[0].Type -ne 'volume') {
+                        # The folder is visible through Docker Desktop's letter
+                        # share. Replace that bind with the private read-only
+                        # volume before the share goes ENODEV again.
+                        $mustRecreate = $true
+                        $resolutionLog += "${requiredLetter}: container still bind-mounts the Windows letter; switching to the read-only engine volume."
+                    }
                 }
                 catch { $mustRecreate = $true }
             }
@@ -1150,7 +1181,11 @@ try {
         # The selected folder can become readable while source resolution is
         # still running (the drive was already bound). Do not rebuild Docker,
         # and do not wait on the iOS/Android stacks, when extraction can start.
-        if ($mustRecreate -and $normalizedRequiredPath -and (Test-RequiredPathInContainer -Path $normalizedRequiredPath)) {
+        $desiredMode = ''
+        if ($requiredLetter -and $sourceState.ContainsKey($requiredLetter)) {
+            $desiredMode = [string]$sourceState[$requiredLetter].mode
+        }
+        if ($mustRecreate -and $desiredMode -ne 'docker-drvfs' -and $normalizedRequiredPath -and (Test-RequiredPathInContainer -Path $normalizedRequiredPath)) {
             $mustRecreate = $false
             $resolutionLog += "Selected path is already readable in Docker. Skipping container recreate."
         }
