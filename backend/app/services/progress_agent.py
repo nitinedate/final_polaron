@@ -372,6 +372,15 @@ def monitor_job(db, job_id, *, schema_name):
             return {"status": "complete", "job_id": job_id}
         return _monitor_acquisition(db, job, schema_name=schema_name)
 
+    # A newly eligible stage has no Celery owner. Dispatch it immediately rather
+    # than waiting for the stale-claim watchdog interval. dispatch_current_stage
+    # locks the job row and atomically moves the single authoritative stage to
+    # queued before publishing, so concurrent process agents cannot double-start.
+    if active.get('status') == 'pending':
+        return {**dispatch_current_stage(db, job_id, schema_name=schema_name),
+                'job_id': job_id, 'coordinator': 'progressAgent',
+                'reason': 'Immediate dependency handoff'}
+
     # Resource-aware parallelism: while recovery/OCR is the critical path, start
     # independent CPU/DB sidecars (parsed-text prechunk + leakage analysis; inventory
     # only beside OCR). They never own CUDA or source extraction, so quality is not

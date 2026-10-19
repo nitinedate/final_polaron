@@ -142,10 +142,28 @@ def _materialize_full(db, job_id):
     )
     entries = prepare_extracted_members(load_index_entries(manifest), manifest)
     expected = len(entries)
-    if expected < int(row.get("files_extracted") or 0):
+    extracted_count = int(row.get("files_extracted") or 0)
+    manifest_gap = max(0, extracted_count - expected)
+    # A small count discrepancy must not block the entire case.  It remains an
+    # explicit, queryable coverage limitation; no absent file is considered parsed.
+    # Larger disagreements still indicate a possibly incomplete/corrupt manifest.
+    allowed_gap = min(100, max(1, int(extracted_count * 0.001)))
+    if manifest_gap > allowed_gap:
         raise RuntimeError(
-            f"Extracted manifest accounts for {expected:,} / {int(row['files_extracted']):,} extracted files"
+            f"Extracted manifest accounts for {expected:,} / {extracted_count:,} extracted files "
+            f"(gap {manifest_gap:,} exceeds allowance {allowed_gap:,}); "
+            "manual extraction reconciliation required"
         )
+    if manifest_gap:
+        execute(db, """UPDATE jobs SET metadata=coalesce(metadata,'{}'::jsonb) ||
+                jsonb_build_object('materialize_manifest_gap', :gap,
+                                  'materialize_manifest_entries', :entries,
+                                  'materialize_extraction_reported', :reported,
+                                  'materialize_coverage_limited', true),
+                updated_at=NOW() WHERE id=:jid""",
+                {"jid": job_id, "gap": manifest_gap, "entries": expected,
+                 "reported": extracted_count})
+        db.commit()
     # Every extracted file enters inventory. Unsupported/no-text files are
     # explicit stage exceptions, never discarded by hash or path filters.
     # V1.10.9: one pass. Each row is inserted with its provenance (extracted part)
@@ -408,11 +426,17 @@ def _recovery(db, job_id):
             schema = str(getattr(db, "info", {}).get("firm_schema") or "")
             if schema:
                 dispatch_ocr_agent(schema, job_id)
-    except Exception:
+    except Exception as exc:
         try:
             db.rollback()
+            from app.services.forensic_serial_pipeline import write_disk_log
+            write_disk_log(db, job_id, f"OCR early dispatch deferred: {type(exc).__name__}: {exc}",
+                           stage="ocr", level="warning")
+            db.commit()
         except Exception:
-            pass
+            db.rollback()
+        # The serial OCR stage remains authoritative and will retry eligibility
+        # and dispatch. Failure of this speculative sidecar is never completion.
 
     # Disk filesystem-level recovery remains in the one-time image acquisition.
     # This stage analyzes derived deleted files and preserves those source flags.

@@ -100,6 +100,10 @@ def ensure_company_leakage_schema(db) -> None:
         updated_at timestamptz NOT NULL DEFAULT NOW(),
         UNIQUE(job_id, job_artifact_id)
     )""")
+    # Index DDL is an optimization, never a prerequisite to scanning evidence.
+    # A database cancellation/lock timeout must not fail the leakage sidecar.
+    # SAVEPOINTs ensure a canceled statement does not poison the outer transaction.
+    import logging
     for sql in (
         "CREATE INDEX IF NOT EXISTS ix_company_leak_job_risk ON company_leakage_evidence(job_id, risk_score DESC, id)",
         "CREATE INDEX IF NOT EXISTS ix_company_leak_job_channel ON company_leakage_evidence(job_id, channel, risk_score DESC)",
@@ -109,15 +113,24 @@ def ensure_company_leakage_schema(db) -> None:
         "CREATE INDEX IF NOT EXISTS ix_company_leak_terms_gin ON company_leakage_evidence USING gin(matched_terms)",
         "CREATE INDEX IF NOT EXISTS ix_company_leak_scan_job ON company_leakage_scan_state(job_id, checked_at, job_artifact_id)",
     ):
-        execute(db, sql)
+        try:
+            with db.begin_nested():
+                execute(db, sql)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Deferring optional company-leakage index build: %s (%s)", sql, exc
+            )
     # pg_trgm is part of the Polaron PostgreSQL baseline.  These make examiner
     # searches inside the new leakage artifact family responsive even at scale.
-    try:
-        execute(db, "CREATE INDEX IF NOT EXISTS ix_company_leak_source_trgm ON company_leakage_evidence USING gin(source_path gin_trgm_ops)")
-        execute(db, "CREATE INDEX IF NOT EXISTS ix_company_leak_excerpt_trgm ON company_leakage_evidence USING gin(excerpt gin_trgm_ops)")
-    except Exception:
-        try: db.rollback()
-        except Exception: pass
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS ix_company_leak_source_trgm ON company_leakage_evidence USING gin(source_path gin_trgm_ops)",
+        "CREATE INDEX IF NOT EXISTS ix_company_leak_excerpt_trgm ON company_leakage_evidence USING gin(excerpt gin_trgm_ops)",
+    ):
+        try:
+            with db.begin_nested():
+                execute(db, sql)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Deferring optional trigram index: %s (%s)", sql, exc)
 
 
 def _company_terms(db) -> list[str]:

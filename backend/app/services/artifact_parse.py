@@ -1387,40 +1387,19 @@ def _run_claimed_parse_batch(
 
     last_scan_beat = 0.0
     scan_started = time.monotonic()
-    gpu_cache = {"at": 0.0, "done": 0, "pending": 0}
-
-    def _gpu_counts() -> tuple[int, int]:
-        now = time.monotonic()
-        if now - float(gpu_cache["at"]) < 15.0:
-            return int(gpu_cache["done"]), int(gpu_cache["pending"])
-        try:
-            row = fetchone(
-                db,
-                """SELECT count(*) FILTER (WHERE ocr_status='done') AS done,
-                          count(*) FILTER (WHERE ocr_status IN ('pending','running')) AS pending
-                   FROM job_artifacts WHERE job_id=:jid""",
-                {"jid": job_id},
-            ) or {}
-            gpu_cache["done"] = int(row.get("done") or 0)
-            gpu_cache["pending"] = int(row.get("pending") or 0)
-            gpu_cache["at"] = now
-        except Exception:
-            log.debug("GPU OCR progress lookup skipped", exc_info=True)
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        return int(gpu_cache["done"]), int(gpu_cache["pending"])
+    # OCR belongs to the later OCR stage.  Do not scan the entire artifact table
+    # on every native-parse heartbeat just to show an unrelated pending count.
+    # In particular, ocr_status='pending' is NOT a verified GPU work queue.
 
     def _publish_scan(detail: dict, *, bytes_total: int = 0, parsing: int = 0, force: bool = False) -> None:
         nonlocal last_scan_beat
         now = time.monotonic()
-        if not force and now - last_scan_beat < 2.0:
+        if not force and now - last_scan_beat < 10.0:
             return
         last_scan_beat = now
         seen = int(detail.get("bytes_seen") or 0)
         elapsed = max(now - scan_started, 0.001)
-        gpu_done, gpu_pending = _gpu_counts()
+        gpu_done, gpu_pending = 0, 0
         label = format_shard_scan_label(
             detail,
             bytes_total=bytes_total,
@@ -1436,8 +1415,6 @@ def _run_claimed_parse_batch(
             "bytes_seen": seen,
             "bytes_total": int(bytes_total or 0),
             "current_path": str(detail.get("current_path") or "")[:300],
-            "gpu_ocr_done": gpu_done,
-            "gpu_ocr_pending": gpu_pending,
             "label": label,
         }
         try:

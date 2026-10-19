@@ -17,13 +17,11 @@ function StageLiveMeter({ stage }: { stage: Stage }) {
   const found = num(io?.files_found ?? io?.files_yielded);
   const seen = num(io?.bytes_seen);
   const total = num(io?.bytes_total);
-  const gpuDone = num(io?.gpu_ocr_done);
-  const gpuPending = num(io?.gpu_ocr_pending);
   const bytePct = total > 0 ? Math.max(0, Math.min(100, Math.round((100 * seen) / total))) : null;
   const filePct = wanted > 0 ? Math.max(0, Math.min(100, Math.round((100 * found) / wanted))) : null;
   const pct = bytePct ?? filePct;
   const showShard = Boolean(io) && (wanted > 0 || total > 0 || seen > 0);
-  if (!showShard && !(gpuDone || gpuPending)) return null;
+  if (!showShard) return null;
   return <div className="mt-2 space-y-1.5">
     {showShard && pct !== null ? <div>
       <div className="mb-1 flex justify-between gap-2 text-[11px] text-ink-700">
@@ -34,7 +32,6 @@ function StageLiveMeter({ stage }: { stage: Stage }) {
         <div className="h-1.5 bg-amber-500" style={{ width: `${pct}%` }} />
       </div>
     </div> : null}
-    {(gpuDone > 0 || gpuPending > 0) ? <p className="text-[11px] text-ink-700">GPU OCR {gpuDone.toLocaleString()} done, {gpuPending.toLocaleString()} queued</p> : null}
   </div>;
 }
 
