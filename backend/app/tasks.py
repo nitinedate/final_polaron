@@ -3023,6 +3023,22 @@ def early_ocr_sidecar_task(schema_name: str, job_id: str, task_id: str | None = 
                 quality_ocr_triage_task.delay(schema_name, job_id)
                 pending = int(count_pending_ocr(db, job_id) or 0)
                 buckets = dispatch_ocr_agent(schema_name, job_id) if pending > 0 else 0
+                # Report early OCR as a parallel lane, not a second serial stage.
+                # Keep the authoritative OCR stage pending until its own claim.
+                if pending > 0:
+                    import json
+                    from app.db.sql_helpers import execute
+                    execute(db, """UPDATE pipeline_stage_runs SET
+                        details=coalesce(details,'{}'::jsonb) || CAST(:d AS jsonb),
+                        updated_at=NOW() WHERE job_id=:jid AND stage='ocr'
+                        AND status='pending'""", {
+                        'jid': job_id,
+                        'd': json.dumps({'parallel_active': bool(buckets),
+                                         'parallel_with': 'early_ocr',
+                                         'parallel_label': 'OCR running alongside parsing' if buckets else 'OCR awaiting worker',
+                                         'parallel_total': pending, 'parallel_completed': 0})
+                    })
+                    db.commit()
                 details = {"ocr_pending": pending, "ocr_buckets": int(buckets or 0)}
                 # Triage keeps filling the OCR bucket while files are registered and
                 # parsed: look again every 45 s until parsing ends (recovery then

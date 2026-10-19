@@ -1719,13 +1719,15 @@ def write_ocr_live_progress(db, job_id: str, *, label: str | None = None) -> Non
     # to running because the serial controller allows only one authoritative
     # running stage per job. The UI renders this sidecar state from details.
     try:
-        recovery = fetchone(
+        concurrent_stage = fetchone(
             db,
-            """SELECT 1 AS ok FROM pipeline_stage_runs
-               WHERE job_id=:jid AND stage='recovery' AND status='running' LIMIT 1""",
+            """SELECT stage FROM pipeline_stage_runs
+               WHERE job_id=:jid AND stage IN ('materialize','parse','recovery')
+                 AND status='running' ORDER BY CASE stage
+                 WHEN 'materialize' THEN 1 WHEN 'parse' THEN 2 ELSE 3 END DESC LIMIT 1""",
             {"jid": job_id},
         )
-        if recovery:
+        if concurrent_stage:
             execute(
                 db,
                 """UPDATE pipeline_stage_runs
@@ -1739,7 +1741,7 @@ def write_ocr_live_progress(db, job_id: str, *, label: str | None = None) -> Non
                     "d": json.dumps({
                         "parallel_active": pending > 0,
                         "parallel_complete": pending == 0,
-                        "parallel_with": "recovery",
+                        "parallel_with": str(concurrent_stage["stage"]),
                         "parallel_completed": progress_done,
                         "parallel_total": progress_total,
                         "parallel_label": label or default_label,

@@ -201,9 +201,9 @@ def schedule_safe_sidecars(db,job_id,*,schema_name,active_stage):
             queued.append('company_leakage'); available-=1
     elif active_stage in {'parse','media_review'}:
         launch('company_leakage', company_leakage_sidecar_task, parse_queue(), active_stage)
-    # Inventory is DB/CPU work and is useful while CUDA owns OCR.
-    if active_stage=='ocr':
-        launch('artifact_inventory', artifact_inventory_sidecar_task, parse_queue(), active_stage)
+    # The authoritative inventory stage already calls run_axiom_artifact_inventory.
+    # Never schedule a second full-case inventory beside OCR: both executions
+    # would contend for the same catalog and re-count the same artifacts.
     return {'queued':queued,'slots':PIPELINE_PARALLEL_SLOTS,'available_after':available,'resources':resources}
 
 
