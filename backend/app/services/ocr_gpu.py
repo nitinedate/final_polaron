@@ -9,7 +9,6 @@ import multiprocessing
 import os
 import shutil
 import threading
-import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 
@@ -1471,54 +1470,6 @@ def _ocr_engine_available() -> bool:
     return model is not None and processor is not None
 
 
-def _set_pending_ocr_in_id_order(db, job_id: str, *, where_sql: str, status: str, batch_size: int = 2000) -> int:
-    """Set ocr_status on pending rows from lowest id to highest.
-
-    A single UPDATE of every pending row locked the heap in scan order and
-    deadlocked the priority-evidence writer, which updates a different id set.
-    Both sides now take row locks in id order and commit in small batches.
-    """
-    from app.db.sql_helpers import is_retryable_db_error, rollback_aborted_transaction
-
-    total = 0
-    sql = f"""WITH candidates AS (
-                SELECT id FROM job_artifacts
-                WHERE job_id=:jid AND ocr_status='pending' AND ({where_sql})
-                ORDER BY id
-                LIMIT :batch
-                FOR UPDATE
-            ), updated AS (
-                UPDATE job_artifacts
-                SET ocr_status=:status, updated_at=NOW()
-                WHERE id IN (SELECT id FROM candidates)
-                RETURNING 1
-            )
-            SELECT count(*)::int AS c FROM updated"""
-    values = {"jid": job_id, "status": status, "batch": max(200, int(batch_size))}
-    while True:
-        row = None
-        for attempt in range(8):
-            try:
-                row = fetchone(db, sql, values)
-                break
-            except Exception as exc:
-                try:
-                    db.rollback()
-                except Exception:
-                    rollback_aborted_transaction(db)
-                if not is_retryable_db_error(exc) or attempt >= 7:
-                    raise
-                time.sleep(0.05 * (2 ** attempt))
-        changed = int((row or {}).get("c") or 0)
-        if changed <= 0:
-            break
-        total += changed
-        db.commit()
-        if changed < values["batch"]:
-            break
-    return total
-
-
 def park_pictures_for_evidence(db, job_id: str) -> int:
     """Leave camera and chat images for image/video evidence, not GLM.
 
@@ -1526,16 +1477,16 @@ def park_pictures_for_evidence(db, job_id: str) -> int:
     are examined by the media-evidence stage, which reads visible text and
     describes what is in the frame.
     """
-    parked = _set_pending_ocr_in_id_order(
+    result = execute(
         db,
-        job_id,
-        where_sql=(
-            "lower(coalesce(extension, '')) <> '.pdf'"
-            f" AND NOT ({OCR_DOC_FOLDER_SQL})"
-            f" AND NOT ({OCR_QUALITY_BUCKET_SQL})"
-        ),
-        status="skipped",
+        f"""UPDATE job_artifacts SET ocr_status='skipped', updated_at=NOW()
+            WHERE job_id=:jid AND ocr_status='pending'
+              AND lower(coalesce(extension, '')) <> '.pdf'
+              AND NOT ({OCR_DOC_FOLDER_SQL})
+              AND NOT ({OCR_QUALITY_BUCKET_SQL})""",
+        {"jid": job_id},
     )
+    parked = int(getattr(result, "rowcount", 0) or 0)
     if parked:
         from app.services.disk_build_log import write_disk_log
 
@@ -1566,29 +1517,33 @@ def skip_ocr_noise_pending(db, job_id: str) -> int:
     except Exception:
         pass
 
-    skipped = _set_pending_ocr_in_id_order(
+    demoted = execute(
         db,
-        job_id,
-        where_sql=f"NOT ({OCR_PENDING_CANDIDATE_SQL})",
-        status="na",
+        f"""UPDATE job_artifacts SET ocr_status='na', updated_at=NOW()
+            WHERE job_id=:jid AND ocr_status='pending'
+              AND NOT ({OCR_PENDING_CANDIDATE_SQL})""",
+        {"jid": job_id},
     )
-    skipped += _set_pending_ocr_in_id_order(
+    skipped = int(getattr(demoted, "rowcount", 0) or 0)
+    result = execute(
         db,
-        job_id,
-        where_sql=f"({OCR_NOISE_SQL}) AND NOT ({OCR_QUALITY_BUCKET_SQL})",
-        status="skipped",
+        f"""UPDATE job_artifacts SET ocr_status='skipped', updated_at=NOW()
+            WHERE job_id=:jid AND ocr_status='pending'
+              AND ({OCR_NOISE_SQL}) AND NOT ({OCR_QUALITY_BUCKET_SQL})""",
+        {"jid": job_id},
     )
+    skipped += int(getattr(result, "rowcount", 0) or 0)
     if not forensic_photos_allowed():
-        skipped += _set_pending_ocr_in_id_order(
+        extra = execute(
             db,
-            job_id,
-            where_sql=(
-                "lower(coalesce(extension, '')) <> '.pdf'"
-                f" AND NOT ({OCR_DOC_FOLDER_SQL})"
-                f" AND NOT ({OCR_QUALITY_BUCKET_SQL})"
-            ),
-            status="skipped",
+            f"""UPDATE job_artifacts SET ocr_status='skipped', updated_at=NOW()
+                WHERE job_id=:jid AND ocr_status='pending'
+                  AND lower(coalesce(extension, '')) <> '.pdf'
+                  AND NOT ({OCR_DOC_FOLDER_SQL})
+                  AND NOT ({OCR_QUALITY_BUCKET_SQL})""",
+            {"jid": job_id},
         )
+        skipped += int(getattr(extra, "rowcount", 0) or 0)
     return skipped
 
 

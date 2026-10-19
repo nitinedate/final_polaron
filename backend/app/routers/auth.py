@@ -109,7 +109,6 @@ def request_access_token(body: RequestAccessTokenIn, db: Session = Depends(get_d
         }}) from exc
     except HTTPException:
         db.rollback()
-        raise
     except Exception:
         import logging
 

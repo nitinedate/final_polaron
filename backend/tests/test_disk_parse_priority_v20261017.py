@@ -88,13 +88,9 @@ def test_priority_evidence_batches_commits_and_shard_reads(monkeypatch, part_cou
     peak_parsers = 0
     worker_guard = threading.Lock()
 
-    deadlocks_left = {"n": 1}
-
     class DB:
         def __init__(self): self.info = {}
         def commit(self): db_commits.append(1)
-        def rollback(self): return None
-        def execute(self, *args, **kwargs): return None
         def connection(self): return self
         def cursor(self): return self
         def __enter__(self): return self
@@ -119,9 +115,6 @@ def test_priority_evidence_batches_commits_and_shard_reads(monkeypatch, part_cou
             for aid, jid, sid, kind, dom, state, ts, data, forensic in values:
                 files[aid] = dict(source_id=sid, kind=kind, data=json.loads(data))
         elif 'UPDATE job_artifacts AS ja' in sql:
-            if deadlocks_left["n"]:
-                deadlocks_left["n"] -= 1
-                raise RuntimeError("deadlock detected")
             for uid, reason in values:
                 entry = next(r for r in sources.values() if r['id']==uid)
                 entry['metadata'].update(priority_parsed_v4=True, priority_parse_exception=reason)

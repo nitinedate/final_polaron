@@ -839,14 +839,11 @@ try {
 
     # V55: the HTTPS gateway routes to product APIs directly over the shared Docker network.
     # Create that external network before starting the gateway, including on a first launch.
-    # docker network inspect writes "network aetheris-common not found" to stderr. Under
-    # Windows PowerShell 5.1 with ErrorActionPreference Stop, that stderr aborts startup
-    # before the network can be created.
-    $networkExists = (Invoke-DockerNativeSafe -DockerArgs @('network', 'inspect', 'aetheris-common') -Quiet) -eq 0
-    if (-not $networkExists) {
+    & docker network inspect aetheris-common *> $null
+    if ($LASTEXITCODE -ne 0) {
         Write-Step 'Create shared Docker network for gateway-to-product API routing'
-        $created = Invoke-DockerNativeSafe -DockerArgs @('network', 'create', 'aetheris-common') -Quiet
-        if ($created -ne 0) { throw 'Could not create external Docker network aetheris-common.' }
+        & docker network create aetheris-common | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not create external Docker network aetheris-common.' }
     }
 
     # Public edge intentionally comes before database/application products. This makes the
@@ -855,18 +852,6 @@ try {
         Write-Step 'Validate trusted public certificates and start HTTPS gateway first'
         $null = Ensure-PublicHttpsEdge -IP $settings.PublicIP -DNS $settings.Domain -Email $settings.AcmeEmail
         $publicGatewayStarted = $true
-    }
-
-    # Common compose marks these volumes external so a stack recreate cannot
-    # create a second empty database. Create them only when this engine has
-    # never had them. An existing volume is left untouched.
-    foreach ($volumeName in @('aetheris-forensic_pgdata', 'aetheris-forensic_pgadmin_data')) {
-        $volumeExists = (Invoke-DockerNativeSafe -DockerArgs @('volume', 'inspect', $volumeName) -Quiet) -eq 0
-        if (-not $volumeExists) {
-            Write-Step "Create persistent Docker volume $volumeName"
-            $volumeCreated = Invoke-DockerNativeSafe -DockerArgs @('volume', 'create', $volumeName) -Quiet
-            if ($volumeCreated -ne 0) { throw "Could not create Docker volume $volumeName." }
-        }
     }
 
     Write-Step "Start shared infrastructure and verify Redis before product stacks"

@@ -22,14 +22,8 @@ function StageLiveMeter({ stage }: { stage: Stage }) {
   const bytePct = total > 0 ? Math.max(0, Math.min(100, Math.round((100 * seen) / total))) : null;
   const filePct = wanted > 0 ? Math.max(0, Math.min(100, Math.round((100 * found) / wanted))) : null;
   const pct = bytePct ?? filePct;
-  const priorityDone = num(details.priority_sources_completed);
-  const priorityTotal = num(details.priority_sources_total);
-  const priorityPct = priorityTotal > 0
-    ? Math.max(0, Math.min(100, Math.round((100 * priorityDone) / priorityTotal))) : null;
-  const staleShard = Boolean(io) && seen === 0 && found === 0 && priorityTotal > 0 && priorityDone < priorityTotal;
-  const showShard = Boolean(io) && !staleShard && (wanted > 0 || total > 0 || seen > 0);
-  const showPriority = priorityTotal > 0 && (priorityDone < priorityTotal || !showShard);
-  if (!showShard && !showPriority && !(gpuDone || gpuPending)) return null;
+  const showShard = Boolean(io) && (wanted > 0 || total > 0 || seen > 0);
+  if (!showShard && !(gpuDone || gpuPending)) return null;
   return <div className="mt-2 space-y-1.5">
     {showShard && pct !== null ? <div>
       <div className="mb-1 flex justify-between gap-2 text-[11px] text-ink-700">
@@ -38,15 +32,6 @@ function StageLiveMeter({ stage }: { stage: Stage }) {
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-white">
         <div className="h-1.5 bg-amber-500" style={{ width: `${pct}%` }} />
-      </div>
-    </div> : null}
-    {showPriority && priorityPct !== null ? <div>
-      <div className="mb-1 flex justify-between gap-2 text-[11px] text-ink-700">
-        <span>Priority evidence</span>
-        <span className="tabular-nums">{priorityDone.toLocaleString()}/{priorityTotal.toLocaleString()} · {priorityPct}%</span>
-      </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-white">
-        <div className="h-1.5 bg-amber-500" style={{ width: `${priorityPct}%` }} />
       </div>
     </div> : null}
     {(gpuDone > 0 || gpuPending > 0) ? <p className="text-[11px] text-ink-700">GPU OCR {gpuDone.toLocaleString()} done, {gpuPending.toLocaleString()} queued</p> : null}

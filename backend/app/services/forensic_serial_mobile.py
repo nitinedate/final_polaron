@@ -385,8 +385,9 @@ def run_mobile_stage(db, job_id, stage, *, schema_name, stage_run_id):
                 item.parser = states[item.path]["parser"]
                 item.error = states[item.path]["error"]
         persist_coverage_snapshot(db, job_id, items, counts)
-        from app.services.forensic_priority_evidence import mobile_priority_coverage
-        mobile_priority_coverage(db, job_id)
+        # Coverage is already persisted from the actual mobile inventory and
+        # normalized artifacts above. Do not run a second priority-family
+        # recount that can misclassify unacquired private app data as absent.
         update_analysis_run(
             db,
             run_id,

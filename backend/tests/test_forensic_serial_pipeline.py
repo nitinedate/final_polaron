@@ -549,53 +549,6 @@ def test_materialization_reads_unhashed_entries_and_disables_path_filter(monkeyp
     assert bool(captured_keys) == (second_path.endswith("/files/key"))
 
 
-def test_materialization_keeps_same_path_extracted_at_two_offsets(monkeypatch):
-    captured = {}
-    manifest = {"index_uri": "s3://derived/index", "parts": ["s3://derived/a", "s3://derived/b"]}
-    entries = [
-        {"path": "Edge/LOG", "part_id": 0, "offset": 10},
-        {"path": "Edge/LOG", "part_id": 0, "offset": 10},
-        {"path": "Edge/LOG", "part_id": 1, "offset": 90},
-    ]
-    monkeypatch.setattr(
-        stages,
-        "fetchone",
-        lambda *args: {"disk_source": manifest, "files_extracted": 2},
-    )
-    monkeypatch.setattr("app.services.disk_manifest.load_index_entries", lambda *args: entries)
-    monkeypatch.setattr(
-        "app.services.mobile_forensic.whatsapp_evidence_gate.prepare_whatsapp_evidence",
-        lambda *args, **kwargs: {"state": "not_applicable", "encrypted_files": 0},
-    )
-
-    def materialize(db, job_id, rows, **kwargs):
-        captured["rows"] = rows
-        return {"status": "ok"}
-
-    monkeypatch.setattr("app.services.artifact_materialize.materialize_index_entries", materialize)
-    monkeypatch.setattr(stages, "report_progress", lambda *args, **kwargs: None)
-    monkeypatch.setattr("psycopg2.extras.execute_values", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        "app.services.mobile_forensic.key_intake.capture_registered_keys", lambda *_a, **_k: None
-    )
-
-    @contextmanager
-    def cursor():
-        yield object()
-
-    db = SimpleNamespace(
-        commit=lambda: None,
-        rollback=lambda: None,
-        connection=lambda: SimpleNamespace(connection=SimpleNamespace(cursor=cursor)),
-    )
-    result = stages._materialize_full(db, "00000000-0000-0000-0000-000000000001")
-    assert result["expected_files"] == 2
-    paths = [row["path"] for row in captured["rows"]]
-    assert paths[0] == "Edge/LOG"
-    assert paths[1].endswith("/LOG") and ".extracted-part-1-90/" in paths[1]
-    assert captured["rows"][1]["source_path"] == "Edge/LOG"
-
-
 @pytest.mark.parametrize(
     "part,expected", [("s3://derived/part", b"evidence"), (None, None)]
 )

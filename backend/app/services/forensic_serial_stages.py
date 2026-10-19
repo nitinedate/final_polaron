@@ -80,60 +80,6 @@ def _index_map(db, job_id):
     return {path.replace("\\", "/"): uri for path, uri in build_index_map(ds).items()}
 
 
-def _inventory_path_for_duplicate(path: str, part_id: int, offset: int) -> str:
-    """Keep a second extracted blob without changing the original file name or extension."""
-    normalized = path.replace("\\", "/").strip("/")
-    parent, _, name = normalized.rpartition("/")
-    folder = f".extracted-part-{part_id}-{offset}"
-    if parent:
-        return f"{parent}/{folder}/{name}"
-    return f"{folder}/{name}"
-
-
-def _materialize_entries(manifest: dict) -> list[dict]:
-    """One inventory row per extracted blob.
-
-    The combined index and the per-shard indexes list the same blob twice.
-    A path can also be extracted twice at different part offsets (the same
-    Windows path in two places). Those are different files and both stay.
-    """
-    from app.services.disk_manifest import load_index_entries, resolve_part_uri
-
-    identities: dict[tuple, dict] = {}
-    order: list[tuple] = []
-    for entry in load_index_entries(manifest):
-        path = (entry.get("path") or "").replace("\\", "/")
-        if not path:
-            raise RuntimeError("Extracted manifest contains an entry without a path")
-        part_id = int(entry.get("part_id") or 0)
-        offset = int(entry.get("offset") or 0)
-        part = resolve_part_uri(manifest, part_id)
-        if not part:
-            raise RuntimeError(f"Extracted part is missing for {path}")
-        prepared = {**entry, "path": path, "source_path": path, "part_uri": part}
-        key = (path, part_id, offset)
-        previous = identities.get(key)
-        if previous is None:
-            identities[key] = prepared
-            order.append(key)
-        elif prepared.get("sha256") and not previous.get("sha256"):
-            identities[key] = prepared
-    used: set[str] = set()
-    entries: list[dict] = []
-    for key in order:
-        entry = identities[key]
-        inventory = entry["path"]
-        if inventory in used:
-            inventory = _inventory_path_for_duplicate(entry["path"], key[1], key[2])
-            suffix = 2
-            while inventory in used:
-                inventory = f"{_inventory_path_for_duplicate(entry['path'], key[1], key[2])}#{suffix}"
-                suffix += 1
-        used.add(inventory)
-        entries.append({**entry, "path": inventory})
-    return entries
-
-
 def _materialize_full(db, job_id):
     from app.services.forensic_shard_overlap import unfinished_shards
     from app.services.forensic_serial_pipeline import StageWaiting
@@ -143,6 +89,7 @@ def _materialize_full(db, job_id):
     from psycopg2.extras import execute_values
 
     from app.services.artifact_materialize import materialize_index_entries
+    from app.services.disk_manifest import load_index_entries, resolve_part_uri
 
     row = fetchone(
         db, "SELECT disk_source,files_extracted FROM jobs WHERE id=:id", {"id": job_id}
@@ -152,12 +99,24 @@ def _materialize_full(db, job_id):
         if isinstance(row["disk_source"], str)
         else row["disk_source"] or {}
     )
-    entries = _materialize_entries(manifest)
-    expected = len(entries)
+    by_path = {}
+    for entry in load_index_entries(manifest):
+        path = (entry.get("path") or "").replace("\\", "/")
+        if not path:
+            raise RuntimeError("Extracted manifest contains an entry without a path")
+        part = resolve_part_uri(manifest, int(entry.get("part_id") or 0))
+        if not part:
+            raise RuntimeError(f"Extracted part is missing for {path}")
+        previous = by_path.get(path)
+        if previous and previous.get("sha256") and not entry.get("sha256"):
+            continue
+        by_path[path] = {**entry, "path": path, "part_uri": part}
+    expected = len(by_path)
     if expected < int(row.get("files_extracted") or 0):
         raise RuntimeError(
             f"Extracted manifest accounts for {expected:,} / {int(row['files_extracted']):,} extracted files"
         )
+    entries = list(by_path.values())
     # Every extracted file enters inventory. Unsupported/no-text files are
     # explicit stage exceptions, never discarded by hash or path filters.
     # V1.10.9: one pass. Each row is inserted with its provenance (extracted part)
@@ -171,7 +130,6 @@ def _materialize_full(db, job_id):
             "extracted_part_id": entry.get("part_id"),
             "extracted_part_offset": entry.get("offset"),
             "source_sha256": entry.get("sha256"),
-            "source_path": entry.get("source_path") or entry.get("path"),
         }
 
     result = materialize_index_entries(
@@ -876,11 +834,10 @@ def _chunk(db, job_id, *, mobile=False):
             {"jid": job_id},
         )["c"]
     )
-    from app.services.forensic_priority_evidence import chunk_disk_priority_records
-    priority_chunks = chunk_disk_priority_records(db, job_id) if not mobile else 0
+    # Disk priority re-parsing is retired. Native parsing and normal RAG
+    # chunks remain the sole mandatory disk text indexing pipeline.
     return {
         "status": "ok",
-        "priority_chunks": priority_chunks,
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
         "embedding_enabled": False,
@@ -900,11 +857,6 @@ def execute_stage(db, job_id, stage, *, schema_name, stage_run_id):
         return _materialize_full(db, job_id)
     if stage == "parse":
         result = _parse(db, job_id, schema_name)
-        if not mobile:
-            from app.services.forensic_priority_evidence import (
-                run_disk_priority_evidence,
-            )
-            result["priority"] = run_disk_priority_evidence(db, job_id)
         if mobile:
             from app.services.forensic_serial_mobile import run_mobile_stage
 
@@ -1274,12 +1226,6 @@ def _validate_complete(db, job_id, *, mobile=False):
             raise StageWaiting(
                 f"Completeness check found {missing_mobile:,} mobile records without chunks"
             )
-    else:
-        missing_priority = int(fetchone(db,"""SELECT count(*) AS c FROM forensic_priority_records p
-            WHERE p.job_id=:jid AND NOT EXISTS(SELECT 1 FROM rag_chunks rc WHERE rc.job_id=:jid
-                AND rc.metadata->>'priority_artifact_id'=p.artifact_id AND rc.metadata->>'chunk_policy'=:policy)""",{"jid":job_id,"policy":CHUNK_POLICY})["c"])
-        if missing_priority:
-            raise StageWaiting(f"Completeness check found {missing_priority:,} priority records without chunks")
     # Semantic coverage is a real barrier when GPU embeddings were requested.
     # A queued/running task is already covered by assert_no_active_producers;
     # additionally reject silent failed tasks with unembedded evidence rows.
