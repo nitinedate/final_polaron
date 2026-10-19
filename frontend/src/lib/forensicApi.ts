@@ -592,7 +592,7 @@ export const forensicApi = {
     }>(
       `/api/jobs/${jobId}/evidence/ingest-path`,
       payload,
-      { timeoutMs: 300_000 }
+      { timeoutMs: 0 }
     ),
 
   previewHostEvidence: (

@@ -101,7 +101,9 @@ async function rawRequest(path: string, opts: RequestOptions): Promise<Response>
   Object.assign(headers, serviceHeaders(path, opts.service));
   const controller = new AbortController();
   const timeoutMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  // A zero timeout is reserved for durable, long-running evidence registration.
+  // The server must still enforce worker heartbeats and bounded I/O retries.
+  const timeout = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     return await fetch(resolveApiUrl(path, opts.query), {
       method: opts.method || "GET",
@@ -125,7 +127,7 @@ async function rawRequest(path: string, opts: RequestOptions): Promise<Response>
       `Unable to reach the API server via ${target}. Ensure the gateway is running (e.g. make up).`
     );
   } finally {
-    clearTimeout(timeout);
+    if (timeout !== null) clearTimeout(timeout);
   }
 }
 

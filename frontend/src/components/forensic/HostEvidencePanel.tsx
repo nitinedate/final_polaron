@@ -1479,7 +1479,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           return;
         }
       }
-      if (e instanceof ApiError && e.code === "timeout") {
+      if (e instanceof ApiError && (e.code === "timeout" || e.status === 504 || e.status === 502)) {
         try {
           const job = await forensicApi.getJob(jobId);
           const hasSegments = Boolean(
@@ -1507,7 +1507,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           /* fall through */
         }
         const timeoutMsg =
-          "Registration timed out before the API responded. Confirm the folder path exists on this PC and contains .E01 segments, then Try again.";
+          "Registration did not return through the gateway. Server progress was checked; the request may still be running. Inspect the case state before attempting registration again.";
         onRegisterError?.(timeoutMsg);
         toast.error(timeoutMsg);
       } else {
@@ -1682,7 +1682,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       }
       onRegistered?.();
     } catch (e: unknown) {
-      if (e instanceof ApiError && e.code === "timeout") {
+      if (e instanceof ApiError && (e.code === "timeout" || e.status === 504 || e.status === 502)) {
         try {
           const job = await forensicApi.getJob(jobId);
           if (["processing", "building_disk", "disk_ready", "extracting"].includes(job.status)) {
