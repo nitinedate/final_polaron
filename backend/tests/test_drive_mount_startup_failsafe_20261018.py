@@ -31,17 +31,12 @@ def test_bootstrap_templates_contain_no_stale_removable_drive_mounts():
         assert set(doc["services"]) == services
         for name in services:
             mounts = doc["services"][name]["volumes"]
-            assert mounts
-            windows = [m for m in mounts if m.get("type") == "bind" and m.get("source") == "C:/"]
-            assert windows, name
-            assert windows[0]["target"] == "/host/c"
-            assert windows[0]["read_only"] is True
-            for mount in mounts:
-                assert mount.get("read_only") is True
-                source = str(mount.get("source") or "")
-                assert not source.upper().startswith("G:")
-                if mount.get("type") == "volume":
-                    assert str(mount.get("target") or "").startswith("/host/")
+            assert len(mounts) == 1
+            mount = mounts[0]
+            assert mount == {
+                "type": "bind", "source": "C:/", "target": "/host/c",
+                "read_only": True, "bind": {"create_host_path": False},
+            }
 
 
 def test_startup_regenerates_all_split_overrides_before_validating_compose():

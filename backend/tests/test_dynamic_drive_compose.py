@@ -24,12 +24,10 @@ def test_generated_drive_override_only_adds_host_letter_targets():
         mounts = data["services"][service]["volumes"]
         assert mounts
         for mount in mounts:
+            assert mount["type"] == "bind"
             assert mount["target"].startswith("/host/")
             assert mount["read_only"] is True
-            if mount["type"] == "bind":
-                assert mount["bind"]["create_host_path"] is False
-            else:
-                assert mount["type"] == "volume"
+            assert mount["bind"]["create_host_path"] is False
 
 
 def test_drive_generator_scans_all_letters_and_uses_safe_bind_syntax():
