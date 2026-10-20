@@ -191,6 +191,16 @@ def _census_from_job_artifacts(db, job_id: str) -> dict[str, Any] | None:
     }
 
 
+def _registered_file_census(db, job_id: str) -> dict[str, Any] | None:
+    """Use the files already extracted instead of walking the evidence image again."""
+    try:
+        census = _census_from_job_artifacts(db, job_id)
+        total = int((census or {}).get("document_disk_inventory", {}).get("enumerated_files") or 0)
+    except Exception:
+        return None
+    return census if total > 0 else None
+
+
 def ensure_disk_extension_censuses(
     db,
     job_id: str,
@@ -220,13 +230,26 @@ def ensure_disk_extension_censuses(
             "lnk_disk_count": lnk_count,
         }
 
-    # AXIOM Section B counts allocated FS + carved. job_artifacts is phase-1 filtered
-    # and undercounts Picture/Video/docs vs a full volume walk. Prefer full-disk
-    # enumeration when the virtual disk opens; fall back to job_artifacts on failure
-    # (agent workers without evidence mounts).
     artifact_census = None
     if not force:
-        artifact_census = _census_from_job_artifacts(db, job_id)
+        artifact_census = _registered_file_census(db, job_id)
+        if artifact_census:
+            ds = _load_disk_source(db, job_id)
+            ds["document_disk_inventory"] = artifact_census["document_disk_inventory"]
+            ds["media_disk_inventory"] = artifact_census["media_disk_inventory"]
+            ds["lnk_disk_count"] = int(artifact_census["lnk_disk_count"])
+            _save_disk_source(db, job_id, ds)
+            db.commit()
+            if on_progress:
+                media = artifact_census["media_disk_inventory"]
+                on_progress(
+                    "Extension census from registered files — "
+                    f"{int(artifact_census['document_disk_inventory']['enumerated_files']):,} files "
+                    f"(pictures={int(media['picture']):,}, videos={int(media['video']):,}, "
+                    f"lnk={int(artifact_census['lnk_disk_count']):,})",
+                    {"phase": "disk_ext_census", "source": "job_artifacts"},
+                )
+            return artifact_census
 
     from app.services.virtual_disk import enumerate_all_files, open_virtual_disk
 

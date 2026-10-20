@@ -769,6 +769,29 @@ def _apply_inventory_progress(
     if current_stage() == "inventory":
         status = "indexing"
         pct = min(pct, 99)
+        from app.services.forensic_serial_stages import report_progress
+        from app.services.progress_agent import note_operation
+
+        shown_total = max(int(total or 0), 1)
+        shown_done = min(shown_total, max(int(completed or 0), 0))
+        if not done and shown_done <= 0:
+            shown_done = max(1, min(shown_total - 1 if shown_total > 1 else 1, int(shown_total * int(resolved_ui) / 100) or 1))
+        report_progress(
+            db,
+            job_id,
+            "inventory",
+            total=shown_total,
+            completed=shown_total if done else shown_done,
+            label=str(pp.get("label") or "Artifact inventory"),
+        )
+        note_operation(
+            db,
+            job_id,
+            "inventory",
+            str(pp.get("label") or "Artifact inventory")[:300],
+            timeout_seconds=900,
+            advanced=True,
+        )
     execute(
         db,
         """UPDATE jobs SET status=:st, progress_pct=:pct,
@@ -1322,6 +1345,9 @@ def _run_axiom_artifact_inventory_impl(
                 else:
                     stage = "census_start"
                 ui_pct = inventory_ui_pct_for(stage=stage)
+                files_found = int((meta or {}).get("files_found") or 0)
+                if files_found and ("walk" in msg_l or "files found" in msg_l or "tsk" in msg_l):
+                    ui_pct = min(9, 2 + min(7, files_found // 20000))
                 ui_done = max(1, min(total - 1, int(total * ui_pct / 100))) if total > 1 else 1
                 write_disk_log(
                     db,

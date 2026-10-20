@@ -1015,9 +1015,9 @@ def compute_all_aligned_count_results(
     except Exception:
         art_n = 0
     if art_n >= 100_000:
-        worker_n = min(worker_n, 2)
+        worker_n = min(worker_n, 8)
     else:
-        worker_n = min(worker_n, 4)
+        worker_n = min(worker_n, 8)
 
     if rows is not None:
         ax_rows = [

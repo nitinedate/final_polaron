@@ -4,6 +4,14 @@ from app.db.sql_helpers import fetchone
 
 def assert_no_active_producers(db, job_id, *, exclude_stage=None):
     from app.services.forensic_serial_pipeline import StageWaiting
+    try:
+        from app.services.safe_parallel import reap_stale_sidecars
+        reap_stale_sidecars(db)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
     if (fetchone(db, "SELECT to_regclass('pipeline_sidecar_runs') AS t") or {}).get('t'):
         row = fetchone(db, """SELECT count(*) AS c FROM pipeline_sidecar_runs
             WHERE job_id=:jid AND status IN ('queued','running')""", {'jid':job_id}) or {}

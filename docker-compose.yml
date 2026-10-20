@@ -674,7 +674,8 @@ services:
       <<: *worker-env
       OCR_ENABLED: "true"
       OCR_ENGINE: tesseract
-      OCR_DEVICE: cuda
+      OCR_PREFER_FAST: "1"
+      OCR_DEVICE: cpu
       OCR_GPU_ONLY: "true"
       OCR_PARALLEL_BUCKETS: "0"
       OCR_CPU_WORKERS: ${OCR_CPU_WORKERS:-8}

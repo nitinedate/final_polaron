@@ -23,8 +23,21 @@ def stage_rows(active='chunk', status='running', **counts):
         result.append(row)
     return result
 
+def test_inventory_card_uses_the_filesystem_walk_percent():
+    rows = stage_rows(active="inventory", status="running", total_items=0, completed_items=0)
+    next(row for row in rows if row["stage"] == "inventory")["operation"] = "Extension census from registered files — 257,583 files"
+    snap = pipeline.snapshot_from_rows(
+        rows,
+        {"phase": "inventory", "inventory_ui_pct": 3, "total": 0, "completed": 0},
+    )
+    card = next(stage for stage in snap["stages"] if stage["id"] == "inventory")
+    assert card["pct"] == 3
+    assert card["process_status"] == "in process"
+    assert "257,583" in card["operation"]
+
+
 @pytest.mark.parametrize('state,label',[('running','writing in'),('failed','failed'),('queued','next'),('waiting','writing in'),('done','completed')])
-def test_process_status_mapping(state,label):
+def test_process_status_mapping(state, label):
     snap=pipeline.snapshot_from_rows(stage_rows(status=state,total_items=10,completed_items=10))
     card=next(x for x in snap['stages'] if x['id']=='chunk')
     assert card['process_status']==label
@@ -59,6 +72,17 @@ def test_ocr_sidecar_bucket_empty_is_not_sealed():
 def test_counter_mismatch_cannot_seal(done,total):
     with pytest.raises(pipeline.StageWaiting):
         stages.validate_stage_barrier(object(),'job','recovery',{'total':total,'completed':done},stage_run_id='stage')
+
+
+def test_stale_sidecar_reaper_releases_only_expired_claims():
+    import inspect
+    from app.services.safe_parallel import reap_stale_sidecars
+
+    source = inspect.getsource(reap_stale_sidecars)
+    assert "status IN ('queued','running')" in source
+    assert "heartbeat_at" in source
+    assert "status='pending'" in source
+    assert "reap_stale_sidecars" in inspect.getsource(completion.assert_no_active_producers)
 
 
 def test_sidecars_block_completion(monkeypatch):

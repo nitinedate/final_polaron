@@ -1347,14 +1347,9 @@ def ocr_bytes(
 def selected_ocr_engine() -> str:
     """Tesseract is the common OCR engine for disk and mobile.
 
-    A worker marked GPU-only with OCR_DEVICE=cuda runs GLM on CUDA. Tesseract
-    does not use the GPU, so that combination must not hide the card.
-    GLM otherwise remains available when OCR_ENGINE=glm-ocr and OCR_PREFER_FAST=0.
+    The GPU worker uses Tesseract. It is the fast engine. GLM stays available
+    only when OCR_ENGINE=glm-ocr and OCR_PREFER_FAST=0.
     """
-    device = (os.environ.get("OCR_DEVICE") or getattr(get_settings(), "ocr_device", "") or "").strip().lower()
-    gpu_only = (os.environ.get("OCR_GPU_ONLY") or "").strip().lower() in {"1", "true", "yes"}
-    if device in {"cuda", "gpu"} and gpu_only:
-        return "glm-ocr"
     requested = (os.environ.get("OCR_ENGINE") or getattr(get_settings(), "ocr_engine", "") or "glm-ocr").strip().lower()
     if requested in {"tesseract", "fast"}:
         return "tesseract"
@@ -2122,9 +2117,13 @@ def run_ocr_for_job(
         db,
         job_id,
         label=(
-            f"GPU OCR — {len(rows)} document(s) on CUDA"
-            if gpu or gpu_only
-            else f"CPU OCR — {len(rows)} document(s)"
+            f"OCR — Tesseract {len(rows)} document(s)"
+            if fast_engine
+            else (
+                f"GPU OCR — {len(rows)} document(s) on CUDA"
+                if gpu or gpu_only
+                else f"CPU OCR — {len(rows)} document(s)"
+            )
         ),
     )
     db.commit()

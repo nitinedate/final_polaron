@@ -287,12 +287,17 @@ def snapshot_from_rows(rows: list[dict], progress: dict | None = None) -> dict:
                 completed = max(completed, int(details.get("parallel_completed") or 0))
         if active and row["stage"] == active["stage"] and status == "running":
             aliases = {
-                "inventory": {"artifact_inventory", "axiom_artifacts"},
+                "inventory": {"artifact_inventory", "axiom_artifacts", "inventory"},
                 "media_review": {"media_review"},
             }
             if progress.get("phase") in aliases.get(row["stage"], {row["stage"]}):
                 total = max(total, int(progress.get("total") or 0))
                 completed = max(completed, int(progress.get("completed") or 0))
+            if row["stage"] == "inventory" and total <= 0:
+                ui = int(progress.get("inventory_ui_pct") or 0)
+                if ui > 0:
+                    total = 100
+                    completed = max(completed, min(99, ui))
         total, completed = _evidence_file_counts(row, total, completed)
         # Mobile bundle rows are the same extracted files. Adding them to the
         # skip/parse counters made the card show more items than were extracted.
@@ -321,7 +326,7 @@ def snapshot_from_rows(rows: list[dict], progress: dict | None = None) -> dict:
                     "writing in" if display_status in {"running", "waiting"} and (
                         completed + failed + skipped >= total > 0 or
                         details.get("progress_agent_reconciliation") or
-                        (display_status == "running" and row["stage"] in {"materialize", "inventory", "chunk", "enrichment", "graph", "validation"}) or
+                        (display_status == "running" and row["stage"] in {"materialize", "chunk", "enrichment", "graph", "validation"}) or
                         str(row.get("error") or "").startswith("Writing in:")
                     ) else "in process" if display_status == "running" else
                     "next" if active and row["stage"] == active["stage"] and display_status in {"queued", "pending"} else "wait"
@@ -333,6 +338,8 @@ def snapshot_from_rows(rows: list[dict], progress: dict | None = None) -> dict:
                 "skipped": skipped,
                 "attempt": int(row.get("attempt") or 0),
                 "error": row.get("error"),
+                "operation": row.get("operation"),
+                "heartbeat_at": str(row["heartbeat_at"]) if row.get("heartbeat_at") else None,
                 "details": details,
                 "started_at": str(row["started_at"]) if row.get("started_at") else None,
                 "completed_at": str(row["completed_at"])

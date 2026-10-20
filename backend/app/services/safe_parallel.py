@@ -43,6 +43,44 @@ def claim_sidecar(db,job_id,sidecar,*,details=None):
     return str(claimed['task_id']) if claimed else None
 
 
+def reap_stale_sidecars(db, *, stale_seconds: int | None = None) -> int:
+    """Release sidecar claims whose owner stopped heartbeating.
+
+    A killed worker leaves the row queued or running. Inventory then waits on
+    that corpse and the progress agent restarts the stage every minute. A live
+    sidecar pulses heartbeat_at from its own connection, including during a
+    long query, so only a dead owner is released.
+    """
+    raw = stale_seconds if stale_seconds is not None else os.environ.get("SIDECAR_STALE_SECONDS", "90")
+    try:
+        seconds = max(60, min(int(raw), 600))
+    except (TypeError, ValueError):
+        seconds = 90
+    try:
+        row = fetchone(
+            db,
+            """WITH stale AS (
+                   UPDATE pipeline_sidecar_runs
+                   SET status='pending', task_id=NULL, heartbeat_at=NULL, updated_at=NOW(),
+                       details=coalesce(details,'{}'::jsonb)
+                           || jsonb_build_object('reaped','stale heartbeat')
+                   WHERE status IN ('queued','running')
+                     AND coalesce(heartbeat_at, updated_at) < NOW() - (:secs * interval '1 second')
+                   RETURNING 1
+               )
+               SELECT count(*)::int AS c FROM stale""",
+            {"secs": seconds},
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+    return int((row or {}).get("c") or 0)
+
+
 def finish_sidecar(db,job_id,sidecar,task_id,*,status='done',details=None):
     execute(db,"""UPDATE pipeline_sidecar_runs SET status=:st,heartbeat_at=NOW(),updated_at=NOW(),details=coalesce(details,'{}'::jsonb)||CAST(:d AS jsonb)
       WHERE job_id=:jid AND sidecar=:s AND task_id=:tid""",{'st':status,'jid':job_id,'s':sidecar,'tid':task_id,'d':json.dumps(details or {})});db.commit()
@@ -228,4 +266,26 @@ def sidecar_execution(db, job_id, sidecar, task_id, *, schema_name):
             WHERE job_id=:jid AND sidecar=:sidecar AND task_id=:tid""",
             {'jid':job_id,'sidecar':sidecar,'tid':task_id})
         db.commit()
-        yield True
+        import threading
+        stop = threading.Event()
+
+        def _pulse() -> None:
+            while not stop.wait(20):
+                try:
+                    from app.db.session import firm_session
+                    with firm_session(schema_name) as beat:
+                        execute(beat, """UPDATE pipeline_sidecar_runs
+                            SET heartbeat_at=NOW(), updated_at=NOW()
+                            WHERE job_id=:jid AND sidecar=:sidecar AND task_id=:tid
+                              AND status='running'""",
+                            {'jid':job_id,'sidecar':sidecar,'tid':task_id})
+                        beat.commit()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_pulse, name=f"sidecar-heartbeat-{sidecar}", daemon=True).start()
+        try:
+            yield True
+        finally:
+            stop.set()
+        return

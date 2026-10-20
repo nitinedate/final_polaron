@@ -90,6 +90,9 @@ export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
           {stage.total > 0 && <span className="tabular-nums">{Math.min(stage.total, stage.completed + stage.failed + stage.skipped).toLocaleString()} / {stage.total.toLocaleString()} items</span>}
         </div>
         {timeTaken(stage) && <p className="mt-1 text-[11px] tabular-nums text-ink-600">{stage.status === "running" ? "Elapsed" : "Time taken"}: {timeTaken(stage)}</p>}
+        {stage.status === "running" && stage.operation ? (
+          <p className="mt-2 rounded-md bg-white/80 px-2 py-1.5 text-[11px] leading-snug text-ink-800">Now: {stage.operation}</p>
+        ) : null}
         {stage.status === "running" ? <StageLiveMeter stage={stage} /> : null}
         {stage.id === "extract" && stage.details?.files_uploaded !== undefined && stage.status === "running" ? (
           <p className="mt-2 text-[11px] text-ink-700">

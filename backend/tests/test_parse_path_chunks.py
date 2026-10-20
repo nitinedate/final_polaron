@@ -40,6 +40,7 @@ def test_retryable_db_errors():
     assert is_retryable_db_error(RuntimeError("server closed the connection unexpectedly"))
     assert is_retryable_db_error(RuntimeError("deadlock detected"))
     assert is_retryable_db_error(RuntimeError("current transaction is aborted, commands ignored"))
+    assert is_retryable_db_error(RuntimeError("canceling statement due to user request"))
     assert not is_retryable_db_error(ValueError("path not found"))
 
 

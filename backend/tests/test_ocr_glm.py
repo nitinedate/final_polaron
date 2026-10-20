@@ -53,6 +53,14 @@ def test_installed_tesseract_replaces_slow_glm(monkeypatch) -> None:
     assert ocr_gpu.selected_ocr_engine() == "tesseract"
 
 
+def test_gpu_worker_env_uses_fast_tesseract(monkeypatch) -> None:
+    monkeypatch.setenv("OCR_ENGINE", "tesseract")
+    monkeypatch.setenv("OCR_PREFER_FAST", "1")
+    monkeypatch.setenv("OCR_DEVICE", "cpu")
+    monkeypatch.setattr(ocr_gpu.shutil, "which", lambda name: "/usr/bin/tesseract" if name == "tesseract" else None)
+    assert ocr_gpu.selected_ocr_engine() == "tesseract"
+
+
 def test_glm_remains_when_fast_ocr_is_turned_off(monkeypatch) -> None:
     monkeypatch.setenv("OCR_ENGINE", "glm-ocr")
     monkeypatch.setenv("OCR_PREFER_FAST", "0")

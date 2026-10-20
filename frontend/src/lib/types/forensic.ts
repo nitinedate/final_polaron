@@ -89,6 +89,8 @@ export interface PipelineProgress {
       skipped: number;
       attempt: number;
       error: string | null;
+      operation?: string | null;
+      heartbeat_at?: string | null;
       details?: Record<string, unknown>;
       started_at?: string | null;
       completed_at?: string | null;

@@ -31,6 +31,25 @@ def test_ensure_returns_cached_without_walk() -> None:
     assert result["media_disk_inventory"]["picture"] == 10
 
 
+def test_registered_files_skip_the_image_walk() -> None:
+    db = MagicMock()
+    census = {
+        "document_disk_inventory": {"by_ext_key": {".pdf": 2}, "enumerated_files": 257583, "source": "job_artifacts"},
+        "media_disk_inventory": {"picture": 9, "audio": 1, "video": 2, "photoshop": 0, "enumerated_files": 257583, "source": "job_artifacts"},
+        "lnk_disk_count": 4,
+    }
+    with patch("app.services.disk_ext_census._load_disk_source", return_value={}), patch(
+        "app.services.disk_ext_census._save_disk_source"
+    ) as save, patch(
+        "app.services.disk_ext_census._registered_file_census", return_value=census
+    ), patch("app.services.virtual_disk.open_virtual_disk") as open_vd:
+        result = ensure_disk_extension_censuses(db, "job-1")
+    open_vd.assert_not_called()
+    save.assert_called_once()
+    assert result["document_disk_inventory"]["enumerated_files"] == 257583
+    assert result["lnk_disk_count"] == 4
+
+
 def test_ensure_one_walk_fills_doc_media_lnk() -> None:
     db = MagicMock()
     nodes = [

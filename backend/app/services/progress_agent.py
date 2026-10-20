@@ -766,6 +766,8 @@ def supervise_progress(db, *, schema_name):
     ensure_progress_schema(db);db.commit()
     try:
         release_blocking_index_waits(db)
+        from app.services.safe_parallel import reap_stale_sidecars
+        reap_stale_sidecars(db)
     except Exception:
         log.exception("progressAgent could not clear a lock-waiting index build")
         try:
