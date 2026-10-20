@@ -7,9 +7,11 @@ accumulate per-catalog-artifact counts in a compact dict.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
+import time
 from typing import Any, Callable
 
 from sqlalchemy import text
@@ -71,6 +73,63 @@ def get_fallback_path_count(job_id: str, artifact_id: str) -> int | None:
         return int(m.get(str(artifact_id), 0))
 
 
+def _load_persisted_path_counts(db, job_id: str, rows: list[dict[str, Any]]) -> dict[str, int] | None:
+    """Reuse a finished index after the stage process is replaced."""
+    try:
+        row = db.execute(
+            text("SELECT disk_source FROM jobs WHERE id=:j"),
+            {"j": job_id},
+        ).mappings().first()
+    except Exception:
+        return None
+    raw = row.get("disk_source") if row else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    saved = raw.get("inventory_path_counts") if isinstance(raw, dict) else None
+    if not isinstance(saved, dict):
+        return None
+    counts = saved.get("counts")
+    if not isinstance(counts, dict) or int(saved.get("files") or 0) <= 0:
+        return None
+    wanted = {str(item.get("artifact_id") or "") for item in rows if item.get("artifact_id")}
+    if not wanted or not wanted.issubset(counts):
+        return None
+    loaded = {aid: int(counts.get(aid) or 0) for aid in wanted}
+    loaded["_files"] = int(saved.get("files") or 0)
+    return loaded
+
+
+def _save_persisted_path_counts(db, job_id: str, counts: dict[str, int], files: int) -> None:
+    if files <= 0:
+        return
+    payload = json.dumps({"files": int(files), "counts": {k: int(v) for k, v in counts.items()}})
+    try:
+        db.execute(
+            text(
+                """UPDATE jobs
+                   SET disk_source=jsonb_set(
+                       COALESCE(disk_source::jsonb, '{}'::jsonb),
+                       '{inventory_path_counts}',
+                       CAST(:payload AS jsonb),
+                       true
+                   ),
+                   updated_at=NOW()
+                   WHERE id=:j"""
+            ),
+            {"j": job_id, "payload": payload},
+        )
+        db.commit()
+    except Exception:
+        log.warning("could not persist path index job=%s", job_id, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 def seed_fallback_path_counts(job_id: str, rows: list[dict[str, Any]] | None = None) -> dict[str, int]:
     """Mark path index ready with zeros — used by mobile jobs that skip Windows path-token scan."""
     counts: dict[str, int] = {}
@@ -97,6 +156,18 @@ def ensure_fallback_path_counts(
     Memory stays O(catalog) (~hundreds of ints), never O(file count).
     """
     job_id = str(job_id)
+    persisted = _load_persisted_path_counts(db, job_id, rows)
+    if persisted is not None:
+        with _lock:
+            _FALLBACK_COUNTS[job_id] = {k: v for k, v in persisted.items() if k != "_files"}
+            _BUILDING.discard(job_id)
+        if progress_cb:
+            progress_cb(
+                f"Path index reused ({int(persisted.get('_files') or 0):,} files)",
+                0,
+                1,
+            )
+        return {k: v for k, v in persisted.items() if k != "_files"}
     # Wait briefly if another thread is building — never treat "building" as empty index.
     for _ in range(600):  # up to ~60s
         with _lock:
@@ -141,6 +212,7 @@ def ensure_fallback_path_counts(
 
     all_tokens = list(token_to_aids.keys())
     scanned = 0
+    last_progress = time.monotonic()
     # Batch tokens into compiled regexes — O(files × batches) instead of O(files × tokens).
     token_batches: list[tuple[re.Pattern[str], list[str]]] = []
     batch_size = 40
@@ -184,7 +256,9 @@ def ensure_fallback_path_counts(
                 continue
 
             scanned += 1
-            if progress_cb and scanned % 25000 == 0:
+            now = time.monotonic()
+            if progress_cb and (scanned % 25000 == 0 or now - last_progress >= 15):
+                last_progress = now
                 progress_cb(f"Streaming path index ({scanned:,} files)", scanned, max(scanned, 1))
 
             # AND semantics: every artifact token must appear in the path.
@@ -234,6 +308,7 @@ def ensure_fallback_path_counts(
     with _lock:
         _BUILDING.discard(job_id)
         _FALLBACK_COUNTS[job_id] = counts
+    _save_persisted_path_counts(db, job_id, counts, scanned)
     return counts
 
 

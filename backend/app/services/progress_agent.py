@@ -20,6 +20,9 @@ ITEM_STALL_SECONDS = 90
 # After a declared operation's deadline, one short grace, then restart the owner.
 LIVELOCK_AFTER_DEADLINE_SECONDS = 90
 MAX_RECOVERY_ATTEMPTS = 3
+# A bounded inventory prewarm is not a per-item catalog counter.
+# Longer than the generic 90-second progress threshold, but never unlimited.
+INVENTORY_PREWARM_GRACE_SECONDS = max(600, min(3600, int(os.getenv("FORENSIC_INVENTORY_PREWARM_GRACE_SECONDS", "1800"))))
 _SCHEMA_READY = set()
 _QUEUE_STATE = (0, None)
 PROGRESS_AGENT = {
@@ -159,6 +162,33 @@ def classify_stage(job, stage, *, now=None):
             return "valid_wait", f"Bounded operation in progress: {stage.get('operation') or stage['stage']}"
         # The operation deadline used to hide this. A child blocked on a file
         # mount keeps its heartbeat and its deadline while the item count is frozen.
+        # Inventory counts a few dozen catalog rows. A live path index or
+        # catalog count can sit on one row for longer than a minute while the
+        # heartbeat stays fresh. Restarting that child throws away the index.
+        if (
+            str(stage.get("stage") or "") == "inventory"
+            and total_items > 0
+            and not startup
+            and _age(stage.get("heartbeat_at"), now) < CHECK_AFTER_SECONDS
+            and progress_age < 600
+        ):
+            return "valid_wait", f"Inventory is writing: {operation or stage['stage']}"
+        # Prewarm consists of path indexing, unallocated signature carving and
+        # optional URL cache construction. It may not commit a *catalog item*
+        # until the entire operation returns. Restarting it after 90 seconds
+        # repeatedly throws away minutes of verified work (observed in logs).
+        # An existing live heartbeat justifies bounded grace, never success.
+        if (
+            str(stage.get("stage") or "") == "inventory"
+            and not startup
+            and any(token in operation.lower() for token in (
+                "carv", "prewarm", "path index", "counting catalog",
+                "url inventory", "encryption warm", "census",
+            ))
+            and progress_age < INVENTORY_PREWARM_GRACE_SECONDS
+            and _age(stage.get("heartbeat_at"), now) < CHECK_AFTER_SECONDS
+        ):
+            return "valid_wait", f"Active bounded inventory operation: {operation}"
         if progress_age >= ITEM_STALL_SECONDS:
             if _age(stage.get("heartbeat_at"), now) >= CHECK_AFTER_SECONDS:
                 return "recover", "No evidence item committed and the stage heartbeat is stale"

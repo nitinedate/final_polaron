@@ -1,33 +1,14 @@
-# OCR worker queue blockage: focused monitoring correction
+# Inventory restarting during signature carving — targeted fix
 
-## Observed case
-Screenshot shows first six stages complete, OCR queued 0/5, and `No responding consumer for ocr`. The source routes forensic OCR to queue `ocr`; `worker-ocr-gpu` is configured as its consumer.
+Root cause in supplied archive: `progress_agent.classify_stage` cancels a running stage after 90 seconds without committed **catalog items**. Signature carving can legitimately take >10 minutes before it commits any catalog count. Logs show a repeat path-index scan after the earlier carve was canceled.
 
-## Changes
-- `progress_agent.queue_delivery_state()` differentiates confirmed missing queue consumer (`blocked`) from broker inspection unavailable (`valid_wait`, not a false absence).
-- Provides worker name, queue name and corrective hints; does not drop/revoke queued tasks, mutate manifests, re-extract or mark OCR complete.
-- No change to the one-authoritative-stage-per-job invariant. Existing parallel sidecars are retained.
+This patch gives a **live** inventory-prewarm operation up to 1800 seconds of grace (configurable by `FORENSIC_INVENTORY_PREWARM_GRACE_SECONDS`, constrained to 600–3600 seconds), as long as its heartbeat is fresh. It does not mark any work complete, disable stuck-worker recovery, or relax parse/OCR stages. After grace expires, the existing cancellation/recovery logic applies. This addresses the demonstrated restart loop, not all other runtime performance issues.
 
-## On Windows host (from repository root)
-```powershell
-docker compose config --services | Select-String 'redis|worker-ocr-gpu|worker-progress'
-docker compose ps redis worker-ocr-gpu worker-progress
-docker compose logs --tail 150 worker-ocr-gpu
-docker compose exec worker-progress celery -A app.celery_app.celery inspect active_queues
-```
+## Install
+Replace `backend/app/services/progress_agent.py` and redeploy the process-agent / progress worker image, taking care not to restart a currently active evidence extraction. Back up first. Run `python tests/test_inventory_preparation_liveness.py`.
 
-If `worker-ocr-gpu` is stopped or missing:
-```powershell
-docker compose up -d --no-deps worker-ocr-gpu
-```
-
-If the worker fails due to CUDA/NVIDIA configuration, repair GPU runtime and re-create the OCR worker; do not delete messages. Its compose currently requests `gpus: all` even when OCR_ENGINE=tesseract. A CPU Tesseract profile is possible, but not automatically activated by this patch.
-
-## Deployment
-The patch is source code. Deploy it in the forensic progress-agent's `/app` code and restart ONLY the progress worker after verifying appropriate compose service names. The OCR worker itself still must be made healthy before OCR will execute. Check broker connectivity, correct broker URL, and that Celery tasks are registered.
-
-## Parallelism
-`safe_parallel.py` already schedules parse shard, OCR, prechunk, leakage, graph-file sidecars using resource-aware claims. Do not relax the unique active authoritative-stage index; overlap independently claimed, committed artifact partitions instead. RAG finalization must await OCR/media result barriers.
-
-## Validation
-`python -m py_compile` passed; three focused unit checks passed. No Docker/GPU/MinIO live-run validation possible in this environment.
+## Important
+- The requested one-hour **whole-case** SLA cannot be guaranteed based only on this code: time depends on bytes read, filesystem defects, MinIO speed, disk/media throughput, decoder costs, graph writes and hardware.
+- Never use an elapsed-time threshold to set 100% unless every item is terminal or explicitly excluded with an auditable coverage limitation. Otherwise the case is incomplete.
+- Existing carving can still consume substantial time; profile `_scan_unallocated` and catalog counters, cache completed results, and consider optional *explicit* post-processing sidecars only after coverage requirements are agreed.
+- Production integration and load tests were not available; run database/worker integration and a >30-minute carving workload before declaring production-ready.

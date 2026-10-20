@@ -42,6 +42,8 @@ def stage(**overrides):
     (stage(operation_deadline=NOW-timedelta(seconds=1)),'valid_wait'),
     (stage(progress_at=NOW-timedelta(seconds=181), operation='media_review: bounded evidence operation', operation_deadline=NOW+timedelta(seconds=600), total_items=0, completed_items=0), 'cancel'),
     (stage(progress_at=NOW-timedelta(seconds=120), operation='Tesseract image/video text', operation_deadline=NOW+timedelta(seconds=600), total_items=1000, completed_items=10), 'cancel'),
+    (stage(stage='inventory', progress_at=NOW-timedelta(seconds=120), operation='Streaming path index (250,000 files)', operation_deadline=NOW+timedelta(seconds=600), total_items=36, completed_items=5), 'valid_wait'),
+    (stage(stage='inventory', progress_at=NOW-timedelta(seconds=700), operation='Streaming path index (250,000 files)', heartbeat_at=NOW-timedelta(seconds=2), total_items=36, completed_items=5), 'cancel'),
     (stage(operation_deadline=NOW-timedelta(seconds=120), operation='Counting image and video files', total_items=10, completed_items=0), 'cancel'),
     (stage(operation_deadline=NOW-timedelta(seconds=120), operation='Frame evidence persisted', total_items=10, completed_items=10), 'valid_wait'),
     (stage(status='queued',updated_at=NOW-timedelta(seconds=59)),'valid_wait'),
