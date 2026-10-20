@@ -283,7 +283,15 @@ export function BrowseFolderDialog({
   }
 
   function addFolder(next: StagedEvidenceFolder) {
-    setFolders([next]);
+    const normalized = (next.hostPath || next.name).replace(/[\\/]+$/, "").toLowerCase();
+    const existing = folders.find((folder) =>
+      (folder.hostPath || folder.name).replace(/[\\/]+$/, "").toLowerCase() === normalized
+    );
+    if (existing) {
+      setActiveFolderId(existing.id);
+      return;
+    }
+    setFolders((previous) => [...previous, next]);
     setActiveFolderId(next.id);
   }
 
@@ -309,7 +317,7 @@ export function BrowseFolderDialog({
 
   function removeFolder(id: string) {
     setFolders((prev) => prev.filter((f) => f.id !== id));
-    if (activeFolderId === id) setActiveFolderId(null);
+    if (activeFolderId === id) setActiveFolderId(folders.find((folder) => folder.id !== id)?.id || null);
   }
 
   const activeFolder = folders.find((f) => f.id === activeFolderId) || folders[0] || null;
@@ -327,7 +335,7 @@ export function BrowseFolderDialog({
         <>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
           <Button variant="brand" disabled={!folders.length} onClick={() => onConfirm(folders)}>
-            Start extraction
+            Start extraction ({folders.length} {folders.length === 1 ? "directory" : "directories"})
           </Button>
         </>
       }
@@ -492,7 +500,20 @@ export function BrowseFolderDialog({
         </div>
 
         <div className="space-y-3 rounded-xl border border-ink-300 bg-gradient-to-b from-white to-brand-50/40 p-3 shadow-panel">
-          <p className="text-xs font-semibold uppercase tracking-wide text-ink-500">Selected directory</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-ink-500">Selected directories ({folders.length})</p>
+          {folders.length > 0 ? (
+            <div className="max-h-40 space-y-1 overflow-y-auto" role="list" aria-label="Selected evidence directories">
+              {folders.map((folder, index) => (
+                <div key={folder.id} role="listitem" className={`flex items-center gap-2 rounded-lg border px-2 py-1.5 ${activeFolder?.id === folder.id ? "border-brand-400 bg-brand-50" : "border-ink-200 bg-white"}`}>
+                  <button type="button" className="min-w-0 flex-1 text-left" onClick={() => setActiveFolderId(folder.id)} aria-pressed={activeFolder?.id === folder.id}>
+                    <p className="truncate text-xs font-semibold">{index + 1}. {folder.name}</p>
+                    <p className="truncate font-mono text-[10px] text-ink-500">{folder.hostPath} · {folder.files.filter((file) => file.isSegment).length} evidence segments</p>
+                  </button>
+                  <button type="button" onClick={() => removeFolder(folder.id)} className="rounded p-1 text-ink-400 hover:text-red-600" aria-label={`Remove ${folder.name}`}><X className="h-4 w-4" /></button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {!activeFolder ? (
             <div className="rounded-lg border border-dashed border-ink-300 bg-white px-4 py-6 text-center text-sm text-ink-500">
               Select a drive, open the required directory, then click <strong>Use this directory</strong>.
@@ -501,7 +522,7 @@ export function BrowseFolderDialog({
             <>
               <div className="flex items-center justify-between gap-3 rounded-lg border border-brand-200 bg-brand-50/70 px-3 py-2">
                 <div className="min-w-0">
-                  <p className="truncate font-semibold text-brand-900">{activeFolder.name}</p>
+                  <p className="truncate font-semibold text-brand-900">Preview: {activeFolder.name}</p>
                   <p className="truncate font-mono text-[11px] text-brand-800">{activeFolder.hostPath}</p>
                 </div>
                 <button type="button" onClick={() => removeFolder(activeFolder.id)} className="rounded p-1 text-ink-400 hover:bg-white hover:text-red-600" aria-label="Remove selected directory">

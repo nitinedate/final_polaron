@@ -6,8 +6,11 @@ from app.services import forensic_media_review as review
 
 
 def test_media_review_defaults_to_eight_workers(monkeypatch):
-    monkeypatch.delenv("FORENSIC_MEDIA_REVIEW_WORKERS", raising=False)
+    monkeypatch.delenv("MEDIA_REVIEW_WORKERS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 10)
     assert review.media_review_workers() == 8
+    monkeypatch.setattr("os.cpu_count", lambda: 24)
+    assert review.media_review_workers() == 16
 
 
 def test_media_cuda_stays_on_unless_cpu_is_requested(monkeypatch):

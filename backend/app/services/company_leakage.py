@@ -101,9 +101,33 @@ def ensure_company_leakage_schema(db) -> None:
         UNIQUE(job_id, job_artifact_id)
     )""")
     # Index DDL is an optimization, never a prerequisite to scanning evidence.
-    # A database cancellation/lock timeout must not fail the leakage sidecar.
-    # SAVEPOINTs ensure a canceled statement does not poison the outer transaction.
+    # CREATE INDEX IF NOT EXISTS still waits on ShareLock when the index already
+    # exists, and that waiter blocks later inserts. Skip a present index, and
+    # give up quickly when a writer (for example a case delete) holds the table.
     import logging
+    have = {
+        str(row.get("relname") or "")
+        for row in fetchall(
+            db,
+            """SELECT c.relname FROM pg_class c
+               JOIN pg_namespace n ON n.oid=c.relnamespace
+               WHERE n.nspname=current_schema() AND c.relkind='i'""",
+        )
+    }
+    def _ensure_index(sql: str) -> None:
+        name = sql.split("EXISTS", 1)[-1].strip().split()[0]
+        if name in have:
+            return
+        try:
+            with db.begin_nested():
+                execute(db, "SET LOCAL lock_timeout = '8s'")
+                execute(db, sql)
+                execute(db, "SET LOCAL lock_timeout = '0'")
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Deferring optional company-leakage index build: %s (%s)", sql, exc
+            )
+
     for sql in (
         "CREATE INDEX IF NOT EXISTS ix_company_leak_job_risk ON company_leakage_evidence(job_id, risk_score DESC, id)",
         "CREATE INDEX IF NOT EXISTS ix_company_leak_job_channel ON company_leakage_evidence(job_id, channel, risk_score DESC)",
@@ -112,25 +136,12 @@ def ensure_company_leakage_schema(db) -> None:
         "CREATE INDEX IF NOT EXISTS ix_company_leak_categories_gin ON company_leakage_evidence USING gin(categories)",
         "CREATE INDEX IF NOT EXISTS ix_company_leak_terms_gin ON company_leakage_evidence USING gin(matched_terms)",
         "CREATE INDEX IF NOT EXISTS ix_company_leak_scan_job ON company_leakage_scan_state(job_id, checked_at, job_artifact_id)",
-    ):
-        try:
-            with db.begin_nested():
-                execute(db, sql)
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "Deferring optional company-leakage index build: %s (%s)", sql, exc
-            )
-    # pg_trgm is part of the Polaron PostgreSQL baseline.  These make examiner
-    # searches inside the new leakage artifact family responsive even at scale.
-    for sql in (
+        # pg_trgm is part of the Polaron PostgreSQL baseline.  These make examiner
+        # searches inside the new leakage artifact family responsive even at scale.
         "CREATE INDEX IF NOT EXISTS ix_company_leak_source_trgm ON company_leakage_evidence USING gin(source_path gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS ix_company_leak_excerpt_trgm ON company_leakage_evidence USING gin(excerpt gin_trgm_ops)",
     ):
-        try:
-            with db.begin_nested():
-                execute(db, sql)
-        except Exception as exc:
-            logging.getLogger(__name__).warning("Deferring optional trigram index: %s (%s)", sql, exc)
+        _ensure_index(sql)
 
 
 def _company_terms(db) -> list[str]:

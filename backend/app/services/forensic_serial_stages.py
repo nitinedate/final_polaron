@@ -143,26 +143,29 @@ def _materialize_full(db, job_id):
     entries = prepare_extracted_members(load_index_entries(manifest), manifest)
     expected = len(entries)
     extracted_count = int(row.get("files_extracted") or 0)
-    manifest_gap = max(0, extracted_count - expected)
-    # A small count discrepancy must not block the entire case.  It remains an
-    # explicit, queryable coverage limitation; no absent file is considered parsed.
-    # Larger disagreements still indicate a possibly incomplete/corrupt manifest.
-    allowed_gap = min(100, max(1, int(extracted_count * 0.001)))
-    if manifest_gap > allowed_gap:
-        raise RuntimeError(
-            f"Extracted manifest accounts for {expected:,} / {extracted_count:,} extracted files "
-            f"(gap {manifest_gap:,} exceeds allowance {allowed_gap:,}); "
-            "manual extraction reconciliation required"
-        )
+    # The manifest is authoritative for what can actually be registered. A
+    # progress counter is NOT proof that its item has a committed index entry.
+    # Do not discard registered evidence, and do not force another disk extraction
+    # because a progress counter and the committed manifest disagree.
+    manifest_gap = extracted_count - expected
     if manifest_gap:
+        direction = "missing_manifest_entries" if manifest_gap > 0 else "manifest_exceeds_progress"
         execute(db, """UPDATE jobs SET metadata=coalesce(metadata,'{}'::jsonb) ||
                 jsonb_build_object('materialize_manifest_gap', :gap,
                                   'materialize_manifest_entries', :entries,
                                   'materialize_extraction_reported', :reported,
-                                  'materialize_coverage_limited', true),
+                                  'materialize_coverage_limited', true,
+                                  'materialize_reconciliation_status', :direction),
                 updated_at=NOW() WHERE id=:jid""",
                 {"jid": job_id, "gap": manifest_gap, "entries": expected,
-                 "reported": extracted_count})
+                 "reported": extracted_count, "direction": direction})
+        execute(db, """UPDATE pipeline_stage_runs SET details=coalesce(details,'{}'::jsonb) ||
+            jsonb_build_object('manifest_count_gap', :gap, 'manifest_entries', :entries,
+                               'extraction_reported', :reported, 'coverage_limited', true,
+                               'reconciliation_status', :direction),
+            updated_at=NOW() WHERE job_id=:jid AND stage='materialize'""",
+            {"jid": job_id, "gap": manifest_gap, "entries": expected,
+             "reported": extracted_count, "direction": direction})
         db.commit()
     # Every extracted file enters inventory. Unsupported/no-text files are
     # explicit stage exceptions, never discarded by hash or path filters.
@@ -248,6 +251,8 @@ def _materialize_full(db, job_id):
         "total": expected + wa_total,
         "completed": expected + wa_total,
         "expected_files": expected,
+        "manifest_count_gap": manifest_gap,
+        "coverage_limited": bool(manifest_gap),
         "whatsapp_evidence_gate": whatsapp_gate,
         "whatsapp_decryption": whatsapp,
     }

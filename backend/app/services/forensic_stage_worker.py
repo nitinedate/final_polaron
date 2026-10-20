@@ -79,7 +79,10 @@ def _stop_owned_process(process):
                 process.kill()
         except ProcessLookupError:
             pass
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning('Stage process did not exit after kill; leaving it and continuing')
     if process.poll() is not None:
         for release,client,key,token in tokens:
             try:

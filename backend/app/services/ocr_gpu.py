@@ -13,7 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolE
 from pathlib import Path
 
 from app.config import get_settings
-from app.db.sql_helpers import execute, fetchall, fetchone
+from app.db.sql_helpers import execute, fetchall, fetchone, is_retryable_db_error
 from app.services.disk_build_log import write_disk_log
 
 log = logging.getLogger("ocr_gpu")
@@ -1347,8 +1347,14 @@ def ocr_bytes(
 def selected_ocr_engine() -> str:
     """Tesseract is the common OCR engine for disk and mobile.
 
-    GLM remains available only when OCR_ENGINE=glm-ocr and OCR_PREFER_FAST=0.
+    A worker marked GPU-only with OCR_DEVICE=cuda runs GLM on CUDA. Tesseract
+    does not use the GPU, so that combination must not hide the card.
+    GLM otherwise remains available when OCR_ENGINE=glm-ocr and OCR_PREFER_FAST=0.
     """
+    device = (os.environ.get("OCR_DEVICE") or getattr(get_settings(), "ocr_device", "") or "").strip().lower()
+    gpu_only = (os.environ.get("OCR_GPU_ONLY") or "").strip().lower() in {"1", "true", "yes"}
+    if device in {"cuda", "gpu"} and gpu_only:
+        return "glm-ocr"
     requested = (os.environ.get("OCR_ENGINE") or getattr(get_settings(), "ocr_engine", "") or "glm-ocr").strip().lower()
     if requested in {"tesseract", "fast"}:
         return "tesseract"
@@ -1502,48 +1508,76 @@ def park_pictures_for_evidence(db, job_id: str) -> int:
     return parked
 
 
-def skip_ocr_noise_pending(db, job_id: str) -> int:
-    """Skip cache/thumbs/OS vendor trees. Documents-only also drops camera rolls.
+def _update_ocr_in_claimed_batches(db, job_id: str, *, predicate: str, new_status: str,
+                                   batch_size: int = 250, max_batches: int = 100000) -> int:
+    """Short, deterministic OCR transitions without a job-wide UPDATE lock storm.
 
-    Image-evidence jobs keep every selected artifact (including tiny images).
-    OCR_DOCUMENTS_ONLY (default) keeps PDFs plus Documents/Downloads/Desktop
-    images so GLM is not spent on DCIM / Pictures / screenshots.
+    SKIP LOCKED lets parse/media writers finish their own transactions.  Rows
+    skipped because another transaction owns them will be revisited by the next
+    sweep; callers must not interpret this function's return as full coverage.
     """
+    import random
+    import time
+    from sqlalchemy import text
+
+    total = 0
+    for _ in range(max_batches):
+        for attempt in range(5):
+            try:
+                result = db.execute(text(f"""
+                    WITH claimed AS MATERIALIZED (
+                        SELECT id FROM job_artifacts
+                        WHERE job_id = :jid AND ocr_status='pending' AND ({predicate})
+                        ORDER BY id
+                        LIMIT :batch_size
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE job_artifacts AS artifact
+                    SET ocr_status=:status, updated_at=NOW()
+                    FROM claimed
+                    WHERE artifact.id=claimed.id
+                    RETURNING artifact.id
+                """), {"jid": job_id, "status": new_status, "batch_size": batch_size})
+                changed = len(result.fetchall())
+                # Release row locks before any GPU work or filesystem I/O.
+                db.commit()
+                total += changed
+                break
+            except Exception as exc:
+                db.rollback()
+                if not is_retryable_db_error(exc) or attempt == 4:
+                    raise
+                time.sleep(min(0.8, 0.05 * (2 ** attempt)) + random.uniform(0, 0.04))
+        if changed < batch_size:
+            break
+    else:
+        log.warning("OCR status batch safety limit reached job=%s status=%s", job_id, new_status)
+    return total
+
+
+def skip_ocr_noise_pending(db, job_id: str) -> int:
+    """Demote OCR-ineligible rows without locking every job artifact at once."""
     try:
         from app.services.rag_image_evidence import is_image_evidence_job
-
         if is_image_evidence_job(db, job_id):
             return 0
     except Exception:
-        pass
+        db.rollback()
+        # The image-evidence policy cannot be guessed if its lookup failed.
+        raise
 
-    demoted = execute(
-        db,
-        f"""UPDATE job_artifacts SET ocr_status='na', updated_at=NOW()
-            WHERE job_id=:jid AND ocr_status='pending'
-              AND NOT ({OCR_PENDING_CANDIDATE_SQL})""",
-        {"jid": job_id},
-    )
-    skipped = int(getattr(demoted, "rowcount", 0) or 0)
-    result = execute(
-        db,
-        f"""UPDATE job_artifacts SET ocr_status='skipped', updated_at=NOW()
-            WHERE job_id=:jid AND ocr_status='pending'
-              AND ({OCR_NOISE_SQL}) AND NOT ({OCR_QUALITY_BUCKET_SQL})""",
-        {"jid": job_id},
-    )
-    skipped += int(getattr(result, "rowcount", 0) or 0)
+    skipped = _update_ocr_in_claimed_batches(
+        db, job_id, predicate=f"NOT ({OCR_PENDING_CANDIDATE_SQL})", new_status="na")
+    skipped += _update_ocr_in_claimed_batches(
+        db, job_id,
+        predicate=f"({OCR_NOISE_SQL}) AND NOT ({OCR_QUALITY_BUCKET_SQL})",
+        new_status="skipped")
     if not forensic_photos_allowed():
-        extra = execute(
-            db,
-            f"""UPDATE job_artifacts SET ocr_status='skipped', updated_at=NOW()
-                WHERE job_id=:jid AND ocr_status='pending'
-                  AND lower(coalesce(extension, '')) <> '.pdf'
-                  AND NOT ({OCR_DOC_FOLDER_SQL})
-                  AND NOT ({OCR_QUALITY_BUCKET_SQL})""",
-            {"jid": job_id},
-        )
-        skipped += int(getattr(extra, "rowcount", 0) or 0)
+        skipped += _update_ocr_in_claimed_batches(
+            db, job_id,
+            predicate=f"lower(coalesce(extension, '')) <> '.pdf' "
+                      f"AND NOT ({OCR_DOC_FOLDER_SQL}) AND NOT ({OCR_QUALITY_BUCKET_SQL})",
+            new_status="skipped")
     return skipped
 
 
@@ -1556,6 +1590,42 @@ def _ocr_eligible_keep_sql() -> str:
     return f"({OCR_QUALITY_BUCKET_SQL})"
 
 
+def _requeue_eligible_ocr_batched(db, job_id: str, keep: str) -> int:
+    import random
+    import time
+    from sqlalchemy import text
+    total = 0
+    for _ in range(100000):
+        for attempt in range(5):
+            try:
+                rows = db.execute(text(f"""
+                    WITH claimed AS MATERIALIZED (
+                        SELECT id FROM job_artifacts
+                        WHERE job_id=:jid AND coalesce(ocr_status, '') IN ('na','')
+                          AND ({keep})
+                        ORDER BY id LIMIT 250 FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE job_artifacts AS artifact
+                    SET ocr_status='pending', updated_at=NOW()
+                    FROM claimed WHERE artifact.id=claimed.id
+                    RETURNING artifact.id
+                """), {"jid": job_id}).fetchall()
+                count = len(rows)
+                db.commit()
+                total += count
+                break
+            except Exception as exc:
+                db.rollback()
+                if not is_retryable_db_error(exc) or attempt == 4:
+                    raise
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0, 0.04))
+        if count < 250:
+            break
+    else:
+        log.warning("OCR requeue batch safety limit reached job=%s", job_id)
+    return total
+
+
 def enqueue_eligible_ocr(db, job_id: str) -> int:
     """Queue PDFs/images that were never attempted (``na`` / empty status).
 
@@ -1564,19 +1634,14 @@ def enqueue_eligible_ocr(db, job_id: str) -> int:
     at 1% with hundreds of pending photos that do not need GLM.
     """
     keep = _ocr_eligible_keep_sql()
-    execute(db, f"""UPDATE job_artifacts SET ocr_status='skipped', updated_at=NOW()
-        WHERE job_id=:jid AND ocr_status='pending'
-          AND coalesce(metadata->>'ocr_quality_checked','false')='true'
-          AND NOT ({OCR_QUALITY_BUCKET_SQL})""", {"jid": job_id})
-    result = execute(
-        db,
-        f"""UPDATE job_artifacts SET ocr_status='pending', updated_at=NOW()
-            WHERE job_id=:jid
-              AND coalesce(ocr_status, '') IN ('na', '')
-              AND {keep}""",
-        {"jid": job_id},
-    )
-    queued = int(getattr(result, "rowcount", 0) or 0)
+    _update_ocr_in_claimed_batches(
+        db, job_id,
+        predicate=f"coalesce(metadata->>'ocr_quality_checked','false')='true' "
+                  f"AND NOT ({OCR_QUALITY_BUCKET_SQL})",
+        new_status="skipped")
+    # Requeue eligible OCR records in short batches as well.  The helper
+    # below uses a different predicate because eligible rows begin as 'na'.
+    queued = _requeue_eligible_ocr_batched(db, job_id, keep)
     return queued
 
 

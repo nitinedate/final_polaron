@@ -33,6 +33,8 @@ TRANSIENT_DB_MARKERS = (
     "cannot connect now",
     "canceling statement due to user request",
     "deadlock detected",
+    "canceling statement due to lock timeout",
+    "lock not available",
 )
 
 

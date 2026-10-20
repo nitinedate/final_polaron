@@ -40,6 +40,10 @@ def stage(**overrides):
     (stage(heartbeat_at=NOW-timedelta(seconds=61)),'recover'),
     (stage(operation_deadline=NOW+timedelta(seconds=30),operation='Vision inference'),'valid_wait'),
     (stage(operation_deadline=NOW-timedelta(seconds=1)),'valid_wait'),
+    (stage(progress_at=NOW-timedelta(seconds=181), operation='media_review: bounded evidence operation', operation_deadline=NOW+timedelta(seconds=600), total_items=0, completed_items=0), 'cancel'),
+    (stage(progress_at=NOW-timedelta(seconds=120), operation='Tesseract image/video text', operation_deadline=NOW+timedelta(seconds=600), total_items=1000, completed_items=10), 'cancel'),
+    (stage(operation_deadline=NOW-timedelta(seconds=120), operation='Counting image and video files', total_items=10, completed_items=0), 'cancel'),
+    (stage(operation_deadline=NOW-timedelta(seconds=120), operation='Frame evidence persisted', total_items=10, completed_items=10), 'valid_wait'),
     (stage(status='queued',updated_at=NOW-timedelta(seconds=59)),'valid_wait'),
     (stage(status='waiting',updated_at=NOW-timedelta(seconds=61),error='GPU lease capacity unavailable'),'retry_dependency'),
     (stage(status='waiting',updated_at=NOW-timedelta(seconds=120),error='OCR quality triage has not completed: Quality triage producer is still writing in'),'retry_dependency'),
@@ -48,6 +52,23 @@ def stage(**overrides):
 ])
 def test_meaningful_progress_and_bounded_waits(entry,decision):
     assert progress.classify_stage({},entry,now=NOW)[0]==decision
+
+
+def test_existing_media_schema_does_not_take_a_table_lock(monkeypatch):
+    from app.services import forensic_media_review as review
+
+    calls = []
+
+    def fetchone(db, sql, params=None):
+        if "pg_class" in sql:
+            return {"tbl": True, "idx": True}
+        return {"name": "firm_p"}
+
+    monkeypatch.setattr(review, "fetchone", fetchone)
+    monkeypatch.setattr(review, "execute", lambda *args, **kwargs: calls.append(args))
+    review._MEDIA_SCHEMA_READY.clear()
+    review.ensure_media_review_schema(object())
+    assert calls == []
 
 
 def test_user_pause_never_recovers_a_process():

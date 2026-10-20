@@ -23,13 +23,25 @@ TEXT_RULES = (
 
 
 def ensure_suspicious_schema(db):
-    execute(db, """CREATE TABLE IF NOT EXISTS forensic_suspicious_activity (
-        id text PRIMARY KEY,job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        job_artifact_id uuid REFERENCES job_artifacts(id) ON DELETE CASCADE,
-        category text NOT NULL,source_record_id text,source_path text NOT NULL,
-        source_sha256 text,timestamp_utc timestamptz,data jsonb NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT NOW())""")
-    execute(db, 'CREATE INDEX IF NOT EXISTS suspicious_job_category ON forensic_suspicious_activity(job_id,category,id)')
+    # A present table or index must not be locked again. CREATE INDEX IF NOT
+    # EXISTS still queues ShareLock and then blocks the stage that needs the table.
+    exists = fetchone(
+        db,
+        """SELECT
+             EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname=current_schema() AND c.relname='forensic_suspicious_activity' AND c.relkind='r') AS tbl,
+             EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname=current_schema() AND c.relname='suspicious_job_category' AND c.relkind='i') AS idx""",
+    ) or {}
+    if not exists.get("tbl"):
+        execute(db, """CREATE TABLE IF NOT EXISTS forensic_suspicious_activity (
+            id text PRIMARY KEY,job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            job_artifact_id uuid REFERENCES job_artifacts(id) ON DELETE CASCADE,
+            category text NOT NULL,source_record_id text,source_path text NOT NULL,
+            source_sha256 text,timestamp_utc timestamptz,data jsonb NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT NOW())""")
+    if not exists.get("idx"):
+        execute(db, "CREATE INDEX IF NOT EXISTS suspicious_job_category ON forensic_suspicious_activity(job_id,category,id)")
 
 
 def review_signals(record):

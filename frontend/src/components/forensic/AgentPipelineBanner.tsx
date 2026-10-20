@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { SerialPipelineBanner } from "./SerialPipelineBanner";
+import { earlySerialPipeline } from "./earlySerialPipeline";
 
 import clsx from "clsx";
 
@@ -118,6 +119,11 @@ export function AgentPipelineBanner({
   const pct = pipelineComplete ? 100 : Math.min(99, Math.max(0, stageOverallPct));
   const waitingFolder = waitingForEvidenceFolder(job);
   const userPaused = job.status === "paused";
+
+  if (!pp?.serial_pipeline && ["host_disk", "disk"].includes(String(job.type || "").toLowerCase())) {
+    return <SerialPipelineBanner pipeline={earlySerialPipeline(job)} paused={userPaused}
+      compact={compact} elapsed={liveElapsedLabel || pipelineElapsedLabel} />;
+  }
 
   if (pp?.serial_pipeline) return <SerialPipelineBanner
     pipeline={pp.serial_pipeline} paused={userPaused}

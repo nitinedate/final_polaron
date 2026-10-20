@@ -1051,11 +1051,20 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     async (folders: StagedEvidenceFolder[]) => {
       setBrowseDialogOpen(false);
       if (!folders.length) return;
-      // Do not open the pipeline modal yet. registerPickedFolder ->
-      // ingestAtResolvedPath first verifies the exact selected path in Docker.
-      for (const folder of folders) {
-        await registerPickedFolder(folder);
+      // A job must receive the entire source list as one atomic registration.
+      // The current backend still owns a single disk_source per job; invoking
+      // registerPickedFolder repeatedly overwrites that ownership and may
+      // start competing extraction attempts. Never silently discard a source.
+      if (folders.length > 1) {
+        setBrowseDialogOpen(true);
+        toastRef.current.error(
+          "Multiple folders are selected, but this server does not yet support one-job multi-source extraction. " +
+          "Selection is retained; extraction has not started. Apply the backend multi-source coordinator first."
+        );
+        return;
       }
+      // Only one source can be registered safely with the current backend.
+      await registerPickedFolder(folders[0]);
     },
     []
   );

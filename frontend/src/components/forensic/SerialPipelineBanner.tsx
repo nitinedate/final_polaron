@@ -91,6 +91,12 @@ export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
         </div>
         {timeTaken(stage) && <p className="mt-1 text-[11px] tabular-nums text-ink-600">{stage.status === "running" ? "Elapsed" : "Time taken"}: {timeTaken(stage)}</p>}
         {stage.status === "running" ? <StageLiveMeter stage={stage} /> : null}
+        {stage.id === "extract" && stage.details?.files_uploaded !== undefined && stage.status === "running" ? (
+          <p className="mt-2 text-[11px] text-ink-700">
+            {stage.details.enumerating ? `Filesystem inventory: ${Number(stage.details.files_found || 0).toLocaleString()} discovered (growing)`
+              : `${Number(stage.details.files_uploaded || 0).toLocaleString()} uploaded to MinIO${stage.total > 0 ? ` · ${Math.max(0, stage.total - Number(stage.details.files_uploaded || 0)).toLocaleString()} remaining` : ""}`}
+          </p>
+        ) : null}
         {stage.status !== "done" && stage.status !== "skipped" && typeof stage.details?.progress_agent_reconciliation === "object" && stage.details?.progress_agent_reconciliation ? (
           <p className="mt-2 rounded-md bg-white/70 px-2 py-1.5 text-[11px] leading-snug text-amber-900">
             {String((stage.details.progress_agent_reconciliation as Record<string, unknown>).summary || "progressAgent is verifying remaining work")}

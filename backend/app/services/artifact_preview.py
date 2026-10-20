@@ -1384,6 +1384,7 @@ def iter_artifact_content(
     row: dict[str, Any],
     *,
     max_bytes: int | None = _CONTENT_READ_MAX_BYTES,
+    allow_disk: bool = True,
 ) -> Iterator[bytes]:
     """Stream artifact bytes in chunks for large forensic downloads."""
     storage_uri = row.get("minio_uri")
@@ -1411,9 +1412,11 @@ def iter_artifact_content(
             yield data if max_bytes is None else data[:max_bytes]
             return
 
-    # Prefer virtual-disk / zip member streaming for UFED package paths.
+    # Opening the evidence image is a separate mount. Media review must be
+    # able to skip a file that is not already in object storage instead of
+    # blocking the whole stage on that mount.
     path = (row.get("file_path") or "").replace("\\", "/")
-    if path:
+    if path and allow_disk:
         try:
             from app.services.virtual_disk import iter_file_from_disk, open_virtual_disk_cached
 

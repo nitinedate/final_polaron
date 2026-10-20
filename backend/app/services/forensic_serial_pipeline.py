@@ -115,11 +115,16 @@ def ensure_serial_schema(db) -> None:
         UNIQUE(stage_run_id, partition_key)
     )""",
     )
-    execute(
+    if not fetchone(
         db,
-        """CREATE INDEX IF NOT EXISTS pipeline_work_pending
-        ON pipeline_work_items(stage_run_id, id) WHERE status='pending'""",
-    )
+        """SELECT 1 AS ok FROM pg_indexes
+           WHERE schemaname=current_schema() AND indexname='pipeline_work_pending'""",
+    ):
+        execute(
+            db,
+            """CREATE INDEX IF NOT EXISTS pipeline_work_pending
+            ON pipeline_work_items(stage_run_id, id) WHERE status='pending'""",
+        )
     _ensure_work_item_priority(db)
     from app.services.forensic_media_review import ensure_media_review_schema
     from app.services.forensic_priority_evidence import ensure_priority_schema

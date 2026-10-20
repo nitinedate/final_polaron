@@ -3,13 +3,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 
 from app.db.sql_helpers import execute, fetchall, fetchone
 
+log = logging.getLogger("forensic.progress")
+
 CHECK_AFTER_SECONDS = 60
+# A process that never leaves its startup declaration is not examining evidence.
+STARTUP_STALL_SECONDS = 180
+# A live heartbeat with no new committed item is a halt, whatever the deadline says.
+ITEM_STALL_SECONDS = 90
+# After a declared operation's deadline, one short grace, then restart the owner.
+LIVELOCK_AFTER_DEADLINE_SECONDS = 90
 MAX_RECOVERY_ATTEMPTS = 3
 _SCHEMA_READY = set()
 _QUEUE_STATE = (0, None)
@@ -33,6 +42,28 @@ def report_queue():
     return {'mobile-android':'android-report','mobile-ios':'ios-report','mobile-extract':'mobile-build'}.get(current_service(),'report-gen')
 
 
+def _catalog_names(db, kind: str) -> set[str]:
+    """Names in the current schema. Does not lock the examined tables."""
+    rows = fetchall(
+        db,
+        """SELECT c.relname FROM pg_class c
+           JOIN pg_namespace n ON n.oid=c.relnamespace
+           WHERE n.nspname=current_schema() AND c.relkind=:kind""",
+        {"kind": kind},
+    )
+    return {str(row["relname"]) for row in rows}
+
+
+def _column_names(db, table: str) -> set[str]:
+    rows = fetchall(
+        db,
+        """SELECT column_name FROM information_schema.columns
+           WHERE table_schema=current_schema() AND table_name=:table""",
+        {"table": table},
+    )
+    return {str(row["column_name"]) for row in rows}
+
+
 def ensure_progress_schema(db):
     from app.services.forensic_serial_pipeline import ensure_serial_schema
     schema=fetchone(db,"SELECT current_schema() AS name")['name']
@@ -40,27 +71,40 @@ def ensure_progress_schema(db):
     if key in _SCHEMA_READY:
         return
     ensure_serial_schema(db)
-    execute(db, """CREATE TABLE IF NOT EXISTS pipeline_progress_events (
-        id bigserial PRIMARY KEY,job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        stage text,decision text NOT NULL,reason text NOT NULL,details jsonb NOT NULL DEFAULT '{}',
-        created_at timestamptz NOT NULL DEFAULT NOW())""")
-    execute(db, "CREATE INDEX IF NOT EXISTS progress_events_job ON pipeline_progress_events(job_id,created_at DESC)")
-    execute(db, "CREATE INDEX IF NOT EXISTS ix_jobs_progress_watch ON jobs(status,updated_at,id) WHERE stop_requested=FALSE")
-    execute(db, """CREATE TABLE IF NOT EXISTS pipeline_progress_checks (
-        job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-        fingerprint text NOT NULL,last_change_at timestamptz NOT NULL DEFAULT NOW(),
-        checked_at timestamptz NOT NULL DEFAULT NOW(),decision text,reason text,
-        acquisition_recoveries integer NOT NULL DEFAULT 0,
-        acquisition_last_dispatch_at timestamptz)""")
-    execute(db, "ALTER TABLE pipeline_progress_checks ADD COLUMN IF NOT EXISTS acquisition_recoveries integer NOT NULL DEFAULT 0")
-    execute(db, "ALTER TABLE pipeline_progress_checks ADD COLUMN IF NOT EXISTS acquisition_last_dispatch_at timestamptz")
-    execute(db, 'ALTER TABLE pipeline_stage_runs ADD COLUMN IF NOT EXISTS recovery_dispatches integer NOT NULL DEFAULT 0')
+    tables = _catalog_names(db, "r")
+    indexes = _catalog_names(db, "i")
+    if "pipeline_progress_events" not in tables:
+        execute(db, """CREATE TABLE IF NOT EXISTS pipeline_progress_events (
+            id bigserial PRIMARY KEY,job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            stage text,decision text NOT NULL,reason text NOT NULL,details jsonb NOT NULL DEFAULT '{}',
+            created_at timestamptz NOT NULL DEFAULT NOW())""")
+    if "progress_events_job" not in indexes:
+        execute(db, "CREATE INDEX IF NOT EXISTS progress_events_job ON pipeline_progress_events(job_id,created_at DESC)")
+    if "ix_jobs_progress_watch" not in indexes:
+        execute(db, "CREATE INDEX IF NOT EXISTS ix_jobs_progress_watch ON jobs(status,updated_at,id) WHERE stop_requested=FALSE")
+    if "pipeline_progress_checks" not in tables:
+        execute(db, """CREATE TABLE IF NOT EXISTS pipeline_progress_checks (
+            job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+            fingerprint text NOT NULL,last_change_at timestamptz NOT NULL DEFAULT NOW(),
+            checked_at timestamptz NOT NULL DEFAULT NOW(),decision text,reason text,
+            acquisition_recoveries integer NOT NULL DEFAULT 0,
+            acquisition_last_dispatch_at timestamptz)""")
+    checks = _column_names(db, "pipeline_progress_checks")
+    if "acquisition_recoveries" not in checks:
+        execute(db, "ALTER TABLE pipeline_progress_checks ADD COLUMN IF NOT EXISTS acquisition_recoveries integer NOT NULL DEFAULT 0")
+    if "acquisition_last_dispatch_at" not in checks:
+        execute(db, "ALTER TABLE pipeline_progress_checks ADD COLUMN IF NOT EXISTS acquisition_last_dispatch_at timestamptz")
+    if "recovery_dispatches" not in _column_names(db, "pipeline_stage_runs"):
+        execute(db, "ALTER TABLE pipeline_stage_runs ADD COLUMN IF NOT EXISTS recovery_dispatches integer NOT NULL DEFAULT 0")
     from app.services.suspicious_activity import ensure_suspicious_schema
     ensure_suspicious_schema(db)
-    if fetchone(db,"SELECT to_regclass('report_runs') AS t")['t']:
+    if "report_runs" in tables or "report_runs" in _catalog_names(db, "r"):
+        present = _column_names(db, "report_runs")
         for column in ('owner_task_id text','heartbeat_at timestamptz','progress_at timestamptz','operation_deadline timestamptz','cancel_requested_at timestamptz','recovery_dispatches integer NOT NULL DEFAULT 0'):
-            execute(db,f'ALTER TABLE report_runs ADD COLUMN IF NOT EXISTS {column}')
-        execute(db,"CREATE INDEX IF NOT EXISTS progress_report_active_job ON report_runs(job_id,created_at DESC) WHERE status IN ('running','queued','waiting')")
+            if column.split()[0] not in present:
+                execute(db, f"ALTER TABLE report_runs ADD COLUMN IF NOT EXISTS {column}")
+        if "progress_report_active_job" not in indexes:
+            execute(db, "CREATE INDEX IF NOT EXISTS progress_report_active_job ON report_runs(job_id,created_at DESC) WHERE status IN ('running','queued','waiting')")
     db.commit()
     _SCHEMA_READY.add(key)
 
@@ -95,50 +139,85 @@ def classify_stage(job, stage, *, now=None):
     progress_age = _age(stage.get("progress_at") or stage.get("started_at") or stage.get("updated_at"), now)
     if state == "failed":
         error = str(stage.get("error") or "").lower()
-        retryable = any(token in error for token in ("deadlock", "connection reset", "server closed", "process exited", "timed out", "stage process", "progressagent", "current transaction is aborted", "infailedsqltransaction"))
+        retryable = any(token in error for token in ("deadlock", "connection reset", "server closed", "process exited", "timed out", "stage process", "progressagent", "current transaction is aborted", "infailedsqltransaction", "lock timeout", "database lock"))
         return ("recover", "Transient stage failure") if retryable and int(stage.get("attempt") or 0) <= MAX_RECOVERY_ATTEMPTS else ("blocked", "Failed stage needs a source/dependency correction")
     if state == "running" and progress_age < CHECK_AFTER_SECONDS:
         return "progressing", "Useful work advanced within the last minute"
     if state == "running":
+        total_items = int(stage.get("total_items") or 0)
+        accounted = sum(int(stage.get(key) or 0) for key in ("completed_items", "failed_items", "skipped_items"))
+        operation = str(stage.get("operation") or "")
+        startup = (not operation) or operation.endswith((": bounded evidence operation", ": starting"))
+        # Heartbeats continue while a child is blocked in a catalog lock or a
+        # native call. That is a livelock: the process is alive and no evidence
+        # item has been committed. Cancel only that child so the stage retries.
+        if progress_age >= STARTUP_STALL_SECONDS and total_items <= 0 and accounted <= 0 and startup:
+            if _age(stage.get("heartbeat_at"), now) >= CHECK_AFTER_SECONDS:
+                return "recover", "Stage never started evidence work and its heartbeat is stale"
+            return "cancel", "Stage process is alive but has not started evidence work; progressAgent is restarting it"
+        if total_items > 0 and accounted >= total_items:
+            return "valid_wait", f"Bounded operation in progress: {stage.get('operation') or stage['stage']}"
+        # The operation deadline used to hide this. A child blocked on a file
+        # mount keeps its heartbeat and its deadline while the item count is frozen.
+        if progress_age >= ITEM_STALL_SECONDS:
+            if _age(stage.get("heartbeat_at"), now) >= CHECK_AFTER_SECONDS:
+                return "recover", "No evidence item committed and the stage heartbeat is stale"
+            return "cancel", "No evidence item has been committed; progressAgent is restarting the stage"
         deadline = stage.get("operation_deadline")
         if deadline and _age(deadline, now) == 0:
             return "valid_wait", f"Bounded operation in progress: {stage.get('operation') or stage['stage']}"
-        total_items = int(stage.get("total_items") or 0)
-        accounted = sum(int(stage.get(key) or 0) for key in ("completed_items", "failed_items", "skipped_items"))
-        if total_items > 0 and accounted >= total_items:
-            return "valid_wait", f"Bounded operation in progress: {stage.get('operation') or stage['stage']}"
         if _age(stage.get('heartbeat_at'),now)>=CHECK_AFTER_SECONDS:
             return 'recover','Owning stage heartbeat is stale and its operation deadline expired'
+        if deadline and _age(deadline, now) >= LIVELOCK_AFTER_DEADLINE_SECONDS:
+            return "cancel", "Declared operation exceeded its deadline without committed progress; progressAgent is restarting the stage"
         # A live owner is still inside the stage. Quiet progress is not a pause.
         return "valid_wait", f"Owning stage is still running: {stage.get('operation') or stage['stage']}"
     if state == "queued" and _age(stage.get("updated_at"), now) < CHECK_AFTER_SECONDS:
         return "valid_wait", "Delivery is within its one-minute queue grace period"
     if state == "waiting" and _age(stage.get("updated_at"), now) < CHECK_AFTER_SECONDS:
         return "valid_wait", str(stage.get("error") or "Waiting for the next dependency check")
-    if state == 'waiting' and any(word in str(stage.get('error') or '').lower() for word in ('gpu','thermal','lease','capacity','model','unavailable','dependency','source key','quality triage','still writing','writing in','interrupted by progressagent')):
+    if state == 'waiting' and any(word in str(stage.get('error') or '').lower() for word in ('gpu','thermal','lease','capacity','model','unavailable','dependency','source key','quality triage','still writing','writing in','interrupted by progressagent','database lock','lock timeout','deadlock','canceling statement')):
         return 'retry_dependency','A bounded dependency wait is ready to be checked again'
     return "recover", "Current stage has no executing claim or its delivery is stale"
 
 
 def queue_delivery_state(queue):
-    """Bounded, cached broker inspection; no destructive revoke/terminate."""
+    """Inspect queue ownership without mistaking an unreachable inspector for an empty queue.
+
+    A queue with no consumer is an actionable deployment blocker, not a normal
+    wait. Never revoke queued tasks or change evidence counters here.
+    """
     global _QUEUE_STATE
-    if time.monotonic()-_QUEUE_STATE[0]>30 or _QUEUE_STATE[1] is None:
+    if time.monotonic() - _QUEUE_STATE[0] > 30 or _QUEUE_STATE[1] is None:
         try:
             from celery import current_app
-            inspect=current_app.control.inspect(timeout=1)
-            queues=inspect.active_queues() or {}
-            active=inspect.active() or {}
-            _QUEUE_STATE=(time.monotonic(),(queues,active))
+            inspector = current_app.control.inspect(timeout=1)
+            queues = inspector.active_queues()
+            active = inspector.active()
+            if queues is None:
+                # A broker/control-plane outage cannot prove the consumer is absent.
+                _QUEUE_STATE = (time.monotonic(), (None, None))
+            else:
+                _QUEUE_STATE = (time.monotonic(), (queues, active or {}))
         except Exception:
-            _QUEUE_STATE=(time.monotonic(),({},{}))
-    queues,active=_QUEUE_STATE[1]
-    consumers=[worker for worker,entries in queues.items() if any(entry.get('name')==queue for entry in entries)]
+            _QUEUE_STATE = (time.monotonic(), (None, None))
+    queues, active = _QUEUE_STATE[1]
+    if queues is None:
+        return 'valid_wait', (
+            'Cannot verify Celery consumers; inspect broker connection, worker logs '
+            'and inspect permissions before retrying the stage'
+        )
+    consumers = [worker for worker, entries in queues.items()
+                 if any(entry.get('name') == queue for entry in (entries or []))]
     if not consumers:
-        return 'valid_wait','No responding consumer for '+queue+'; check its worker/dependency'
+        service = 'worker-ocr-gpu' if queue == 'ocr' else f'consumer of {queue}'
+        return 'blocked', (
+            f'No worker subscribes to Celery queue {queue}; verify {service} '
+            'is running, connected to the same broker and has the correct -Q setting'
+        )
     if all(active.get(worker) for worker in consumers):
-        return 'valid_wait','Consumers are executing bounded process work; delivery is queued'
-    return 'recover','A consumer is available but the stage delivery is stale'
+        return 'valid_wait', 'Consumers are executing bounded process work; delivery is queued'
+    return 'recover', 'A consumer is available but the stage delivery is stale'
 
 
 def _event(db, job_id, stage, decision, reason, *, details=None):
@@ -655,9 +734,44 @@ def _monitor_acquisition(db, job, *, schema_name):
     return {'status':'valid_wait','reason':'Acquisition source, live extractor or dependency has not released its claim','job_id':str(job['id'])}
 
 
+def release_blocking_index_waits(db) -> int:
+    """Cancel CREATE INDEX sessions that are queued on a lock, not building.
+
+    A waiting ShareLock blocks later inserts on that table, so image/video
+    observations stay at 0% behind a no-op "IF NOT EXISTS" index. The statement
+    has not changed any data. Cancelling it lets the stage retry or skip.
+    """
+    rows = fetchall(
+        db,
+        """SELECT pid FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND pid <> pg_backend_pid()
+             AND state = 'active'
+             AND wait_event_type = 'Lock'
+             AND now() - query_start > interval '45 seconds'
+             AND (ltrim(query) ILIKE 'CREATE INDEX%'
+                  OR ltrim(query) ILIKE 'ALTER TABLE%')""",
+    )
+    cancelled = 0
+    for row in rows:
+        ok = fetchone(db, "SELECT pg_cancel_backend(:pid) AS ok", {"pid": int(row["pid"])}) or {}
+        if ok.get("ok"):
+            cancelled += 1
+            log.warning("progressAgent cancelled a lock-waiting CREATE INDEX (pid %s)", row["pid"])
+    return cancelled
+
+
 def supervise_progress(db, *, schema_name):
     from app.services.forensic_serial_pipeline import pipeline_execution_lock
     ensure_progress_schema(db);db.commit()
+    try:
+        release_blocking_index_waits(db)
+    except Exception:
+        log.exception("progressAgent could not clear a lock-waiting index build")
+        try:
+            db.rollback()
+        except Exception:
+            pass
     from app.service_identity import current_service
     with pipeline_execution_lock(db,schema_name,'progressAgent:'+current_service()) as acquired:
         if not acquired:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
+import time
 from typing import Any
 
 from app.config import get_settings
@@ -394,14 +396,47 @@ def sync_graph_files_phase(db, job_id: str, *, driver, total: int, stop=None, st
     last = "00000000-0000-0000-0000-000000000000"
     scanned = 0
 
-    def write_files(session, rows):
-        payload = [{"path": r["file_path"], "sha": r["sha256"], "aid": r["encyclopedia_artifact_id"]} for r in rows]
-        session.run("""UNWIND $rows AS r
-            MERGE (e:EvidenceFile {path:r.path,job_id:$jid}) SET e.sha256=r.sha,e.artifact_id=r.aid
-            FOREACH (aid IN CASE WHEN r.aid IS NULL THEN [] ELSE [r.aid] END |
-                MERGE (a:Artifact {id:aid}) MERGE (e)-[:MAPS_TO_ENCYCLOPEDIA]->(a))""",
-            rows=payload, jid=job_id).consume()
-        return len(rows)
+    # Shared Artifact nodes can be referenced from many EvidenceFile rows. Parallel
+    # relationship-group updates against those shared nodes caused Neo4j deadlocks.
+    # Keep this phase's writes serialized and bounded, while letting independent
+    # PostgreSQL parsing/OCR tasks run concurrently.
+    def write_files_batch(rows):
+        payload = [
+            {"path": r["file_path"], "sha": r["sha256"], "aid": r["encyclopedia_artifact_id"]}
+            for r in rows
+        ]
+        payload.sort(key=lambda r: (str(r["aid"] or ""), str(r["path"] or "")))
+
+        def transact(tx):
+            tx.run("""UNWIND $rows AS r
+                MERGE (e:EvidenceFile {path:r.path,job_id:$jid})
+                SET e.sha256=r.sha,e.artifact_id=r.aid
+                FOREACH (aid IN CASE WHEN r.aid IS NULL THEN [] ELSE [r.aid] END |
+                    MERGE (a:Artifact {id:aid})
+                    MERGE (e)-[:MAPS_TO_ENCYCLOPEDIA]->(a))""",
+                rows=payload, jid=job_id).consume()
+            return len(payload)
+
+        # Transaction functions are replay-safe because graph writes use MERGE.
+        # Neo4j's managed transactions retry transient failures. A bounded outer
+        # retry handles exhausted transient retries without replaying completed
+        # chunks or silently claiming success.
+        for attempt in range(5):
+            try:
+                with driver.session() as session:
+                    return int(session.execute_write(transact))
+            except Exception as exc:
+                code = str(getattr(exc, "code", ""))
+                retryable = (
+                    code.startswith("Neo.TransientError.")
+                    or "deadlock" in str(exc).lower()
+                )
+                if not retryable or attempt == 4:
+                    raise
+                delay = min(5.0, 0.2 * (2 ** attempt)) + random.uniform(0, 0.1)
+                log.warning("Neo4j graph_files transient failure, retry %d/5 in %.2fs: %s", attempt+1, delay, exc)
+                time.sleep(delay)
+        raise RuntimeError("graph_files retries exhausted")
 
     while True:
         if stop is not None:
@@ -418,7 +453,11 @@ def sync_graph_files_phase(db, job_id: str, *, driver, total: int, stop=None, st
         if not wave:
             break
         note_operation(db, job_id, stage, "Graph synchronization of extracted evidence", advanced=True, timeout_seconds=900)
-        scanned += _write_graph_batches(driver, wave, write_files)
+        # A wave is fetched in cursor order; each subset commits independently.
+        # 100-row transactions reduce shared relationship-group lock duration.
+        for group in wave:
+            for i in range(0, len(group), 100):
+                scanned += write_files_batch(group[i:i + 100])
         if stage == "graph":
             report_progress(db, job_id, "graph", total=total, completed=scanned, label="Graph synchronization of extracted evidence")
     _mark_graph_phase(driver, job_id, "graph_files_done")

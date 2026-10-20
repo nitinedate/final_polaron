@@ -2648,6 +2648,9 @@ def quality_ocr_triage_task(schema_name: str, job_id: str) -> dict:
 
     batch = max(100, min(int(__import__('os').environ.get("QUALITY_TRIAGE_BATCH", "800") or 800), 2000))
     with firm_session(schema_name) as db:
+        job = fetchone(db, "SELECT status, stop_requested FROM jobs WHERE id=:jid", {"jid": job_id})
+        if not job or job.get("stop_requested") or str(job.get("status") or "") in {"paused", "cancelled", "deleted", "failed"}:
+            return {"status": "held", "reason": "Job is not accepting quality triage"}
         gate = fetchone(db, "SELECT status FROM pipeline_stage_runs WHERE job_id=:jid AND stage='ocr'", {'jid':job_id})
         if gate and gate.get('status') in {'done','skipped'}:
             return {'status':'held','reason':'OCR producer boundary already sealed'}
@@ -2693,6 +2696,13 @@ def quality_ocr_triage_task(schema_name: str, job_id: str) -> dict:
             db.rollback()
             quality_ocr_triage_task.apply_async(args=(schema_name, job_id), countdown=2)
             return {'status':'waiting','reason':'Quality triage producer is still writing in'}
+        except Exception as exc:
+            from app.db.sql_helpers import is_retryable_db_error
+            if not is_retryable_db_error(exc):
+                raise
+            db.rollback()
+            quality_ocr_triage_task.apply_async(args=(schema_name, job_id), countdown=5)
+            return {'status':'waiting','reason':'Quality triage lock was released; it will try again'}
         stage = fetchone(
             db,
             """SELECT status FROM pipeline_stage_runs

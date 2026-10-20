@@ -29,6 +29,9 @@ def is_retryable_db_error(exc: BaseException) -> bool:
             "crash shutdown",
             "current transaction is aborted",
             "infailedsqltransaction",
+            "canceling statement due to user request",
+            "canceling statement due to lock timeout",
+            "lock not available",
         )
     )
 
@@ -84,24 +87,27 @@ def _artifact_id_list(ids: list[Any]) -> list[str]:
     return sorted({str(item) for item in ids if item})
 
 
-def lock_job_artifacts_in_id_order(db: Session, ids: list[Any]) -> None:
+def lock_job_artifacts_in_id_order(db: Session, ids: list[Any], *, skip_locked: bool = False) -> list[str]:
     """Lock artifact rows from lowest id to highest.
 
     Two pipeline writers that update the same artifacts in different orders
     deadlock. An ordered lock makes every later UPDATE wait in the same sequence.
+    skip_locked is for a batch that must not sit behind a delete of the same rows.
     """
     clean = _artifact_id_list(ids)
     if not clean:
-        return
-    db.execute(
+        return []
+    clause = "FOR UPDATE SKIP LOCKED" if skip_locked else "FOR UPDATE"
+    rows = db.execute(
         text(
-            """SELECT id FROM job_artifacts
+            f"""SELECT id FROM job_artifacts
                WHERE id = ANY(CAST(:ids AS uuid[]))
                ORDER BY id
-               FOR UPDATE"""
+               {clause}"""
         ),
         {"ids": clean},
-    )
+    ).mappings().all()
+    return [str(row["id"]) for row in rows]
 
 
 def lock_job_artifacts_for_paths(db: Session, job_id: Any, paths: list[Any]) -> None:

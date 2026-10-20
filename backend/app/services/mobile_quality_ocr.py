@@ -260,7 +260,11 @@ def _route_forensic_quality_to_ocr_impl(
             db.commit()
             return
         ordered = sorted(skips, key=lambda item: item[0])
-        lock_job_artifacts_in_id_order(db, [item[0] for item in ordered])
+        locked = set(lock_job_artifacts_in_id_order(db, [item[0] for item in ordered], skip_locked=True))
+        ordered = [item for item in ordered if item[0] in locked]
+        if not ordered:
+            db.commit()
+            return
         from psycopg2.extras import execute_values
 
         with db.connection().connection.cursor() as cur:
@@ -411,7 +415,11 @@ def _route_forensic_quality_to_ocr_impl(
             db.commit()
             return
         ordered = sorted(updates, key=lambda item: item[0])
-        lock_job_artifacts_in_id_order(db, [item[0] for item in ordered])
+        locked = set(lock_job_artifacts_in_id_order(db, [item[0] for item in ordered], skip_locked=True))
+        ordered = [item for item in ordered if item[0] in locked]
+        if not ordered:
+            db.commit()
+            return
         from psycopg2.extras import execute_values
 
         with db.connection().connection.cursor() as cur:

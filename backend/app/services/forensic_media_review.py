@@ -69,20 +69,66 @@ Give a concrete visible_detail for each signal;
 if absent or unclear, return an empty list. Return the requested JSON object."""
 
 
+_MEDIA_SCHEMA_READY: set[tuple[str, str]] = set()
+
+
 def ensure_media_review_schema(db):
-    execute(
+    """Create the observation table only when it is missing.
+
+    CREATE INDEX IF NOT EXISTS still takes ShareLock and queues behind any
+    writer. A queued ShareLock then blocks the inserts this stage needs, so a
+    case sits at 0% while an index that already exists waits. A catalog read
+    does not take that lock.
+    """
+    schema = str((fetchone(db, "SELECT current_schema() AS name") or {}).get("name") or "")
+    key = (str(getattr(db, "bind", "") or ""), schema)
+    if key in _MEDIA_SCHEMA_READY:
+        return
+    # pg_class only. to_regclass locks the table and queues behind a waiting
+    # CREATE INDEX, which is the stall this check exists to avoid.
+    present = fetchone(
         db,
-        """CREATE TABLE IF NOT EXISTS forensic_media_observations (
-        job_artifact_id uuid PRIMARY KEY REFERENCES job_artifacts(id) ON DELETE CASCADE,
-        job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        media_kind text NOT NULL,source_path text NOT NULL,source_sha256 text,
-        status text NOT NULL,description text NOT NULL DEFAULT '',flagged boolean NOT NULL DEFAULT false,
-        details jsonb NOT NULL DEFAULT '{}'::jsonb,error text,updated_at timestamptz NOT NULL DEFAULT NOW())""",
-    )
-    execute(
-        db,
-        "CREATE INDEX IF NOT EXISTS ix_media_observations_job ON forensic_media_observations(job_id,job_artifact_id)",
-    )
+        """SELECT
+             EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname=current_schema() AND c.relname='forensic_media_observations' AND c.relkind='r') AS tbl,
+             EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname=current_schema() AND c.relname='ix_media_observations_job' AND c.relkind='i') AS idx""",
+    ) or {}
+    if present.get("tbl") and present.get("idx"):
+        _MEDIA_SCHEMA_READY.add(key)
+        return
+    try:
+        # A lock wait here is a pause, not a failed examination. 8s is long
+        # enough for a free table and short enough to retry instead of sitting
+        # at 0% for the whole stage deadline.
+        execute(db, "SET LOCAL lock_timeout = '8s'")
+        execute(
+            db,
+            """CREATE TABLE IF NOT EXISTS forensic_media_observations (
+            job_artifact_id uuid PRIMARY KEY REFERENCES job_artifacts(id) ON DELETE CASCADE,
+            job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            media_kind text NOT NULL,source_path text NOT NULL,source_sha256 text,
+            status text NOT NULL,description text NOT NULL DEFAULT '',flagged boolean NOT NULL DEFAULT false,
+            details jsonb NOT NULL DEFAULT '{}'::jsonb,error text,updated_at timestamptz NOT NULL DEFAULT NOW())""",
+        )
+        execute(
+            db,
+            "CREATE INDEX IF NOT EXISTS ix_media_observations_job ON forensic_media_observations(job_id,job_artifact_id)",
+        )
+        execute(db, "SET LOCAL lock_timeout = '0'")
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        text = str(exc).lower()
+        if any(token in text for token in ("lock timeout", "lock not available", "deadlock", "canceling statement")):
+            raise StageWaiting(
+                "Image/video observations paused on a database lock; progressAgent will retry"
+            ) from exc
+        raise
+    _MEDIA_SCHEMA_READY.add(key)
 
 
 def visual_model():
@@ -431,7 +477,7 @@ def _tesseract_frame(image_bytes: bytes) -> dict:
     }
 
 
-def _inspect_media_file(temp: str, kind: str, *, expected_sha: str | None, expected_size: int | None) -> dict:
+def _inspect_media_file(temp: str, kind: str, *, expected_sha: str | None, expected_size: int | None, prior_ocr: dict | None = None) -> dict:
     """Clarity check plus Tesseract. No database access, so workers can share it."""
     digest = hashlib.sha256()
     with open(temp, "rb") as source:
@@ -465,7 +511,22 @@ def _inspect_media_file(temp: str, kind: str, *, expected_sha: str | None, expec
                 "details": details,
             }
         blob, properties = _image_derivative(temp)
-        observation = _tesseract_frame(blob)
+        # Reuse the already-committed Stage 7 OCR text for the same artifact.
+        # The source SHA/length are verified above before accepting cached text.
+        # Blank results are NOT reused: media OCR still gets its own attempt.
+        if prior_ocr and str(prior_ocr.get("ocr_text") or "").strip():
+            prior_text = str(prior_ocr["ocr_text"]).strip()
+            observation = {
+                "description": prior_text,
+                "signals": ocr_signals(prior_text),
+                "model": "tesseract",
+                "model_derived": True,
+                "ocr_confidence": round(float(prior_ocr.get("confidence") or 0), 3),
+                "reused_prior_ocr": True,
+            }
+            details["reused_prior_ocr"] = True
+        else:
+            observation = _tesseract_frame(blob)
         details["frames"].append(
             {
                 "timestamp_seconds": None,
@@ -569,9 +630,10 @@ def media_review_workers() -> int:
     """
     raw = str(os.environ.get("MEDIA_REVIEW_WORKERS") or "").strip()
     if raw.isdigit() and int(raw) > 0:
-        return min(int(raw), 8)
+        return min(int(raw), 16)
+    # Leave a couple of cores for the database and the shard reader.
     cpus = os.cpu_count() or 8
-    return max(1, min(8, cpus - 2))
+    return max(1, min(16, cpus - 2))
 
 
 _PROGRESS_EVERY_FILES = 50
@@ -603,6 +665,18 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
     from app.services.progress_agent import note_operation
 
     workers = media_review_workers()
+    # Stage 7 already stored text for these pictures. A second Tesseract pass
+    # on every unclear image is what keeps this stage to a few files a second.
+    prior_ocr = {}
+    if os.environ.get("FORENSIC_MEDIA_REUSE_OCR", "true").lower() in {"1", "yes", "true"}:
+        existing = fetchall(db, """SELECT o.job_artifact_id AS aid,
+                   max(o.ocr_text) AS ocr_text, max(o.confidence) AS confidence
+            FROM ocr_results o JOIN job_artifacts a ON a.id=o.job_artifact_id
+            WHERE a.job_id=:jid AND a.ocr_status='done'
+              AND length(trim(coalesce(o.ocr_text,'')))>0
+            GROUP BY o.job_artifact_id""", {"jid": job_id})
+        prior_ocr = {str(r["aid"]): dict(r) for r in existing}
+        db.commit()
     os.environ.setdefault("OMP_THREAD_LIMIT", "1")
     progress_state = {"since": 0, "at": 0.0}
 
@@ -648,34 +722,60 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
                 _kind(row),
                 expected_sha=row.get("sha256") or (row.get("metadata") or {}).get("source_sha256"),
                 expected_size=row.get("size_bytes"),
+                prior_ocr=prior_ocr.get(str(row["id"])) if _kind(row) == "image" else None,
             )
         except Exception as exc:
             return {"error": str(exc), "kind": _kind(row), "details": {"frames": [], "model": "tesseract", "ocr_engine": "tesseract"}}
 
-    workers = max(1, min(int(workers), 8))
+    workers = max(1, min(int(workers), 16))
     gate = threading.BoundedSemaphore(workers)
     inflight: dict[threading.Thread, tuple] = {}
+    # Wall-clock guard for a task that never returns (e.g., corrupt decoder).
+    # On failure the isolated stage worker exits and releases its claims; do not
+    # pretend an unfinished artifact has been analyzed.
+    task_deadline_seconds = max(60, int(os.environ.get("FORENSIC_MEDIA_TASK_TIMEOUT_SECONDS", "600")))
 
     def _drain(block: bool) -> None:
         if not inflight:
             return
+        now = time.monotonic()
+        overdue = [thread for thread, item in inflight.items()
+                   if thread.is_alive() and now - item[3] > task_deadline_seconds]
+        if overdue:
+            # Thread APIs cannot safely kill a stuck native codec. Force the
+            # isolated stage run to be retried rather than endlessly waiting.
+            raise StageWaiting(
+                f"Media review has {len(overdue)} worker(s) exceeding "
+                f"{task_deadline_seconds}s; stage requires isolated-worker recovery"
+            )
         if block:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline and not any(not thread.is_alive() for thread in inflight):
                 time.sleep(0.05)
             if not any(not thread.is_alive() for thread in inflight):
-                note_operation(db, job_id, "media_review", "Tesseract image/video text", advanced=True, timeout_seconds=900)
+                # Workers are still inside a file. Do not call that committed
+                # progress: a codec hang must stay visible to progressAgent.
                 return
         finished = [thread for thread in list(inflight) if not thread.is_alive()]
         for thread in finished:
-            row, temp, box = inflight.pop(thread)
+            row, temp, box, started = inflight.pop(thread)
             try:
                 ok, value = box.get_nowait()
                 if not ok:
                     raise value
                 _publish(row, value)
-            except Exception:
+            except Exception as exc:
+                from app.db.sql_helpers import rollback_aborted_transaction
+                rollback_aborted_transaction(db)
                 log.exception("Media observation save failed for %s", row.get("file_path"))
+                # Never swallow a failed database write. Without this, the row
+                # remains pending and may be processed again on every resume.
+                # A data/codec error is already transformed by _inspect() into
+                # an explicit failed observation and can safely continue.
+                raise StageWaiting(
+                    f"Media observation result could not be committed for "
+                    f"{row.get('file_path')}: {type(exc).__name__}"
+                ) from exc
             finally:
                 if temp:
                     Path(temp).unlink(missing_ok=True)
@@ -696,9 +796,42 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
                 except Exception as exc:
                     box.put((False, exc))
 
-        thread = threading.Thread(target=_run, name="disk-media")
+        thread = threading.Thread(target=_run, name="disk-media", daemon=True)
+        inflight[thread] = (row, temp, box, time.monotonic())
         thread.start()
-        inflight[thread] = (row, temp, box)
+
+    def _submit_stored_copy(row) -> None:
+        """Use object storage only. The evidence image lives on a slow mount.
+
+        Opening that mount for one missing picture stalls the whole stage in
+        an uninterruptible read. Record the miss and keep going.
+        """
+        if not row.get("minio_uri"):
+            _store(
+                db, job_id, row, _kind(row), "failed",
+                "Media could not be reviewed",
+                {"frames": [], "model": "tesseract", "ocr_engine": "tesseract"},
+                error="Picture is not in the extracted shard or object storage",
+            )
+            progress_state["since"] += 1
+            _report()
+            return
+        try:
+            temp = _stream_to_temp(
+                db, job_id, row, Path(row["file_path"]).suffix.lower(),
+                directory="/tmp", allow_disk=False,
+            )
+        except Exception as exc:
+            _store(
+                db, job_id, row, _kind(row), "failed",
+                "Media could not be reviewed",
+                {"frames": [], "model": "tesseract", "ocr_engine": "tesseract"},
+                error=str(exc)[:2000],
+            )
+            progress_state["since"] += 1
+            _report()
+            return
+        _submit(row, temp)
 
     for _part, wanted in by_part.items():
         note_operation(
@@ -724,13 +857,11 @@ def _run_fast_media_observations(db, job_id, by_part, loose, total) -> None:
             _drain(True)
         for path, row in wanted.items():
             if path not in seen:
-                temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
-                _submit(row, temp)
+                _submit_stored_copy(row)
         while inflight:
             _drain(True)
     for row in loose:
-        temp = _stream_to_temp(db, job_id, row, Path(row["file_path"]).suffix.lower(), directory="/tmp")
-        _submit(row, temp)
+        _submit_stored_copy(row)
     while inflight:
         _drain(True)
     _report(force=True)
@@ -746,6 +877,16 @@ def run_media_review(db, job_id, *, schema_name):
 
     ensure_media_review_schema(db)
     db.commit()
+    from app.services.progress_agent import note_operation
+
+    note_operation(
+        db,
+        job_id,
+        "media_review",
+        "Counting image and video files",
+        timeout_seconds=900,
+        advanced=False,
+    )
     if os.environ.get("FORENSIC_MEDIA_REVIEW_ENABLED", "true").lower() not in {
         "1",
         "true",
@@ -775,9 +916,35 @@ def run_media_review(db, job_id, *, schema_name):
         AND NOT EXISTS(SELECT 1 FROM forensic_media_observations o WHERE o.job_artifact_id=ja.id AND o.status IN ('done','failed','skipped'))""",
         params,
     )["c"]
-    from app.services.ocr_gpu import selected_ocr_engine
-
-    fast_ocr = selected_ocr_engine() == "tesseract"
+    observed = fetchone(
+        db,
+        """SELECT count(*) FILTER(WHERE status='done') AS done,
+                  count(*) FILTER(WHERE status='failed') AS failed,
+                  count(*) FILTER(WHERE status='skipped') AS skipped
+           FROM forensic_media_observations WHERE job_id=:jid""",
+        {"jid": job_id},
+    ) or {}
+    note_operation(
+        db,
+        job_id,
+        "media_review",
+        f"Reviewing {int(pending):,} image/video files ({total:,} in this case)",
+        timeout_seconds=900,
+        advanced=True,
+    )
+    report_progress(
+        db,
+        job_id,
+        "media_review",
+        total=total,
+        completed=int(observed.get("done") or 0),
+        failed=int(observed.get("failed") or 0),
+        skipped=int(observed.get("skipped") or 0),
+        label="Image and video evidence",
+    )
+    # Picture observations stay on Tesseract. Document OCR on the GPU worker
+    # uses CUDA, and this stage must not follow that switch.
+    fast_ocr = (os.environ.get("FORENSIC_MEDIA_OCR_ENGINE") or "tesseract").strip().lower() in {"", "tesseract", "fast"}
     if pending:
         if not fast_ocr:
             check_model()
