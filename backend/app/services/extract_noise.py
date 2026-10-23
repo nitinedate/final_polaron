@@ -356,6 +356,8 @@ POLICY_BY_MODE: dict[str, NoisePolicy] = {
     # vendor tree above the size floor are identical on every machine of that
     # build; user paths, small files, and named scope artifacts stay.
     "defensible": NoisePolicy(enabled=True),
+    # Standard profile = defensible include rules + vendor-tree/asset exclusion.
+    "standard": NoisePolicy(enabled=True),
     "forensic": NoisePolicy(enabled=True),
     "fast": NoisePolicy(enabled=True),
 }

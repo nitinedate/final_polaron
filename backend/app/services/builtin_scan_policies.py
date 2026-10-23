@@ -29,7 +29,7 @@ log = logging.getLogger("builtin_scan_policies")
 _DONE: set[tuple[str, str]] = set()
 _LOCK = threading.Lock()
 
-VENDOR_LABEL = {"nexpose": "Nexpose", "nessus": "Nessus", "aetheris": "Aetheris"}
+VENDOR_LABEL = {"polaron": "Polaron", "nexpose": "Nexpose", "nessus": "Nessus", "aetheris": "Aetheris"}
 
 
 def seedable_templates() -> list[dict[str, Any]]:

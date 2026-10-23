@@ -94,6 +94,11 @@ export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
           <p className="mt-2 rounded-md bg-white/80 px-2 py-1.5 text-[11px] leading-snug text-ink-800">Now: {stage.operation}</p>
         ) : null}
         {stage.status === "running" ? <StageLiveMeter stage={stage} /> : null}
+        {stage.status === "skipped" && stage.details?.reason ? (
+          <p className="mt-2 rounded-md bg-white/80 px-2 py-1.5 text-[11px] leading-snug text-ink-700">
+            Not run: {String(stage.details.reason)}
+          </p>
+        ) : null}
         {stage.id === "extract" && stage.details?.files_uploaded !== undefined && stage.status === "running" ? (
           <p className="mt-2 text-[11px] text-ink-700">
             {stage.details.enumerating ? `Filesystem inventory: ${Number(stage.details.files_found || 0).toLocaleString()} discovered (growing)`

@@ -229,17 +229,10 @@ def collect_usb_usage_events(db, job_id: str, *, limit: int = 100) -> dict[str, 
     events: list[dict[str, Any]] = []
     seen: set[str] = set()
     devices = collect_usb_devices(db, job_id)
-    for path, rec in _iter_normalized_records(
-        db,
-        job_id,
-        where_sql=(
-            "apr.normalized::text ILIKE '%usb_usage_event%' "
-            "OR ja.file_path ILIKE '%setupapi.dev%' OR ja.file_path ILIKE '%/SYSTEM'"
-        ),
-        limit=40,
-    ):
-        if rec.get("record_type") != "usb_usage_event":
-            continue
+    # Shared registry/SetupAPI index — no normalized::text ILIKE over every parse result.
+    from app.services.registry_evidence_index import registry_evidence
+
+    for path, _kind, rec in registry_evidence(db, job_id).records("usb_usage_event"):
         key = f"{rec.get('event_time')}|{rec.get('device_id')}|{rec.get('serial')}"
         if key in seen:
             continue
@@ -360,14 +353,9 @@ def collect_phone_usage(db, job_id: str, *, limit: int = 100) -> dict[str, Any]:
     reg_phones: list[dict[str, Any]] = []
     seen_reg: set[str] = set()
     your_phone_only: list[dict[str, Any]] = []
-    for path, rec in _iter_normalized_records(
-        db,
-        job_id,
-        where_sql="apr.normalized::text ILIKE '%phone_device%'",
-        limit=40,
-    ):
-        if rec.get("record_type") != "phone_device":
-            continue
+    from app.services.registry_evidence_index import registry_evidence
+
+    for path, _kind, rec in registry_evidence(db, job_id).records("phone_device"):
         name = rec.get("device_name") or ""
         src = (rec.get("source") or path or "").lower()
         if not name or "usbstor" in name.lower():

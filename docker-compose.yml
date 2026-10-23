@@ -474,8 +474,12 @@ services:
         ]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 180s
+      # Forensic owns the shared PostgreSQL and applies firm migrations at boot;
+      # if another stack's workers already hold locks, those ALTERs wait out
+      # lock_timeout. 420s start_period + retries covers that cold start. Secondary
+      # stacks skip boot migrations entirely (AETHERIS_SKIP_BOOT_MIGRATIONS=1).
+      retries: 18
+      start_period: 420s
 
   # Disk extract/parse — forensic product only (vuln scans live in services/vuln).
   worker-disk:

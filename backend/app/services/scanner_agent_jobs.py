@@ -387,6 +387,59 @@ def _scanner_role_for_job(db, row: dict[str, Any]) -> str:
     return infer_scanner_role(scanner)
 
 
+def _build_number(version: Any) -> tuple[int, int, int] | None:
+    """``v62.0`` / ``1.10.2+v62.0`` -> (62, 0, 0); None when no build is advertised."""
+    builds = re.findall(r"(?i)(?<![0-9a-z])v?(\d{2,3})\.(\d+)(?:\.(\d+))?", str(version or ""))
+    if not builds:
+        return None
+    major, minor, patch = builds[-1]
+    return int(major), int(minor), int(patch or 0)
+
+
+def agent_compatible_policy_request(request: dict[str, Any], agent_version: Any) -> dict[str, Any]:
+    """Keep a job runnable on a laptop agent that predates its template (V1.10.2).
+
+    Agents re-expand ``scan_policy_request`` by template key and reject keys they
+    do not ship ("Unknown scan template"). The request central stores is already
+    fully expanded and validated, so for an agent older than the template's
+    ``min_agent_build`` (or one that does not advertise a build) the key is dropped
+    and the agent runs exactly the same ports and settings. Updated agents get the
+    key and record the template name in their policy snapshot.
+    """
+    req = dict(request or {})
+    key = str(req.get("template") or "").strip()
+    if not key:
+        return req
+    from app.services.scanner_service_policy import template_by_key
+
+    try:
+        template = template_by_key(key)
+    except ValueError:
+        return req
+    need = _build_number(template.get("min_agent_build"))
+    if need is None:
+        return req
+    have = _build_number(agent_version)
+    if have is not None and have >= need:
+        return req
+    log.info(
+        "Agent build %s predates template %s (needs %s); sending expanded settings without the key",
+        agent_version or "unknown", key, template.get("min_agent_build"),
+    )
+    return {k: v for k, v in req.items() if k not in ("template", "template_name")}
+
+
+def _scanner_version(db, row: dict[str, Any]) -> str | None:
+    sid = row.get("scanner_id")
+    if not sid:
+        return None
+    try:
+        found = fetchone(db, "SELECT version FROM vuln_scanners WHERE id = CAST(:id AS uuid)", {"id": str(sid)})
+    except Exception:
+        return None
+    return str((found or {}).get("version") or "").strip() or None
+
+
 def _job_payload(db, row: dict[str, Any], *, resumed: bool = False) -> dict[str, Any]:
     targets = fetchall(
         db,
@@ -419,7 +472,9 @@ def _job_payload(db, row: dict[str, Any], *, resumed: bool = False) -> dict[str,
             str(x).strip() for x in (orch.get("assessed_hosts") or []) if str(x).strip()
         ],
         "skipped_hosts": orch.get("skipped_hosts") or [],
-        "scan_policy_request": orch.get("scan_policy_request") or {},
+        "scan_policy_request": agent_compatible_policy_request(
+            orch.get("scan_policy_request") or {}, _scanner_version(db, row)
+        ),
         "target_progress": orch.get("target_progress") or {},
         "progress_event_seq": orch.get("progress_event_seq") or 0,
         "policy_snapshots": orch.get("policy_snapshots") or {},
@@ -781,6 +836,60 @@ def _target_event_state(event: str, *, status: str | None = None,
     return {"status": state, "progress_pct": pct, "activity": activity}
 
 
+SILENT_CAUSE_TEXT = {
+    "host_firewall": " (host answers ping: its firewall drops the scanner)",
+    "client_isolation_suspected": " (only the gateway answered: Wi-Fi client isolation or another VLAN suspected)",
+    "no_answer": " (no ping reply either: host offline or dropping everything)",
+}
+
+
+def silent_hosts(host_cov: Any) -> tuple[list[str], list[str]]:
+    """(hosts that answered nothing, hosts that answered) from agent per-host coverage."""
+    silent: list[str] = []
+    answered: list[str] = []
+    for host, cov in (host_cov or {}).items() if isinstance(host_cov, dict) else []:
+        if not isinstance(cov, dict):
+            continue
+        quiet = (
+            str(cov.get("verdict") or "") == "no_exposed_services"
+            and not cov.get("host_responded")
+            and not cov.get("open_tcp_ports")
+            and not cov.get("open_udp_ports")
+            and not cov.get("self_scan")
+        )
+        (silent if quiet else answered).append(str(host))
+    return sorted(silent), sorted(answered)
+
+
+def silent_hosts_note(host_cov: Any) -> str | None:
+    """Job-level explanation when some targets were never assessed (V1.10.2)."""
+    silent, answered = silent_hosts(host_cov)
+    if not silent:
+        return None
+    total = len(silent) + len(answered)
+    causes = {str((host_cov.get(h) or {}).get("silent_cause") or "") for h in silent}
+    shown = ", ".join(answered[:6]) + (" …" if len(answered) > 6 else "")
+    text = (
+        f"{len(silent)} of {total} IPs did not answer on any policy TCP port and were not assessed; "
+        + (f"all findings come from the {len(answered)} IP(s) that answered ({shown}). " if answered
+           else "no IP answered. ")
+    )
+    if "client_isolation_suspected" in causes:
+        text += (
+            "Only the network gateway answered and the silent IPs did not answer ping: Wi-Fi client "
+            "(AP) isolation, a guest network or a separate VLAN is the likely cause. Run the scan from a "
+            "wired port on the targets' network. "
+        )
+    if "host_firewall" in causes:
+        n = sum(1 for h in silent if (host_cov.get(h) or {}).get("silent_cause") == "host_firewall")
+        text += (
+            f"{n} silent IP(s) answered ping, so they are up and their firewall drops the scanner: allow "
+            "the scanner laptop's IP in the host firewall (Private/Domain profile) or scan from an allowed segment. "
+        )
+    text += "Credentials do not help until SMB 445 / SSH 22 is reachable."
+    return text[:600]
+
+
 def classify_host_coverage(
     host_cov: dict[str, Any], target_progress: Any
 ) -> tuple[dict[str, Any], list[str], list[str]]:
@@ -821,11 +930,18 @@ def classify_host_coverage(
             network_complete.append(str(cov_host))
             entry["status"] = "completed"
             counts = cov.get("port_state_counts") if isinstance(cov.get("port_state_counts"), dict) else {}
-            entry["activity"] = (
-                f"No exposed services - {int(counts.get('closed') or 0)} policy ports closed, "
-                f"{int(counts.get('filtered') or 0)} not answering"
-                + ("" if cov.get("host_responded") else " (firewall blocking or host offline)")
-            )
+            closed_n, filtered_n = int(counts.get("closed") or 0), int(counts.get("filtered") or 0)
+            if cov.get("host_responded"):
+                entry["activity"] = (
+                    f"No exposed services - host is up; {closed_n} policy ports closed, {filtered_n} not answering"
+                )
+            else:
+                # V1.10.2: nothing answered, so nothing was assessed. Say so, with
+                # the cause the agent determined (ping + which IPs answered).
+                entry["activity"] = (
+                    f"No response - not assessed: none of {closed_n + filtered_n} policy TCP ports answered"
+                    + SILENT_CAUSE_TEXT.get(str(cov.get("silent_cause") or ""), " (firewall blocking or host offline)")
+                )[:200]
         elif verdict == "discovery_alive":
             # V1.6.9 Ping-Only Discovery: aliveness is the whole result.
             entry["status"] = "completed"
@@ -889,6 +1005,10 @@ def classify_host_coverage(
             "auth_status": auth,
             "port_state_counts": cov.get("port_state_counts") if isinstance(cov.get("port_state_counts"), dict) else {},
             "stopped_at_progress": cov.get("stopped_at_progress"),
+            # V1.10.2: whether anything on this host answered, and why not.
+            "host_responded": bool(cov.get("host_responded") or tcp_ports or udp_ports or verdict != "no_exposed_services"),
+            "icmp_echo": cov.get("icmp_echo"),
+            "silent_cause": cov.get("silent_cause"),
         }
         tp[str(cov_host)] = entry
     return tp, degraded_now, network_complete
@@ -950,9 +1070,24 @@ def _merge_edge_target_progress(previous: Any, incoming: Any, targets: list[str]
                 if not isinstance(value, bool) and 1 <= port <= 65535:
                     ports.add(port)
             state["open_ports"] = sorted(ports)
+        if (old.get("coverage") and old.get("status") in {"completed", "incomplete"}
+                and state["status"] in {"completed", "incomplete"}):
+            # V1.10.2: the coverage classification is the final, explained result
+            # for this host ("No response - not assessed ..."). A late terminal
+            # progress event (it carries a task id the classified row may not
+            # have) used to replace that text with a bare "Completed" while the
+            # notes stayed, so unreachable IPs looked like clean scans.
+            kept = dict(old)
+            kept["updated_at"] = stamp
+            if seq is not None:
+                kept["event_seq"] = seq
+            merged[host] = kept
+            continue
         retained = dict(old)
         if task_id and old.get("task_id") and not same_task:
-            retained.pop("coverage", None)
+            # A new assessment of this host: the previous verdict no longer applies.
+            for stale in ("coverage", "notes", "warnings"):
+                retained.pop(stale, None)
         merged[host] = dict(retained, **state)
     return merged
 

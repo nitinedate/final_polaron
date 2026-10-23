@@ -8,6 +8,7 @@ Implements the counting contract from the AXIOM-aligned specification:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -93,12 +94,13 @@ def _setupapi_device_key(device_id: str) -> str:
     return (m.group(1) if m else did[:160]).lower()
 
 
-def count_usb_device_records(db, job_id: str) -> tuple[int, list[dict[str, Any]]]:
-    """USB Devices — Enum\\USB + USBSTOR registry instances + SetupAPI device IDs."""
-    from app.parsers.registry import parse_registry_hive
-    from app.parsers.setupapi import parse_setupapi_log
-    from app.services.artifact_live_counts import _read_job_files
+def count_usb_device_records(db, job_id: str, *, live: bool = True) -> tuple[int, list[dict[str, Any]]]:
+    """USB Devices — Enum\\USB + USBSTOR registry instances + SetupAPI device IDs.
 
+    ``live=False`` is the examiner browse path. It returns records already
+    written by inventory and does not open extracted archives or the disk image.
+    Opening those files on a click blocks the API for minutes.
+    """
     devices: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -113,80 +115,38 @@ def count_usb_device_records(db, job_id: str) -> tuple[int, list[dict[str, Any]]
 
     # Parsed records + live hive/SetupAPI — AXIOM USB ≈ Enum\USB + USBSTOR + SetupAPI.
     # Do not early-return on a small parse set (previously capped at 8 and missed devices).
-    _usb_devices_from_parse_results(db, job_id, seen, devices)
+    if not live:
+        cached = _usb_devices_from_inventory_cache(db, job_id)
+        if cached:
+            return len(cached), cached
+        _usb_devices_from_parse_results(db, job_id, seen, devices, text_scan=False)
+        return len(devices), devices
+    # V2026-10-21: one shared, single-flight read of the records stage 5 already
+    # stored (registry_evidence_index). Previously this re-streamed up to 64
+    # SYSTEM hives and 64 SetupAPI logs from the tar shards on every call, and
+    # "Your Phone Device" triggered the same read again in parallel.
+    from app.services.registry_evidence_index import registry_evidence
 
-    hive_rows = fetchall(
-        db,
-        """SELECT file_path, size_bytes, sha256 FROM job_artifacts
-           WHERE job_id=:j AND size_bytes > 4096
-             AND (file_path ILIKE '%/SYSTEM' OR lower(file_name) = 'system')
-           ORDER BY size_bytes DESC LIMIT 64""",
-        {"j": job_id},
-    )
-    if hive_rows:
-        contents = _read_job_files(db, job_id, hive_rows, max_bytes=8_000_000)
-        seen_hive_hashes: set[str] = set()
-        for row in hive_rows:
-            digest = str(row.get("sha256") or "").strip().lower()
-            if digest and digest in seen_hive_hashes:
-                continue
-            if digest:
-                seen_hive_hashes.add(digest)
-            path = (row.get("file_path") or "").replace("\\", "/")
-            data = contents.get(path)
-            if not data:
-                continue
-            try:
-                for rec in parse_registry_hive(data, path):
-                    _add(rec)
-            except Exception:
-                continue
-
-    setup_rows = fetchall(
-        db,
-        """SELECT file_path, size_bytes, sha256 FROM job_artifacts
-           WHERE job_id=:j AND size_bytes > 32 AND (
-             lower(file_name) LIKE 'setupapi.dev%'
-             OR file_path ILIKE '%setupapi.dev.log%'
-           )
-           ORDER BY size_bytes DESC LIMIT 64""",
-        {"j": job_id},
-    )
-    if setup_rows:
-        contents = _read_job_files(db, job_id, setup_rows, max_bytes=4_000_000)
-        seen_setup_hashes: set[str] = set()
-        for row in setup_rows:
-            digest = str(row.get("sha256") or "").strip().lower()
-            if digest and digest in seen_setup_hashes:
-                continue
-            if digest:
-                seen_setup_hashes.add(digest)
-            path = (row.get("file_path") or "").replace("\\", "/")
-            data = contents.get(path)
-            if not data:
-                continue
-            try:
-                for rec in parse_setupapi_log(data, path):
-                    if rec.get("record_type") != "usb_usage_event":
-                        continue
-                    did = str(rec.get("device_id") or "")
-                    if not did or not re.search(r"USB|VID_|USBSTOR|WPDBUSENUM", did, re.I):
-                        continue
-                    class_id = _setupapi_device_key(did)
-                    key = f"setupapi|{class_id}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    devices.append({
-                        "record_type": "usb_device",
-                        "bus": "SetupAPI",
-                        "device_name": class_id,
-                        "class_id": class_id,
-                        "serial": rec.get("serial"),
-                        "source": rec.get("source") or path,
-                    })
-            except Exception:
-                continue
+    index = registry_evidence(db, job_id)
+    for _path, _kind, rec in index.records("usb_device"):
+        _add(rec)
+    for path, _kind, rec in index.records("usb_usage_event", kinds={"setupapi"}):
+        did = str(rec.get("device_id") or "")
+        if not did or not re.search(r"USB|VID_|USBSTOR|WPDBUSENUM", did, re.I):
+            continue
+        class_id = _setupapi_device_key(did)
+        key = f"setupapi|{class_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        devices.append({
+            "record_type": "usb_device",
+            "bus": "SetupAPI",
+            "device_name": class_id,
+            "class_id": class_id,
+            "serial": rec.get("serial"),
+            "source": rec.get("source") or path,
+        })
 
     if not devices:
         return 0, []
@@ -194,19 +154,79 @@ def count_usb_device_records(db, job_id: str) -> tuple[int, list[dict[str, Any]]
     return len(devices), devices
 
 
-def _usb_devices_from_parse_results(db, job_id: str, seen: set[str], devices: list[dict[str, Any]]) -> None:
-    """Supplement registry USB counts with parsed usb_device records (SetupAPI / SYSTEM)."""
+def _records_from_parse_results(db, job_id: str, record_type: str, seen: set[str], out: list[dict[str, Any]]) -> None:
+    """Read one record type already stored by inventory. Does not open evidence files."""
     rows = fetchall(
         db,
         """SELECT ja.file_path, apr.normalized
            FROM job_artifacts ja
            JOIN artifact_parse_results apr ON apr.job_artifact_id = ja.id
+           WHERE ja.job_id=:j AND apr.parser_name IN ('registry', 'setupapi')
+           LIMIT 400""",
+        {"j": job_id},
+    )
+    import json as _json
+
+    for row in rows:
+        norm = row.get("normalized")
+        if isinstance(norm, str):
+            try:
+                norm = _json.loads(norm)
+            except Exception:
+                continue
+        if not isinstance(norm, list):
+            continue
+        for rec in norm:
+            if not isinstance(rec, dict) or rec.get("record_type") != record_type:
+                continue
+            key = str(rec.get("host") or rec.get("device_id") or rec.get("serial") or rec.get("source") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rec)
+
+
+def _usb_devices_from_inventory_cache(db, job_id: str) -> list[dict[str, Any]]:
+    """USB rows already written by inventory. One indexed lookup, no archive reads."""
+    row = fetchone(
+        db,
+        """SELECT metadata FROM rag_chunks
+           WHERE job_id=:j AND file_path='__forensic__/usb_devices'
+           LIMIT 1""",
+        {"j": job_id},
+    )
+    if not row:
+        return []
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except json.JSONDecodeError:
+            return []
+    devices = meta.get("devices") if isinstance(meta, dict) else None
+    if not isinstance(devices, list):
+        return []
+    return [item for item in devices if isinstance(item, dict)]
+
+
+def _usb_devices_from_parse_results(
+    db, job_id: str, seen: set[str], devices: list[dict[str, Any]], *, text_scan: bool = False,
+) -> None:
+    """Supplement registry USB counts with parsed usb_device records (SetupAPI / SYSTEM)."""
+    text_clause = ""
+    if text_scan:
+        text_clause = """
+             OR apr.normalized::text ILIKE '%usb_device%'
+             OR apr.normalized::text ILIKE '%USBSTOR%'"""
+    rows = fetchall(
+        db,
+        f"""SELECT ja.file_path, apr.normalized
+           FROM job_artifacts ja
+           JOIN artifact_parse_results apr ON apr.job_artifact_id = ja.id
            WHERE ja.job_id=:j AND (
              ja.file_path ILIKE '%/SYSTEM'
              OR lower(ja.file_name) = 'system'
-             OR ja.file_path ILIKE '%setupapi.dev%'
-             OR apr.normalized::text ILIKE '%usb_device%'
-             OR apr.normalized::text ILIKE '%USBSTOR%'
+             OR ja.file_path ILIKE '%setupapi.dev%'{text_clause}
            )
            LIMIT 500""",
         {"j": job_id},
@@ -232,58 +252,32 @@ def _usb_devices_from_parse_results(db, job_id: str, seen: set[str], devices: li
             devices.append(rec)
 
 
-def count_rdp_connection_records(db, job_id: str) -> tuple[int, list[dict[str, Any]]]:
+def count_rdp_connection_records(db, job_id: str, *, live: bool = True) -> tuple[int, list[dict[str, Any]]]:
     """RDP — Terminal Server Client Servers + MRU per user profile (parsed records)."""
-    from app.parsers.registry import parse_registry_hive
-    from app.services.artifact_live_counts import _read_job_files
-
     conns: list[dict[str, Any]] = []
     seen: set[str] = set()
+    if not live:
+        _records_from_parse_results(db, job_id, "rdp_connection", seen, conns)
+        return len(conns), conns
 
-    ntuser_rows = fetchall(
-        db,
-        """SELECT file_path, size_bytes, sha256 FROM job_artifacts
-           WHERE job_id=:j AND size_bytes > 4096 AND (
-             lower(file_name) = 'ntuser.dat'
-             OR file_path ILIKE '%/NTUSER.DAT'
-           )
-           ORDER BY size_bytes DESC""",
-        {"j": job_id},
-    )
-    if ntuser_rows:
-        contents = _read_job_files(db, job_id, ntuser_rows)
-        seen_hive_hashes: set[str] = set()
-        for row in ntuser_rows:
-            digest = str(row.get("sha256") or "").strip().lower()
-            if digest and digest in seen_hive_hashes:
-                continue
-            if digest:
-                seen_hive_hashes.add(digest)
-            path = (row.get("file_path") or "").replace("\\", "/")
-            data = contents.get(path)
-            if not data:
-                continue
-            try:
-                for rec in parse_registry_hive(data, path):
-                    if rec.get("record_type") != "rdp_connection":
-                        continue
-                    host = (rec.get("host") or "").strip()
-                    if not host or "\\AddIns\\" in host or host.lower().startswith("software\\"):
-                        continue
-                    user = (rec.get("user") or rec.get("username_hint") or path or "").strip()
-                    source = str(rec.get("source") or "")
-                    key = f"{path.lower()}|{source.lower()}|{user.lower()}|{host.lower()}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    conns.append({
-                        "host": host,
-                        "user": rec.get("user"),
-                        "username_hint": rec.get("username_hint"),
-                        "source": source or path,
-                    })
-            except Exception:
-                continue
+    from app.services.registry_evidence_index import registry_evidence
+
+    for path, _kind, rec in registry_evidence(db, job_id).records("rdp_connection", kinds={"ntuser"}):
+        host = (rec.get("host") or "").strip()
+        if not host or "\\AddIns\\" in host or host.lower().startswith("software\\"):
+            continue
+        user = (rec.get("user") or rec.get("username_hint") or path or "").strip()
+        source = str(rec.get("source") or "")
+        key = f"{path.lower()}|{source.lower()}|{user.lower()}|{host.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        conns.append({
+            "host": host,
+            "user": rec.get("user"),
+            "username_hint": rec.get("username_hint"),
+            "source": source or path,
+        })
 
     if conns:
         return len(conns), conns
@@ -293,46 +287,17 @@ def count_rdp_connection_records(db, job_id: str) -> tuple[int, list[dict[str, A
 
 def count_feature_usage_records(db, job_id: str) -> int:
     """Feature Usage — sum of FeatureUsage registry values across all NTUSER profiles."""
-    from app.parsers.registry import parse_registry_hive
-    from app.services.artifact_live_counts import _read_job_files
+    from app.services.registry_evidence_index import registry_evidence
 
     total = 0
-    ntuser_rows = fetchall(
-        db,
-        """SELECT file_path, size_bytes, sha256 FROM job_artifacts
-           WHERE job_id=:j AND size_bytes > 4096 AND (
-             lower(file_name) = 'ntuser.dat'
-             OR file_path ILIKE '%/NTUSER.DAT'
-           )
-           ORDER BY size_bytes DESC""",
-        {"j": job_id},
-    )
-    if ntuser_rows:
-        contents = _read_job_files(db, job_id, ntuser_rows)
-        seen_hive_hashes: set[str] = set()
-        for row in ntuser_rows:
-            digest = str(row.get("sha256") or "").strip().lower()
-            if digest and digest in seen_hive_hashes:
-                continue
-            if digest:
-                seen_hive_hashes.add(digest)
-            path = (row.get("file_path") or "").replace("\\", "/")
-            data = contents.get(path)
-            if not data:
-                continue
-            try:
-                for rec in parse_registry_hive(data, path):
-                    if rec.get("record_type") != "feature_usage":
-                        continue
-                    if rec.get("metric") == "app_launch_switched":
-                        continue
-                    key_path = str(rec.get("key_path") or "")
-                    subkey = key_path.rsplit("\\", 1)[-1] if key_path else ""
-                    if subkey and subkey not in _FEATURE_USAGE_SUBKEYS and "\\FeatureUsage\\" in key_path:
-                        continue
-                    total += int(rec.get("entry_count") or 0)
-            except Exception:
-                continue
+    for _path, _kind, rec in registry_evidence(db, job_id).records("feature_usage", kinds={"ntuser"}):
+        if rec.get("metric") == "app_launch_switched":
+            continue
+        key_path = str(rec.get("key_path") or "")
+        subkey = key_path.rsplit("\\", 1)[-1] if key_path else ""
+        if subkey and subkey not in _FEATURE_USAGE_SUBKEYS and "\\FeatureUsage\\" in key_path:
+            continue
+        total += int(rec.get("entry_count") or 0)
 
     if total > 0:
         return total
@@ -1101,6 +1066,24 @@ def compute_all_aligned_count_results(
         aid = str(row["artifact_id"])
         name = str(row.get("artifact_name") or aid)
         category = str(row.get("category") or "")
+        import time as _time
+
+        started = _time.monotonic()
+        try:
+            aid, result = _count_one_inner(aid, name, category)
+        finally:
+            elapsed = _time.monotonic() - started
+            if elapsed >= 30:
+                log.warning("slow inventory collector job=%s artifact=%s %.1fs", job_id, name, elapsed)
+        try:
+            snap = getattr(result, "query_snapshot", None)
+            if isinstance(snap, dict):
+                snap["collector_elapsed_ms"] = int(elapsed * 1000)
+        except Exception:
+            pass
+        return aid, result
+
+    def _count_one_inner(aid: str, name: str, category: str) -> tuple[str, CountResult]:
         try:
             if schema:
                 from app.db.session import firm_session_readonly
@@ -1130,8 +1113,8 @@ def compute_all_aligned_count_results(
         for idx, row in enumerate(ax_rows, start=1):
             aid, result = _count_one(row)
             results[aid] = result
-            if progress_cb and (idx == 1 or idx == total or idx % 5 == 0):
-                progress_cb(f"Counting {row.get('artifact_name') or aid}", idx, total)
+            if progress_cb:
+                progress_cb(f"Counted {row.get('artifact_name') or aid}", idx, total)
         return results
 
     # Bounded in-flight window — avoids submitting hundreds of futures / DB checkouts at once.
@@ -1163,8 +1146,8 @@ def compute_all_aligned_count_results(
                     results[aid] = result
                     done_n += 1
                     n = done_n
-                if progress_cb and (n == 1 or n == total or n % 5 == 0):
-                    progress_cb(f"Counting {row.get('artifact_name') or aid}", n, total)
+                if progress_cb:
+                    progress_cb(f"Counted {row.get('artifact_name') or aid}", n, total)
                 try:
                     nxt = next(row_iter)
                 except StopIteration:

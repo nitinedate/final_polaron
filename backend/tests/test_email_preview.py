@@ -54,7 +54,7 @@ def test_build_artifact_preview_includes_email_block(monkeypatch) -> None:
         "file_path": "Mail/Inbox/message.eml",
         "file_name": "message.eml",
         "extension": ".eml",
-        "minio_uri": None,
+        "minio_uri": "s3://bucket/message.eml",
         "metadata": {},
     }
     raw = _sample_eml()
@@ -68,3 +68,66 @@ def test_build_artifact_preview_includes_email_block(monkeypatch) -> None:
     assert preview["body_text"]
     assert preview["attachments"][0]["filename"] == "report.pdf"
     assert preview["attachment_count"] == 1
+
+
+# ---------------------------------------------------------------- carved EML fragments
+def test_readable_email_gate_accepts_real_and_rejects_binary() -> None:
+    from app.services.artifact_preview import _decode_text, _looks_like_readable_email
+    import os
+
+    real = ("From: a@x.com\r\nTo: b@y.com\r\nSubject: Project update\r\n\r\n"
+            "Hi Bob, please review the attached figures and reply by Friday. Thanks, Alice.\r\n")
+    assert _looks_like_readable_email(real) is True
+    assert _looks_like_readable_email("Subject: hi\r\n\r\nSee you at 3pm in room 2.\r\n") is True
+    # 200 random carved blobs must never be mistaken for readable email.
+    fp = sum(1 for _ in range(200) if _looks_like_readable_email(_decode_text(os.urandom(4000))))
+    assert fp == 0
+    # EML signature followed by binary (the pagefile carve case).
+    frag = b"Subject: carved\r\nFrom: x\r\nMIME-Version: 1.0\r\n\r\n" + os.urandom(3500)
+    assert _looks_like_readable_email(_decode_text(frag)) is False
+
+
+def _carved_row(path="pagefile.sys", name="carved-eml-pagefile.sys-387610514.eml"):
+    return {
+        "id": "c1", "file_path": path, "file_name": name, "extension": ".eml",
+        "minio_uri": "s3://bucket/carved.eml", "metadata": {"carved": True},
+        "artifact_type": "carved_eml",
+    }
+
+
+def test_carved_binary_eml_is_not_dumped_as_text(monkeypatch) -> None:
+    import os
+
+    raw = b"Subject: carved-eml\r\nFrom: x\r\nMIME-Version: 1.0\r\n\r\n" + os.urandom(4000)
+    monkeypatch.setattr(artifact_preview, "_load_artifact_row", lambda db, jid, aid: _carved_row())
+    monkeypatch.setattr(artifact_preview, "resolve_artifact_bytes", lambda *a, **k: raw)
+    monkeypatch.setattr(artifact_preview, "_link_attachment_artifacts", lambda db, jid, path, atts: atts)
+
+    preview = artifact_preview.build_artifact_preview(_FakeDb(), "job", "c1")
+    # Email shell still mounts, but the body is an honest notice, not binary.
+    assert preview["email"]["subject"]
+    assert preview.get("carved_unparsed") is True
+    assert "signature carving" in preview["body_text"].lower()
+    # No replacement chars / mojibake leaked into the body.
+    assert "\ufffd" not in preview["body_text"]
+    assert preview["body"] == preview["body_text"]
+    assert preview["attachment_count"] == 0
+
+
+def test_real_eml_that_trips_strict_parser_still_shows_body(monkeypatch) -> None:
+    # A valid RFC822 message the strict parser rejects must keep its readable body.
+    raw = (b"From: real@example.com\r\nTo: b@example.com\r\n"
+           b"Subject: Genuine message\r\n\r\n"
+           b"This is a perfectly readable plain-text email body that should be shown.\r\n")
+    monkeypatch.setattr(artifact_preview, "_load_artifact_row", lambda db, jid, aid: _carved_row())
+    monkeypatch.setattr(artifact_preview, "resolve_artifact_bytes", lambda *a, **k: raw)
+    monkeypatch.setattr(artifact_preview, "_link_attachment_artifacts", lambda db, jid, path, atts: atts)
+    # Force the strict parser to "fail" so we exercise the fallback path.
+    monkeypatch.setattr(artifact_preview, "build_email_preview_details",
+                        lambda data, path: {"parse_ok": False}, raising=False)
+    import app.parsers.email_mime_parser as em
+    monkeypatch.setattr(em, "build_email_preview_details", lambda data, path: {"parse_ok": False})
+
+    preview = artifact_preview.build_artifact_preview(_FakeDb(), "job", "c1")
+    assert preview.get("carved_unparsed") is not True
+    assert "readable plain-text email body" in preview["body_text"]

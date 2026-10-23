@@ -157,7 +157,7 @@ def classify_stage(job, stage, *, now=None):
         if progress_age >= STARTUP_STALL_SECONDS and total_items <= 0 and accounted <= 0 and startup:
             if _age(stage.get("heartbeat_at"), now) >= CHECK_AFTER_SECONDS:
                 return "recover", "Stage never started evidence work and its heartbeat is stale"
-            return "cancel", "Stage process is alive but has not started evidence work; progressAgent is restarting it"
+            return "valid_wait", "Stage owner is alive; waiting for initial evidence work"
         if total_items > 0 and accounted >= total_items:
             return "valid_wait", f"Bounded operation in progress: {stage.get('operation') or stage['stage']}"
         # The operation deadline used to hide this. A child blocked on a file
@@ -192,14 +192,14 @@ def classify_stage(job, stage, *, now=None):
         if progress_age >= ITEM_STALL_SECONDS:
             if _age(stage.get("heartbeat_at"), now) >= CHECK_AFTER_SECONDS:
                 return "recover", "No evidence item committed and the stage heartbeat is stale"
-            return "cancel", "No evidence item has been committed; progressAgent is restarting the stage"
+            return "valid_wait", "Stage owner is alive; waiting for a committed batch"
         deadline = stage.get("operation_deadline")
         if deadline and _age(deadline, now) == 0:
             return "valid_wait", f"Bounded operation in progress: {stage.get('operation') or stage['stage']}"
         if _age(stage.get('heartbeat_at'),now)>=CHECK_AFTER_SECONDS:
             return 'recover','Owning stage heartbeat is stale and its operation deadline expired'
         if deadline and _age(deadline, now) >= LIVELOCK_AFTER_DEADLINE_SECONDS:
-            return "cancel", "Declared operation exceeded its deadline without committed progress; progressAgent is restarting the stage"
+            return "valid_wait", "Stage owner is alive past its operation deadline; report slow stage without duplicate restart"
         # A live owner is still inside the stage. Quiet progress is not a pause.
         return "valid_wait", f"Owning stage is still running: {stage.get('operation') or stage['stage']}"
     if state == "queued" and _age(stage.get("updated_at"), now) < CHECK_AFTER_SECONDS:

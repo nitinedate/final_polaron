@@ -171,12 +171,35 @@ def _upsert_parse_result(db, job_artifact_id: str, payload: list[dict[str, Any]]
     )
 
 
+_SCAN_JOB_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _pst_job_lock(job_id: str) -> threading.Lock:
+    with _LOCK:
+        lock = _SCAN_JOB_LOCKS.get(job_id)
+        if lock is None:
+            lock = _SCAN_JOB_LOCKS[job_id] = threading.Lock()
+        return lock
+
+
 def scan_job_pst_mailboxes(db, job_id: str, *, force: bool = False) -> dict[str, Any]:
-    """Scan PST/OST files once; cache counts + persist message metadata for browse."""
+    """Scan PST/OST files once; cache counts + persist message metadata for browse.
+
+    Single-flight per job: Outlook Emails and Email Attachments run in parallel
+    inventory threads and previously both missed the cache and each streamed up
+    to 40 mailboxes (80 MB each) from the tar shards.
+    """
     with _LOCK:
         if not force and job_id in _JOB_CACHE:
             return dict(_JOB_CACHE[job_id])
+    with _pst_job_lock(str(job_id)):
+        with _LOCK:
+            if not force and job_id in _JOB_CACHE:
+                return dict(_JOB_CACHE[job_id])
+        return _scan_job_pst_mailboxes_impl(db, job_id)
 
+
+def _scan_job_pst_mailboxes_impl(db, job_id: str) -> dict[str, Any]:
     from app.services.artifact_live_counts import _read_job_files
 
     rows = fetchall(

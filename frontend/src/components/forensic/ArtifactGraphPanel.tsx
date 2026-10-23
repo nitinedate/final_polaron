@@ -33,22 +33,40 @@ export function ArtifactGraphPanel({ jobId, artifact }: { jobId: string; artifac
   const [error, setError] = useState<string | null>(null);
 
   const isDisk = artifact.artifact_type === "disk_image";
+  const virtual = artifact.id.startsWith("carve-") || artifact.id.startsWith("ev-");
+  const sourcePath = String(artifact.source_path || artifact.metadata?.source_path || artifact.file_name || "");
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     setError(null);
-
-    const graphReq = forensicApi.getArtifactGraph(jobId, artifact.id).catch(() => null);
-    const treeReq = isDisk
-      ? Promise.resolve(fileTreeFromMetadata(artifact, jobId))
-      : forensicApi.getJobFileTree(jobId).catch(() => null);
-
-    Promise.all([graphReq, treeReq])
-      .then(([g, tree]) => {
-        if (cancelled) return;
-        setGraph(g);
-        setFileTree(tree);
+    if (isDisk) {
+      setGraph(null);
+      setFileTree(fileTreeFromMetadata(artifact, jobId));
+      setLoading(false);
+      return;
+    }
+    // One selected file is not the whole disk tree. The job file-tree call
+    // reads thousands of paths and was repeated on every carved-mail click.
+    const ownNode: JobFileTree | null = sourcePath
+      ? {
+          job_id: jobId,
+          disk_artifact_id: artifact.id,
+          summary: { total_nodes: 1, file_count: 1, dir_count: 0, interesting_file_count: 0 },
+          nodes: [{ path: sourcePath, name: sourcePath.split(/[\\/]/).pop() || sourcePath, type: "file" }],
+          root: null,
+        }
+      : null;
+    setFileTree(ownNode);
+    if (virtual) {
+      setGraph({ artifact_id: artifact.id, entities: [], relationships: [] });
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    forensicApi
+      .getArtifactGraph(jobId, artifact.id)
+      .then((g) => {
+        if (!cancelled) setGraph(g);
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof Error ? e.message : "Graph data unavailable");
@@ -56,11 +74,10 @@ export function ArtifactGraphPanel({ jobId, artifact }: { jobId: string; artifac
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-
     return () => {
       cancelled = true;
     };
-  }, [jobId, artifact.id, artifact.artifact_type, isDisk, artifact.metadata]);
+  }, [jobId, artifact, artifact.id, isDisk, virtual, sourcePath]);
 
   const entities =
     graph?.entities ?? (artifact.metadata?.entities as ArtifactGraph["entities"] | undefined) ?? [];

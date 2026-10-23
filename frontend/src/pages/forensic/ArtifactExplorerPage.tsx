@@ -21,27 +21,49 @@ export function ArtifactExplorerPage() {
   const parentRef = useRef<HTMLDivElement>(null);
 
   const [tree, setTree] = useState<CategoryTree | null>(null);
+  const [reportTaxonomy, setReportTaxonomy] = useState<{key: string; title: string; count?: number; items: {key: string; title: string; count?: number}[]}[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [catalogSelected, setCatalogSelected] = useState<{ catalogKey: string | null; catalogSection: string | null }>({ catalogKey: null, catalogSection: null });
   const [selected, setSelected] = useState<{ category: string | null; subCategory: string | null }>({
     category: null,
     subCategory: null,
   });
   const [detail, setDetail] = useState<Artifact | null>(null);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const detailRequest = useRef(0);
+  const listingRequest = useRef(0);
+  const listingBusy = useRef(false);
   const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState<string | null>(null);
   const [comment, setComment] = useState("");
   const [jobStatus, setJobStatus] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [reviewSummary, setReviewSummary] = useState<ArtifactReviewSummary | null>(null);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 300);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+
+  useEffect(() => {
+    if (!jobId) return;
+    let active = true;
+    forensicApi.getArtifactTaxonomy(jobId).then(
+      result => { if (active) setReportTaxonomy(result.sections ?? []); },
+      () => { if (active) setReportTaxonomy([]); }
+    );
+    return () => { active = false; };
+  }, [jobId]);
+
   const loadTree = useCallback(async () => {
     if (!jobId) return;
     try {
       const t = await forensicApi.getArtifactCategories(jobId);
-      setTree(t);
+      if (t && Array.isArray(t.categories)) setTree(t);
     } catch {
       /* optional */
     }
@@ -68,35 +90,54 @@ export function ArtifactExplorerPage() {
 
   const loadArtifacts = useCallback(async (opts?: { silent?: boolean; page?: number; append?: boolean }) => {
     if (!jobId) return;
+    const requestId = ++listingRequest.current;
     const pageToLoad = opts?.page ?? 1;
     const append = Boolean(opts?.append);
-    if (!opts?.silent && !append) setLoading(true);
-    if (append) setLoadingMore(true);
+    if (!opts?.silent && !append) { setLoading(true); setListError(null); }
+    if (append) {
+      if (listingBusy.current) return;
+      listingBusy.current = true;
+      setLoadingMore(true);
+    }
     try {
       const res = await forensicApi.listArtifacts(jobId, {
         page: pageToLoad,
         page_size: PAGE_SIZE,
-        category: selected.category ?? undefined,
-        sub_category: selected.subCategory ?? undefined,
-        q: search || undefined,
+        category: catalogSelected.catalogKey || catalogSelected.catalogSection ? undefined : selected.category ?? undefined,
+        sub_category: catalogSelected.catalogKey || catalogSelected.catalogSection ? undefined : selected.subCategory ?? undefined,
+        catalog_key: catalogSelected.catalogKey ?? undefined,
+        catalog_section: catalogSelected.catalogSection ?? undefined,
+        q: debouncedSearch || undefined,
       });
-      setTotal(res.total);
+      if (requestId !== listingRequest.current) return;
+      setListError(null);
+      setTotal(Number(res.total ?? 0));
       setPage(pageToLoad);
       setArtifacts((prev) => {
         if (!append) return res.items;
         const seen = new Set(prev.map((row) => row.id));
         return [...prev, ...res.items.filter((row) => !seen.has(row.id))];
       });
-      setDetail((prev) => prev ?? res.items[0] ?? null);
+      if (!append) {
+        const first = res.items?.[0] ?? null;
+        setDetail(first);
+        if (first) { setComment(first.examiner_comment ?? ""); }
+      }
     } catch (e: unknown) {
+      if (requestId !== listingRequest.current) return;
       if (!opts?.silent) {
-        toast.error(e instanceof Error ? e.message : "Failed to load artifacts");
+        const message = e instanceof Error ? e.message : "Failed to load artifacts";
+        setListError(message);
+        toast.error(message);
       }
     } finally {
-      if (!opts?.silent) setLoading(false);
-      setLoadingMore(false);
+      if (append) listingBusy.current = false;
+      if (requestId === listingRequest.current) {
+        if (!opts?.silent) setLoading(false);
+        setLoadingMore(false);
+      }
     }
-  }, [jobId, selected, search, toast]);
+  }, [jobId, selected, catalogSelected, debouncedSearch, toast]);
 
   useEffect(() => {
     loadTree();
@@ -111,17 +152,23 @@ export function ArtifactExplorerPage() {
     if (!jobId || !ragInProgress) return;
     const timer = window.setInterval(() => {
       loadTree();
-      loadArtifacts({ silent: true });
+      // Preserve selected filters and avoid repeatedly querying expensive catalog listings.
+      // A new selection or search triggers its own request.
       loadJobStatus();
     }, 5000);
     return () => window.clearInterval(timer);
   }, [jobId, ragInProgress, loadTree, loadArtifacts, loadJobStatus]);
 
   useEffect(() => {
+    ++listingRequest.current;
+    ++detailRequest.current;
     setDetail(null);
     setPage(1);
+    setTotal(0);
     setArtifacts([]);
-  }, [selected, search]);
+    setListError(null);
+    parentRef.current?.scrollTo({ top: 0 });
+  }, [selected, catalogSelected, debouncedSearch]);
 
   useEffect(() => {
     loadArtifacts({ page: 1 });
@@ -145,15 +192,19 @@ export function ArtifactExplorerPage() {
   }, [lastVirtual, artifacts.length, total, page, loading, loadingMore, loadArtifacts]);
 
   async function selectArtifact(a: Artifact) {
+    // Render the already loaded metadata immediately. Never block the examiner UI
+    // on heavyweight backend enrichment or a slow artifact lookup.
+    const request = ++detailRequest.current;
     setDetail(a);
     setComment(a.examiner_comment ?? "");
     if (!jobId) return;
     try {
       const full = await forensicApi.getArtifact(jobId, a.id);
+      if (request !== detailRequest.current) return;
       setDetail(full);
       setComment(full.examiner_comment ?? "");
     } catch {
-      /* use list item */
+      /* The list row remains usable when detail enrichment is unavailable. */
     }
   }
 
@@ -176,7 +227,9 @@ export function ArtifactExplorerPage() {
     try {
       await forensicApi.downloadArtifactsExport(jobId, {
         q: search || undefined,
-        category: selected.category ?? undefined,
+        category: catalogSelected.catalogKey || catalogSelected.catalogSection ? undefined : selected.category ?? undefined,
+        catalog_key: catalogSelected.catalogKey ?? undefined,
+        catalog_section: catalogSelected.catalogSection ?? undefined,
       });
       toast.success("Artifacts exported to Excel");
     } catch (e: unknown) {
@@ -249,9 +302,17 @@ export function ArtifactExplorerPage() {
             <ArtifactCategoryTree
               jobId={jobId}
               categories={tree.categories}
+              taxonomy={reportTaxonomy.length ? reportTaxonomy : (tree.taxonomy ?? [])}
+              catalogSelected={catalogSelected}
+              onCatalogSelect={(catalogKey, catalogSection) => {
+                setCatalogSelected({ catalogKey, catalogSection });
+                setSelected({ category: null, subCategory: null });
+                setDetail(null);
+              }}
               total={tree.total}
               selected={selected}
               onSelect={(category, subCategory) => {
+                setCatalogSelected({ catalogKey: null, catalogSection: null });
                 setSelected({ category, subCategory });
                 setDetail(null);
               }}
@@ -281,6 +342,8 @@ export function ArtifactExplorerPage() {
           </div>
           {loading ? (
             <Spinner />
+          ) : listError ? (
+            <div role="alert" className="p-5 text-sm text-red-700">Unable to load the selected artifacts: {listError}</div>
           ) : artifacts.length === 0 ? (
             <p className="py-16 text-center text-sm text-ink-400">No artifacts found.</p>
           ) : (
@@ -303,11 +366,23 @@ export function ArtifactExplorerPage() {
                         <span className="block truncate font-medium text-ink-800">
                           {a.title || a.artifact_type}
                         </span>
-                        {a.artifact_datetime && (
-                          <span className="text-xs text-amber-700">
-                            Deleted {new Date(a.artifact_datetime).toLocaleString()}
-                          </span>
-                        )}
+                        {(() => {
+                          const meta = a.metadata || {};
+                          const when = String(
+                            meta.last_visit || meta.file_created || meta.ctime || meta.created_time
+                            || a.artifact_datetime || a.created_at || "",
+                          );
+                          if (!when) return null;
+                          const deleted = Boolean(meta.is_deleted) || a.tags?.includes("deleted");
+                          const label = deleted ? "Deleted" : String(meta.evidence_kind || "") === "url_visit" ? "Visited" : meta.file_created || meta.ctime ? "Created" : "Recovered";
+                          const parsed = new Date(when);
+                          const shown = Number.isNaN(parsed.getTime()) ? when : parsed.toLocaleString();
+                          return (
+                            <span className={clsx("text-xs", deleted ? "text-amber-700" : "text-ink-400")}>
+                              {label} {shown}
+                            </span>
+                          );
+                        })()}
                       </span>
                       {a.tags?.includes("deleted") || a.metadata?.is_deleted ? (
                         <Badge tone="amber">deleted</Badge>

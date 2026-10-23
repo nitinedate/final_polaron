@@ -193,28 +193,8 @@ def get_artifact_media_properties(db: Session, job_id: str, artifact_id: str) ->
         image = {}
 
     probe: dict[str, Any] = {}
-    need_image_probe = kind == "image" and (not width or not height)
-    need_av_probe = kind in {"video", "audio"} and (
-        (kind == "video" and (not width or not height)) or duration is None
-    )
-    if need_image_probe or need_av_probe:
-        temp_path = None
-        try:
-            temp_path = _stream_to_temp(db, job_id, row, ext or ".bin")
-            probe = _image_probe(temp_path) if need_image_probe else _ffprobe(temp_path)
-            width = _int(probe.get("width")) or width
-            height = _int(probe.get("height")) or height
-            duration = _float(probe.get("duration_seconds")) or duration
-            fmt = probe.get("format") or fmt
-            source = "evidence_probe"
-        except Exception as exc:
-            probe = {"probe_error": str(exc)}
-        finally:
-            if temp_path:
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
+    # Do not stream the evidence file just to measure a click. Opening the
+    # archive here blocks preview and download of every other artifact.
 
     if not content_type or content_type == "application/octet-stream":
         content_type = mimetypes.guess_type(filename)[0] or content_type

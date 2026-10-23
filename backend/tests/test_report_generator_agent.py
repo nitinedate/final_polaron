@@ -174,8 +174,8 @@ def test_artifact_page_budget_splits_groups_so_panel_text_is_not_clipped():
     ).read_text(encoding="utf-8")
     assert "paginateArtifactItemCosts" in src
     assert "ARTIFACT_ITEM_UNITS = 4" in src
-    assert "ARTIFACT_PAGE_UNITS = 28" in src
-    header, item, capacity = 2, 4, 28
+    assert "ARTIFACT_PAGE_UNITS = 36" in src
+    header, item, capacity = 2, 4, 36
     application_usage = header + 4 * item
     communication = header + 5 * item
     assert application_usage + communication > capacity

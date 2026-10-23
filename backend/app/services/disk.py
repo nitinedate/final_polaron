@@ -367,6 +367,8 @@ def _build_extracted_image_locked(db: Session, job_id: str, *, schema_name: str)
                 },
                 extract_mobile_meta(prior),
             )
+            if prior.get("processing_profile") in ("standard", "deep"):
+                mount_ds["processing_profile"] = prior["processing_profile"]
             execute(
                 db,
                 """UPDATE jobs SET
@@ -487,6 +489,8 @@ def _build_extracted_image_locked(db: Session, job_id: str, *, schema_name: str)
                 fetchone(db, "SELECT disk_source FROM jobs WHERE id=:job_id", {"job_id": job_id})
             )
             manifest = merge_mobile_meta_into_disk_source(manifest, extract_mobile_meta(prior))
+            if prior.get("processing_profile") in ("standard", "deep"):
+                manifest["processing_profile"] = prior["processing_profile"]
             if (
                 not bool(getattr(settings, "extract_then_process", True)) and not serial_enabled()
                 and settings.phase3_stream_during_extract

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -610,11 +611,7 @@ def extract_url_records_from_sqlite(data: bytes, path: str) -> list[dict[str, An
     return [_enrich_url_record(rec, source=path) for rec in out]
 
 
-def _collect_urls_from_message_stores(db, job_id: str) -> list[dict[str, Any]]:
-    """Recover http(s) links embedded in SMS / WhatsApp message text (when Safari History is absent)."""
-    rows = fetchall(
-        db,
-        """SELECT file_path, size_bytes FROM job_artifacts
+_MESSAGE_STORE_SQL = """SELECT file_path, size_bytes FROM job_artifacts
            WHERE job_id=:j AND size_bytes > 1024 AND size_bytes < 524288000 AND (
              lower(file_name) IN ('sms.db', 'chatstorage.sqlite', 'msgstore.db')
              OR file_path ILIKE '%/Library/SMS/sms.db'
@@ -622,12 +619,24 @@ def _collect_urls_from_message_stores(db, job_id: str) -> list[dict[str, Any]]:
              OR file_path ILIKE '%/msgstore.db'
            )
            ORDER BY size_bytes DESC NULLS LAST
-           LIMIT 12""",
-        {"j": job_id},
-    )
+           LIMIT 12"""
+_SHORTCUT_SQL = """SELECT file_path, size_bytes FROM job_artifacts
+           WHERE job_id=:j AND size_bytes > 20 AND size_bytes < 65536 AND (
+             lower(coalesce(extension,''))='.url'
+             OR file_path ILIKE '%.url'
+           )
+           ORDER BY size_bytes DESC NULLS LAST
+           LIMIT 400"""
+
+
+def _collect_urls_from_message_stores(db, job_id: str, *, rows=None, contents=None) -> list[dict[str, Any]]:
+    """Recover http(s) links embedded in SMS / WhatsApp message text (when Safari History is absent)."""
+    if rows is None:
+        rows = fetchall(db, _MESSAGE_STORE_SQL, {"j": job_id})
     if not rows:
         return []
-    contents = _read_job_files(db, job_id, rows, max_bytes=_inventory_max_db_bytes())
+    if contents is None:
+        contents = _read_job_files(db, job_id, rows, max_bytes=_inventory_max_db_bytes())
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
@@ -698,22 +707,14 @@ def clear_browser_url_cache(job_id: str | None = None) -> None:
             _URL_TOTALS_CACHE.clear()
 
 
-def _collect_internet_shortcut_urls(db, job_id: str) -> list[dict[str, Any]]:
+def _collect_internet_shortcut_urls(db, job_id: str, *, rows=None, contents=None) -> list[dict[str, Any]]:
     """Internet Shortcut (.url) files — often hold social/chat landing URLs."""
-    rows = fetchall(
-        db,
-        """SELECT file_path, size_bytes FROM job_artifacts
-           WHERE job_id=:j AND size_bytes > 20 AND size_bytes < 65536 AND (
-             lower(coalesce(extension,''))='.url'
-             OR file_path ILIKE '%.url'
-           )
-           ORDER BY size_bytes DESC NULLS LAST
-           LIMIT 400""",
-        {"j": job_id},
-    )
+    if rows is None:
+        rows = fetchall(db, _SHORTCUT_SQL, {"j": job_id})
     if not rows:
         return []
-    contents = _read_job_files(db, job_id, rows, max_bytes=65_536)
+    if contents is None:
+        contents = _read_job_files(db, job_id, rows, max_bytes=65_536)
     out: list[dict[str, Any]] = []
     for row in rows:
         path = (row.get("file_path") or "").replace("\\", "/")
@@ -745,7 +746,57 @@ def _browser_source_origin(path: str) -> str:
     return "browser_aux"
 
 
-def collect_job_browser_url_records(db, job_id: str) -> list[dict[str, Any]]:
+def _persisted_browser_visits(db, job_id: str) -> list[dict[str, Any]]:
+    """URL visits already stored. Does not open browser databases."""
+    try:
+        rows = fetchall(
+            db,
+            """SELECT timestamp_utc, data, forensic
+               FROM forensic_priority_records
+               WHERE job_id=:jid AND artifact_type='browser_url' AND source_domain='browser'
+               ORDER BY timestamp_utc DESC NULLS LAST
+               LIMIT 5000""",
+            {"jid": job_id},
+        )
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        data = row.get("data") or {}
+        forensic = row.get("forensic") or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(forensic, str):
+            try:
+                forensic = json.loads(forensic)
+            except json.JSONDecodeError:
+                forensic = {}
+        if not isinstance(data, dict):
+            continue
+        url = str(data.get("url") or "").strip()
+        if not url:
+            continue
+        visited = data.get("last_visit")
+        if not visited and row.get("timestamp_utc") is not None:
+            stamp = row.get("timestamp_utc")
+            visited = stamp.isoformat() if hasattr(stamp, "isoformat") else str(stamp)
+        source = str((forensic or {}).get("source_path") or "")
+        out.append({
+            "url": url,
+            "title": data.get("title"),
+            "visit_count": data.get("visit_count") or 1,
+            "last_visit": visited,
+            "browser": data.get("browser") or infer_browser_label(source),
+            "source": source,
+            "record_origin": "browser_history",
+        })
+    return out
+
+
+def collect_job_browser_url_records(db, job_id: str, *, live: bool = True) -> list[dict[str, Any]]:
     """Scan URL-bearing sources with provenance-aware de-duplication.
 
     A URL in Chrome/Edge/Firefox profile A is a different occurrence source from
@@ -753,6 +804,11 @@ def collect_job_browser_url_records(db, job_id: str) -> list[dict[str, Any]]:
     kept only MAX(visit_count), losing valid visits. Conversely, bookmark/message/
     carved URLs are not browser-visit records and must not inflate visit counts.
     """
+    stored = _persisted_browser_visits(db, job_id)
+    if stored:
+        return stored
+    if not live:
+        return []
     from app.services.forensic_serial_policy import serial_enabled
     if serial_enabled():
         from app.services.forensic_priority_evidence import priority_record_table
@@ -765,7 +821,10 @@ def collect_job_browser_url_records(db, job_id: str) -> list[dict[str, Any]]:
             if control and control.get("name"):
                 complete = bool(fetchone(db,"""SELECT 1 AS ok FROM pipeline_stage_runs WHERE job_id=:jid AND stage='parse'
                     AND status='done' AND EXISTS(SELECT 1 FROM pipeline_stage_runs WHERE job_id=:jid AND stage='media_review')""",{"jid":job_id}))
-            if persisted or complete:
+            # Disk jobs no longer populate priority browser rows (disk priority
+            # scan removed 2026-10-19); "complete" there must NOT mean "no URLs".
+            # Only mobile normalized artifacts are authoritative when empty.
+            if persisted or (complete and table == "mobile_normalized_artifacts"):
                 merged = {}
                 for row in persisted:
                     data,forensic = row["data"] or {},row["forensic"] or {}
@@ -791,7 +850,16 @@ def collect_job_browser_url_records(db, job_id: str) -> list[dict[str, Any]]:
             return hit[1]
 
     rows = fetchall(db, _BROWSER_SOURCE_SQL, {"j": job_id})
-    contents = _read_job_files(db, job_id, rows, max_bytes=_inventory_max_db_bytes())
+    shortcut_rows = fetchall(db, _SHORTCUT_SQL, {"j": job_id})
+    message_rows = fetchall(db, _MESSAGE_STORE_SQL, {"j": job_id})
+    # One streamed pass per tar shard for all three source families (was three).
+    from app.services.artifact_live_counts import read_job_files_capped
+
+    contents = read_job_files_capped(db, job_id, [
+        (rows, _inventory_max_db_bytes()),
+        (shortcut_rows, 65_536),
+        (message_rows, _inventory_max_db_bytes()),
+    ])
 
     def _merge_rec(
         merged: dict[str, dict[str, Any]],
@@ -832,10 +900,10 @@ def collect_job_browser_url_records(db, job_id: str) -> list[dict[str, Any]]:
         for rec in extract_url_records_from_sqlite(data, path):
             _merge_rec(merged, rec, source=path, origin=origin)
 
-    for rec in _collect_internet_shortcut_urls(db, job_id):
+    for rec in _collect_internet_shortcut_urls(db, job_id, rows=shortcut_rows, contents=contents):
         _merge_rec(merged, rec, source=str(rec.get("source") or ""), origin="internet_shortcut")
     try:
-        for rec in _collect_urls_from_message_stores(db, job_id):
+        for rec in _collect_urls_from_message_stores(db, job_id, rows=message_rows, contents=contents):
             _merge_rec(merged, rec, source=str(rec.get("source") or ""), origin="message_store")
     except Exception as exc:
         log.debug("message-store URL merge failed job=%s: %s", job_id, exc)

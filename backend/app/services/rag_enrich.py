@@ -35,6 +35,24 @@ _SQL_COUNT_RES = {
     "email": r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
     "ip": r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)",
 }
+def _full_text_enrichment() -> bool:
+    """Entity-mention counters are statistics shown on the pipeline card; no report,
+    retrieval or validation step consumes them. Scanning the FULL normalized JSON of
+    every parse result with eight regexes took minutes on large disks, so the serial
+    stage now uses the same 3,500-character sample as the incremental path.
+    FORENSIC_ENRICH_FULL_TEXT=true restores the full-text scan.
+    """
+    import os
+
+    return (os.environ.get("FORENSIC_ENRICH_FULL_TEXT") or "false").strip().lower() in {"1", "true", "yes"}
+
+
+def _serial_full_scan() -> bool:
+    from app.services.forensic_serial_policy import current_stage
+
+    return current_stage() == "enrichment" and _full_text_enrichment()
+
+
 _EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
 
@@ -60,7 +78,7 @@ def extract_entities_from_normalized(normalized: Any) -> dict[str, int]:
     nodes = 0
     from app.services.forensic_serial_policy import current_stage
 
-    full = current_stage() == "enrichment"
+    full = _serial_full_scan()
 
     def bump(kind: str) -> None:
         counts[kind] = counts.get(kind, 0) + 1
@@ -205,7 +223,7 @@ def _sql_aggregate_batch(db, job_id: str, last_id: str, batch_size: int) -> dict
         "jid": job_id,
         "last": last_id,
         "lim": int(batch_size),
-        "nchars": 0 if current_stage() == "enrichment" else ENRICH_SAMPLE_CHARS,
+        "nchars": 0 if _serial_full_scan() else ENRICH_SAMPLE_CHARS,
     }
     params.update({f"{kind}_re": pattern for kind, pattern in _SQL_COUNT_RES.items()})
     return fetchone(
@@ -248,7 +266,7 @@ def run_rag_enrichment_batch(
     """Scan the next batch of parse results. Returns updated stats."""
     from app.services.forensic_serial_policy import current_stage
 
-    full = current_stage() == "enrichment"
+    full = _serial_full_scan()
     stats = dict(current) if current else load_enrichment_stats(db, job_id)
     if full and not stats.get("full_corpus"):
         stats = {}  # Legacy sample counts cannot stand in for a full serial scan.
@@ -338,6 +356,7 @@ def run_rag_enrichment_batch(
         "ontology_mapped": ontology_mapped,
         "complete": bool(complete),
         "full_corpus": full,
+        "sample_chars": 0 if full else ENRICH_SAMPLE_CHARS,
     }
     persist_enrichment_stats(db, job_id, stats)
     if on_progress is not None:

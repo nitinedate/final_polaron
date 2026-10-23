@@ -42,6 +42,14 @@ def clear_inventory_runtime_cache(job_id: str) -> None:
         clear_carve_cache(job_id)
     except Exception:
         pass
+    try:
+        from app.services.email_inventory import clear_parsed_record_count_cache
+        from app.services.registry_evidence_index import clear_registry_evidence_cache
+
+        clear_registry_evidence_cache(job_id)
+        clear_parsed_record_count_cache(job_id)
+    except Exception:
+        pass
 
 
 _MIN_ARTIFACTS_FOR_INVENTORY = 500
@@ -1279,10 +1287,14 @@ def _run_axiom_artifact_inventory_impl(
     # Fresh inventory run — drop stale collector caches from prior passes.
     try:
         from app.services.browser_url_inventory import clear_browser_url_cache
+        from app.services.email_inventory import clear_parsed_record_count_cache
         from app.services.encryption_inventory import clear_encryption_count_cache
+        from app.services.registry_evidence_index import clear_registry_evidence_cache
 
         clear_browser_url_cache(job_id)
         clear_encryption_count_cache(job_id)
+        clear_registry_evidence_cache(job_id)
+        clear_parsed_record_count_cache(job_id)
     except Exception:
         pass
 
@@ -1414,7 +1426,7 @@ def _run_axiom_artifact_inventory_impl(
         stage: str | None = None,
         path_frac: float | None = None,
     ) -> None:
-        if idx == 0 or idx == 1 or idx == total or idx % 5 == 0 or path_frac is not None:
+        if True:  # every collector completion (was every 5th; 36 rows looked frozen)
             from app.services.job_locks import DEFAULT_INVENTORY_LOCK_TTL_SEC, refresh_job_lock
 
             refresh_job_lock("inventory", job_id, ttl_sec=DEFAULT_INVENTORY_LOCK_TTL_SEC)
@@ -1541,8 +1553,19 @@ def _run_axiom_artifact_inventory_impl(
                 f"path index not ready with {art_n:,} job_artifacts — refusing hollow inventory"
             )
 
-        # Single-flight carve warm before parallel counts (avoids 4× unalloc scans).
-        if not mobile_job:
+        # Standard mode keeps source/metadata inventory but does not make
+        # expensive unallocated-space carving mandatory. Deep performs it.
+        profile_row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:jid", {"jid": job_id})
+        profile_source = (profile_row or {}).get("disk_source") or {}
+        if isinstance(profile_source, str):
+            try:
+                profile_source = json.loads(profile_source)
+            except (ValueError, TypeError):
+                profile_source = {}
+        processing_profile = profile_source.get("processing_profile") if isinstance(profile_source, dict) else None
+        # Legacy jobs retain the previous behavior.
+        do_signature_carve = processing_profile != "standard"
+        if not mobile_job and do_signature_carve:
             try:
                 import threading
 
@@ -2461,7 +2484,8 @@ def _persist_report_template_inventory(
         from app.services.signature_carve_inventory import ensure_signature_carve_inventory
         # Recovered records remain a separate domain, but some mail/document collectors
         # need the persisted carve inventory to report their recovered component.
-        ensure_signature_carve_inventory(db, job_id, force=False)
+        if processing_profile != "standard":
+            ensure_signature_carve_inventory(db, job_id, force=False)
     except Exception as exc:
         log.warning("authoritative signature inventory warm failed job=%s: %s", job_id, exc)
     count_results: dict[str, Any] = {}

@@ -21,6 +21,9 @@ export function artifactContentTarget(art: Artifact | null | undefined): {
   const sourceId = meta.source_artifact_id ? String(meta.source_artifact_id) : null;
   const sourcePath = String(meta.source_path || art.source_path || art.file_name || "");
   const virtual = id.startsWith("ev-") || id.startsWith("carve-");
+  if (id.startsWith("carve-") && String(meta.kind || art.artifact_type || "").toLowerCase().includes("eml")) {
+    return { id, kind: "file" };
+  }
   if (virtual) {
     if (sourceId && !isSqliteFileName(sourcePath)) return { id: sourceId, kind: "file" };
     return { id: null, kind: "none" };

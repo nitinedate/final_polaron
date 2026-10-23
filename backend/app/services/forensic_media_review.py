@@ -901,6 +901,21 @@ def run_media_review(db, job_id, *, schema_name):
         AND COALESCE(metadata->>'mime','') NOT LIKE 'audio/%'
         AND COALESCE(metadata->>'detected_mime','') NOT LIKE 'audio/%'"""
     params = {"jid": job_id, "extensions": extensions, "audio": sorted(_AUDIO)}
+    from app.services.processing_profile import USER_SPACE_PATH_SQL, is_standard
+
+    standard_scope = is_standard(db, job_id)
+    out_of_scope = 0
+    if standard_scope:
+        # Standard: OS/vendor image assets (icons, wallpapers, app art under
+        # Windows\, Program Files, ProgramData) carry no case facts and are
+        # identical on every install. Count them for the record, observe only
+        # user-space media. Deep keeps reviewing every picture and video.
+        out_of_scope = int(fetchone(
+            db,
+            f"SELECT count(*) AS c FROM job_artifacts WHERE job_id=:jid AND {predicate} AND NOT {USER_SPACE_PATH_SQL}",
+            params,
+        )["c"])
+        predicate = f"({predicate}) AND {USER_SPACE_PATH_SQL}"
     total = int(
         fetchone(
             db,
@@ -909,7 +924,9 @@ def run_media_review(db, job_id, *, schema_name):
         )["c"]
     )
     if not total:
-        return {"status": "ok", "total": 0, "completed": 0}
+        return {"status": "ok", "total": 0, "completed": 0,
+                "processing_profile": "standard" if standard_scope else None,
+                "out_of_scope_vendor_media": out_of_scope}
     pending = fetchone(
         db,
         f"""SELECT count(*) AS c FROM job_artifacts ja WHERE ja.job_id=:jid AND {predicate}
@@ -1296,13 +1313,23 @@ def run_media_review(db, job_id, *, schema_name):
                         review_one(row, None)
             for row in loose:
                 review_one(row, None)
+    scope_sql = (
+        f" AND job_artifact_id IN (SELECT id FROM job_artifacts WHERE job_id=:jid AND {predicate})"
+        if standard_scope else ""
+    )
+    # Standard counts only in-scope observations: a case reprocessed from Deep
+    # keeps its earlier vendor-media rows, which must not exceed ``total`` and
+    # hold the stage barrier open.
     counts = fetchone(
         db,
-        "SELECT count(*) FILTER(WHERE status='done') AS done,count(*) FILTER(WHERE status='failed') AS failed,count(*) FILTER(WHERE status='skipped') AS skipped,count(*) FILTER(WHERE flagged) AS flagged FROM forensic_media_observations WHERE job_id=:jid",
-        {"jid": job_id},
+        "SELECT count(*) FILTER(WHERE status='done') AS done,count(*) FILTER(WHERE status='failed') AS failed,count(*) FILTER(WHERE status='skipped') AS skipped,count(*) FILTER(WHERE flagged) AS flagged FROM forensic_media_observations WHERE job_id=:jid"
+        + scope_sql,
+        params if standard_scope else {"jid": job_id},
     )
     return {
         "status": "ok",
+        "processing_profile": "standard" if standard_scope else None,
+        "out_of_scope_vendor_media": out_of_scope,
         "total": total,
         "completed": int(counts["done"]),
         "failed": int(counts["failed"]),

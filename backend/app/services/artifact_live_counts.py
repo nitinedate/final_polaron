@@ -82,6 +82,76 @@ def _read_job_files(db, job_id: str, rows: list[dict], *, max_bytes: int | None 
     return out
 
 
+def read_job_files_capped(db, job_id: str, groups: list[tuple[list[dict], int | None]]) -> dict[str, bytes | None]:
+    """``_read_job_files`` for several row groups with different byte caps.
+
+    All wanted members of a shard are read in ONE streamed pass (per-path caps via
+    ``max_bytes_by_path``) instead of one pass per group.
+    """
+    from app.services.tar_cache import iter_files_from_part
+
+    index_map = _job_index_map(db, job_id)
+    by_part: dict[str, dict[str, int | None]] = {}
+    for rows, cap in groups:
+        for row in rows:
+            path = (row.get("file_path") or "").replace("\\", "/")
+            part = index_map.get(path)
+            if not part:
+                continue
+            caps = by_part.setdefault(part, {})
+            if path in caps:
+                prev = caps[path]
+                caps[path] = None if prev is None or cap is None else max(prev, cap)
+            else:
+                caps[path] = cap
+    out: dict[str, bytes | None] = {}
+    for part_uri, caps in by_part.items():
+        for norm, content in iter_files_from_part(part_uri, set(caps), max_bytes_by_path=caps):
+            out[norm] = content
+    return out
+
+
+def iter_job_file_contents(db, job_id: str, rows: list[dict], *, max_bytes: int | None = None):
+    """Yield ``(row, content, resolved)`` reading every tar shard at most once.
+
+    Per-file readers (``iter_artifact_content``) stream a shard from its start for
+    EACH file; called for thousands of files that is thousands of multi-GB scans.
+    This groups all wanted members by shard and streams each shard once,
+    yielding members as they are reached so memory stays per-file.
+
+    ``resolved`` is False for rows that are not shard-backed (own MinIO object,
+    or original image only) or not found in the shard; the caller then uses its
+    normal single-file reader for just those rows.
+    """
+    from app.services.tar_cache import iter_files_from_part
+
+    index_map = _job_index_map(db, job_id)
+    by_part: dict[str, dict[str, list[dict]]] = {}
+    direct: list[dict] = []
+    for row in rows:
+        if row.get("minio_uri"):
+            direct.append(row)
+            continue
+        path = (row.get("file_path") or "").replace("\\", "/")
+        part = index_map.get(path)
+        if part:
+            by_part.setdefault(part, {}).setdefault(path, []).append(row)
+        else:
+            direct.append(row)
+    for part_uri, members in by_part.items():
+        seen: set[str] = set()
+        for norm, content in iter_files_from_part(part_uri, set(members), max_bytes=max_bytes):
+            seen.add(norm)
+            for row in members.get(norm, ()):
+                yield row, content, content is not None
+        for path, missing in members.items():
+            if path not in seen:
+                for row in missing:
+                    yield row, None, False
+    for row in direct:
+        yield row, None, False
+
+
 def _url_matches(url: str, patterns: list[re.Pattern]) -> bool:
     return bool(url and any(p.search(url) for p in patterns))
 
@@ -543,51 +613,41 @@ def count_jump_list_destinations(db, job_id: str) -> dict[str, Any]:
 
 
 def scan_registry_inventory(db, job_id: str) -> dict[str, Any]:
-    from app.parsers.registry import parse_registry_hive
+    """FeatureUsage + Uninstall programs from SOFTWARE/SYSTEM/NTUSER/USRCLASS.
+
+    Served from the shared registry evidence index (stage 5 parse results; raw
+    shard reads only for hives without a stored parse). Previously every call
+    re-streamed up to 80 hives from the tar shards, and both Installed-Programs
+    catalog rows plus Feature Usage called it concurrently.
+    """
+    from app.services.registry_evidence_index import registry_evidence
 
     feature_entries = 0
     feature_keys: set[str] = set()
     programs: dict[str, dict[str, Any]] = {}
-
-    rows = fetchall(db, _HIVE_SQL, {"j": job_id})
-    contents = _read_job_files(db, job_id, rows)
-
-    seen_hive_hashes: set[str] = set()
-    for row in rows:
-        path = row.get("file_path") or ""
-        norm_path = path.replace("\\", "/")
-        digest = str(row.get("sha256") or "").strip().lower()
-        # VSS/backup copies of the identical hive must not multiply registry records.
-        if digest and digest in seen_hive_hashes:
+    kinds = {"software", "system", "ntuser", "usrclass"}
+    index = registry_evidence(db, job_id)
+    for norm_path, _kind, rec in index.records("feature_usage", kinds=kinds):
+        key_path = str(rec.get("key_path") or rec.get("source") or "")
+        metric = str(rec.get("metric") or "unknown")
+        if metric == "app_launch_switched":
             continue
-        if digest:
-            seen_hive_hashes.add(digest)
-        data = contents.get(norm_path)
-        if not data:
+        entry_n = int(rec.get("entry_count") or 0)
+        metric_key = f"{norm_path}|{key_path}|{metric}"
+        if metric_key not in feature_keys:
+            feature_keys.add(metric_key)
+            feature_entries += entry_n
+    for _norm_path, _kind, rec in index.records("installed_program", kinds=kinds):
+        name = (rec.get("display_name") or "").strip()
+        if not name:
             continue
-        for rec in parse_registry_hive(data, path):
-            rt = rec.get("record_type")
-            if rt == "feature_usage":
-                key_path = str(rec.get("key_path") or rec.get("source") or "")
-                metric = str(rec.get("metric") or "unknown")
-                if metric == "app_launch_switched":
-                    continue
-                entry_n = int(rec.get("entry_count") or 0)
-                metric_key = f"{norm_path}|{key_path}|{metric}"
-                if metric_key not in feature_keys:
-                    feature_keys.add(metric_key)
-                    feature_entries += entry_n
-            elif rt == "installed_program":
-                name = (rec.get("display_name") or "").strip()
-                if not name:
-                    continue
-                key = "|".join([
-                    str(rec.get("source") or "").lower(),
-                    str(rec.get("uninstall_key") or "").lower(),
-                    name.lower(),
-                ])
-                if key not in programs:
-                    programs[key] = rec
+        key = "|".join([
+            str(rec.get("source") or "").lower(),
+            str(rec.get("uninstall_key") or "").lower(),
+            name.lower(),
+        ])
+        if key not in programs:
+            programs[key] = rec
 
     ms = [p for p in programs.values() if p.get("is_microsoft")]
     non_ms = [p for p in programs.values() if not p.get("is_microsoft")]

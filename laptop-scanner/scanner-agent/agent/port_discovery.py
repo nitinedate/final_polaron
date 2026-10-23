@@ -157,9 +157,13 @@ def probe_open_tcp_ports(
     return {host: list(st.get("open") or []) for host, st in states.items()}
 
 
-def discovery_plan(hosts: list[str]) -> dict[str, Any]:
-    """Build an *observation-only* TCP probe plan. Never narrow Greenbone scope."""
-    fallback = candidate_range()
+def discovery_plan(hosts: list[str], *, port_range: str | None = None) -> dict[str, Any]:
+    """Build an *observation-only* TCP probe plan. Never narrow Greenbone scope.
+
+    ``port_range`` (V1.10.2) is the job policy's TCP list; without it the
+    laptop's PORT_PROFILE default list is probed as before.
+    """
+    fallback = (port_range or "").strip() or candidate_range()
     if not enabled():
         return {
             "enabled": False,

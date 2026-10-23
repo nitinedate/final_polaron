@@ -260,6 +260,7 @@ def _policy_row(r: dict) -> dict:
         "requires_credentials": required,
         "credentials_missing": bool(required) and not (have & set(required)),
         "is_builtin": bool(r.get("is_builtin")),
+        "is_default": bool(r.get("is_builtin")) and bool(template.get("default")),
         "lifecycle_state": r.get("lifecycle_state") or "draft",
         "compliance_framework": r.get("compliance_framework"),
         "created_by": str(r["created_by"]) if r.get("created_by") else None,
@@ -277,6 +278,11 @@ def _assessment_notes(orch_obj: dict, *, is_edge: bool, service_verified: bool) 
             "(High/Critical) checks, as in a Nexpose Full audit with credentials."
         )
     host_cov = orch_obj.get("host_coverage") if isinstance(orch_obj.get("host_coverage"), dict) else {}
+    from app.services.scanner_agent_jobs import silent_hosts_note
+
+    silent_note = silent_hosts_note(host_cov)
+    if silent_note:
+        notes.insert(0, silent_note)
     for host, cov in sorted(host_cov.items()):
         if not isinstance(cov, dict):
             continue
@@ -1170,8 +1176,14 @@ def list_policy_templates(
 ):
     """Nessus-equivalent templates with their effective scanner settings."""
     _require_vuln_module()
-    from app.services.scanner_service_policy import effective_policy, scan_templates, validate_request
+    from app.services.scanner_service_policy import (
+        default_template_key,
+        effective_policy,
+        scan_templates,
+        validate_request,
+    )
 
+    default_key = default_template_key()
     out = []
     for template in scan_templates()["templates"]:
         req = validate_request({"template": template["key"]})
@@ -1193,6 +1205,8 @@ def list_policy_templates(
             "reference": template.get("reference") or template.get("nessus_reference"),
             "deviations": template["deviations"],
             "seed_as_builtin": bool(template.get("seed_as_builtin")),
+            # V1.10.2: the template the Launch dialog and new-policy form preselect.
+            "is_default": template["key"] == default_key,
             "settings": req,
             "tcp_port_count_floor": tcp_count,
             "udp_port_count": udp_count,
@@ -1634,6 +1648,8 @@ def get_scan_job_severity_summary(
     current: CurrentUser = Depends(require_firm_permission("scan:read")),
 ):
     """Finding severity breakdown + distinct host IPs for a scan job (View Details)."""
+    from app.services.scanner_agent_jobs import silent_hosts
+
     _require_vuln_module()
     row = fetchone(db, "SELECT * FROM vuln_scan_jobs WHERE id = CAST(:id AS uuid)", {"id": job_id})
     if not row:
@@ -1744,6 +1760,12 @@ def get_scan_job_severity_summary(
         for h in network_complete_hosts
     ):
         assessment_label = "NETWORK SCAN COMPLETE - NO EXPOSED SERVICES"
+    elif verified and network_done and silent_hosts(orch_obj.get("host_coverage"))[0]:
+        # V1.10.2: some targets answered nothing; the job must not read as a full assessment.
+        _silent, _answered = silent_hosts(orch_obj.get("host_coverage"))
+        assessment_label = (
+            f"NETWORK SCAN COMPLETE - {len(_silent)} OF {len(_silent) + len(_answered)} IP(S) DID NOT ANSWER"
+        )
     elif verified and network_done and plugin_error_count > 0:
         assessment_label = f"NETWORK SCAN COMPLETE - {plugin_error_count} SCANNER WARNING(S)"
     elif verified and network_done:

@@ -571,7 +571,7 @@ def _iter_jump_records(db, job_id: str):
            WHERE ja.job_id=:j AND (
              ja.file_path ILIKE '%.automaticdestinations-ms'
              OR ja.file_path ILIKE '%.customdestinations-ms'
-             OR apr.normalized::text ILIKE '%jump_list%'
+             OR apr.parser_name = 'jumplist'
            )""",
         {"j": job_id},
     )

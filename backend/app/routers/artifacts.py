@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
@@ -15,6 +17,14 @@ router = APIRouter(prefix="/api/jobs", tags=["artifacts"])
 def _require_artifact_job(db,job_id):
     if not fetchone(db,"SELECT id FROM jobs WHERE id=:jid",{"jid":job_id}):
         raise HTTPException(status_code=404,detail="Job not found")
+
+
+def _is_artifact_uuid(artifact_id: str) -> bool:
+    try:
+        uuid.UUID(str(artifact_id or ""))
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
 
 
 @router.get("/{job_id}/priority-evidence")
@@ -239,6 +249,7 @@ def list_artifacts(
     page_size: int = 20,
     q: str | None = None,
     category: str | None = None,
+    sub_category: str | None = None,
     catalog_key: str | None = None,
     catalog_section: str | None = None,
     family: str | None = Query(
@@ -281,6 +292,22 @@ def list_artifacts(
     if family_norm == "company_leakage" or str(catalog_key or "").strip().lower() == "company_leakage":
         from app.services.company_leakage import list_company_leakage_evidence
         return list_company_leakage_evidence(db, job_id, page=page, page_size=page_size, q=q)
+
+    if str(catalog_key or "").strip().lower() == "visited-urls":
+        from app.services.artifact_evidence_browse import _url_visit_rows
+
+        visits = _url_visit_rows(db, job_id, "Visited URLs")
+        page_n = max(int(page or 1), 1)
+        size_n = max(min(int(page_size or 20), 200), 1)
+        start = (page_n - 1) * size_n
+        return {
+            "items": visits[start : start + size_n],
+            "total": len(visits),
+            "page": page_n,
+            "page_size": size_n,
+            "evidence_domain": "url_visit",
+            "evidence_label": "Visited URLs",
+        }
 
     # Messaging / chat board families: prefer virtual evidence rows (parsed messages +
     # chat DBs) instead of dumping every path under com.whatsapp (APK/ART junk).
@@ -851,8 +878,16 @@ def list_artifacts(
         where += " AND (file_path ILIKE :q OR file_name ILIKE :q)"
         params["q"] = f"%{q}%"
     if category:
-        where += " AND encyclopedia_artifact_id ILIKE :cat"
-        params["cat"] = f"%{category}%"
+        from app.services.artifact_browse_categories import FILE_CATEGORY_SQL, KNOWN_FILE_CATEGORIES
+        if category in KNOWN_FILE_CATEGORIES:
+            where += f" AND ({FILE_CATEGORY_SQL}) = :file_category"
+            params["file_category"] = category
+            if sub_category:
+                where += " AND lower(ltrim(coalesce(extension,''), '.')) = :file_subcategory"
+                params["file_subcategory"] = sub_category.strip().lower() if sub_category != "(no extension)" else ""
+        else:
+            where += " AND encyclopedia_artifact_id ILIKE :cat"
+            params["cat"] = f"%{category}%"
     if catalog_key:
         from app.services.artifact_list_queries import list_where_for_catalog_key
 
@@ -888,36 +923,39 @@ def list_artifacts(
             )"""
             params["platform"] = platform
             params["section"] = catalog_section
-    total_row = fetchone(db, f"SELECT count(*) c FROM job_artifacts {where}", params)
-    file_total = int(total_row["c"]) if total_row else 0
-    file_offset = offset
-    # When carved hits prepend the listing, shift allocated SQL offset.
-    if catalog_key and scope_norm not in {"all", "unclassified", "extensionless", "tiny"}:
-        from app.services.artifact_evidence_browse import merge_carve_into_file_listing
-
-        probe = merge_carve_into_file_listing(
+    # Fast category browsing: do not block the first 20 records behind a full
+    # COUNT(*) of costly forensic path predicates. Fetch one extra row instead.
+    fast_browse = bool(catalog_key or catalog_section or category or q)
+    if fast_browse:
+        # Carved evidence precedes allocated files; account for its prefix
+        # before paging allocated rows, without full-file COUNT(*).
+        if catalog_key and scope_norm not in {"all", "unclassified", "extensionless", "tiny"}:
+            from app.services.artifact_evidence_browse import merge_carve_into_file_listing
+            probe = merge_carve_into_file_listing(
+                db, job_id, catalog_key=catalog_key, file_items=[],
+                file_total=0, page=page, page_size=page_size,
+            )
+            if probe and "carve_prefix" in probe:
+                prefix = int(probe["carve_prefix"] or 0)
+                params["offset"] = max(0, offset - prefix)
+        page_rows = fetchall(
             db,
-            job_id,
-            catalog_key=catalog_key,
-            file_items=[],
-            file_total=file_total,
-            page=page,
-            page_size=page_size,
+            f"SELECT * FROM job_artifacts {where} ORDER BY file_path LIMIT :limit OFFSET :offset",
+            {**params, "limit": page_size + 1},
         )
-        if probe is not None and "carve_prefix" in probe:
-            carve_n = int(probe.get("carve_prefix") or 0)
-            start = (max(page, 1) - 1) * page_size
-            if start >= carve_n:
-                file_offset = start - carve_n
-            else:
-                file_offset = 0
-            params = {**params, "offset": file_offset}
-
-    rows = fetchall(
-        db,
-        f"SELECT * FROM job_artifacts {where} ORDER BY file_path LIMIT :limit OFFSET :offset",
-        params,
-    )
+        has_more = len(page_rows) > page_size
+        rows = page_rows[:page_size]
+        # Navigation lower bound only: never treat this as a forensic finding count.
+        file_total = params["offset"] + len(rows) + (1 if has_more else 0)
+    else:
+        total_row = fetchone(db, f"SELECT count(*) c FROM job_artifacts {where}", params)
+        file_total = int(total_row["c"]) if total_row else 0
+        rows = fetchall(
+            db,
+            f"SELECT * FROM job_artifacts {where} ORDER BY file_path LIMIT :limit OFFSET :offset",
+            params,
+        )
+        has_more = offset + len(rows) < file_total
     from app.services.encyclopedia_match import encyclopedia_label_map, ensure_extended_encyclopedia
 
     ensure_extended_encyclopedia(db)
@@ -966,10 +1004,41 @@ def list_artifacts(
     return {
         "items": items,
         "total": file_total,
+        "total_exact": not fast_browse,
+        "has_more": has_more,
         "page": page,
         "page_size": page_size,
         "evidence_domain": "file",
     }
+
+
+@router.get("/{job_id}/artifact-taxonomy")
+def artifact_taxonomy(
+    job_id: str,
+    db: Session = Depends(firm_db),
+    current: CurrentUser = Depends(require_firm_permission("artifact:read")),
+):
+    """Report-aligned forensic taxonomy (not a count of ordinary files)."""
+    from app.services.artifact_selection_catalog import (
+        get_selection_artifact_catalog, resolve_job_axiom_platform,
+    )
+    _require_artifact_job(db, job_id)
+    platform = resolve_job_axiom_platform(db, job_id)
+    catalog = get_selection_artifact_catalog(db, platform=platform, job_id=job_id, read_only=True)
+    sections = []
+    for section in catalog.get("sections") or []:
+        title = str(section.get("title") or section.get("label") or "")
+        key = str(section.get("key") or title)
+        items = [
+            {"key": str(sub.get("key") or ""),
+             "title": str(sub.get("label") or sub.get("title") or ""),
+             "count": int(sub.get("count") or 0)}
+            for sub in section.get("subcategories") or []
+        ]
+        sections.append({"key": key, "title": title, "count": sum(item["count"] for item in items), "items": items})
+    return {"job_id": job_id, "source": "forensic_catalog", "platform": platform,
+            "notice": "Counts describe classified forensic findings, not every source file.",
+            "sections": sections}
 
 
 @router.get("/{job_id}/artifacts/categories")
@@ -978,25 +1047,45 @@ def artifact_categories(
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("artifact:read")),
 ):
-    from app.services.encyclopedia_match import encyclopedia_label_map, ensure_extended_encyclopedia
+    """File extension groups for evidence browsing; taxonomy is a separate endpoint."""
+    from app.services.artifact_browse_categories import FILE_CATEGORY_SQL
+    _require_artifact_job(db, job_id)
+    rows = fetchall(db, f"""SELECT {FILE_CATEGORY_SQL} AS category,
+                     lower(ltrim(coalesce(extension,''), '.')) AS sub_category,
+                     count(*) AS count
+                     FROM job_artifacts WHERE job_id=:jid
+                     GROUP BY 1, 2 ORDER BY 1, 3 DESC""", {"jid": job_id})
+    categories = [{"category": str(r["category"]),
+                   "sub_category": str(r["sub_category"] or "(no extension)"),
+                   "count": int(r["count"])} for r in rows]
+    return {"categories": categories, "total": sum(r["count"] for r in categories)}
 
-    ensure_extended_encyclopedia(db)
-    labels = encyclopedia_label_map(db)
-    rows = fetchall(
-        db,
-        """SELECT encyclopedia_artifact_id as cat, count(*) c FROM job_artifacts
-           WHERE job_id=:jid GROUP BY encyclopedia_artifact_id ORDER BY c DESC""",
-        {"jid": job_id},
-    )
-    categories = []
-    for r in rows:
-        key = r["cat"] or "unmatched"
-        categories.append({
-            "key": key,
-            "label": labels.get(key, "Unmatched" if key == "unmatched" else key),
-            "count": int(r["c"]),
-        })
-    return {"categories": categories}
+
+@router.get("/{job_id}/artifacts/{artifact_id}/graph")
+def artifact_graph(
+    job_id: str,
+    artifact_id: str,
+    db: Session = Depends(firm_db),
+    current: CurrentUser = Depends(require_firm_permission("artifact:read")),
+):
+    """Empty graph when no linked graph entities have been recorded yet."""
+    _require_artifact_job(db, job_id)
+    # Carved and virtual rows (carve-eml-…, ev-…) are not job_artifacts UUIDs.
+    # Casting them in SQL raises InvalidTextRepresentation and fails the click.
+    if not _is_artifact_uuid(artifact_id):
+        return {
+            "artifact_id": artifact_id,
+            "entities": [],
+            "relationships": [],
+            "status": "not_available",
+            "note": "Virtual evidence has no graph row",
+        }
+    artifact = fetchone(db, "SELECT id FROM job_artifacts WHERE job_id=:jid AND id=:aid",
+                        {"jid": job_id, "aid": artifact_id})
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return {"artifact_id": artifact_id, "entities": [], "relationships": [],
+            "status": "not_available", "note": "No artifact graph relationships exposed by this endpoint"}
 
 
 @router.get("/{job_id}/artifacts/resolve-path")
@@ -1092,6 +1181,18 @@ def get_artifact(
     from app.services.artifact_preview import _load_artifact_row
     from app.services.encyclopedia_match import encyclopedia_label_map, ensure_extended_encyclopedia
 
+    # Carved rows are virtual. Return the inventory record instead of a 404.
+    if str(artifact_id).startswith("carve-"):
+        from app.services.carved_artifact_content import carved_artifact_record
+
+        try:
+            return carved_artifact_record(db, job_id, artifact_id)
+        except LookupError:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": {"code": "not_found", "message": "Recovered evidence was not found"}},
+            )
+
     # Virtual evidence ids (ev-wa-…) are not job_artifacts UUIDs — never hit Postgres uuid cast.
     row = _load_artifact_row(db, job_id, artifact_id)
     if not row:
@@ -1118,6 +1219,21 @@ def preview_artifact(
     db: Session = Depends(firm_db),
     current: CurrentUser = Depends(require_firm_permission("artifact:read")),
 ):
+    if str(artifact_id).startswith("carve-"):
+        from app.services.carved_artifact_content import build_carved_preview
+
+        try:
+            return build_carved_preview(db, job_id, artifact_id)
+        except LookupError:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": {"code": "not_found", "message": "Recovered evidence was not found"}},
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": {"code": "not_found", "message": str(exc)}},
+            )
     from app.services.artifact_preview import build_artifact_preview
 
     try:
@@ -1135,6 +1251,26 @@ def preview_artifact(
                 }
             },
         )
+
+
+@router.get("/{job_id}/artifacts/{artifact_id}/records")
+def artifact_records(
+    job_id: str,
+    artifact_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(firm_db),
+    current: CurrentUser = Depends(require_firm_permission("artifact:read")),
+):
+    """Page of parsed forensic records (registry, EVTX, Prefetch, LNK, Jump List…)."""
+    from app.services.artifact_preview import artifact_records_page
+
+    if not _is_artifact_uuid(artifact_id):
+        raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": "No parsed records"}})
+    try:
+        return artifact_records_page(db, job_id, artifact_id, offset=offset, limit=limit)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(exc)}})
 
 
 @router.get("/{job_id}/artifacts/{artifact_id}/content")
@@ -1155,26 +1291,17 @@ def artifact_content(
         _CONTENT_READ_MAX_BYTES,
     )
 
-    row = _load_artifact_row(db, job_id, artifact_id)
-    if not row:
-        raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": "Artifact not found"}})
     disposition = "attachment" if download else "inline"
-    hint = _size_hint_bytes(row) or 0
-    # Stream large evidence so examiners can open UFED media / DBs without 413.
-    stream_threshold = 8 * 1024 * 1024
-    if download or hint >= stream_threshold:
-        # Sniff a tiny head so extensionless files get a real download name/type.
-        head = b""
+    if str(artifact_id).startswith("carve-"):
+        from app.services.carved_artifact_content import load_carved_content
+
         try:
-            for chunk in iter_artifact_content(db, job_id, row, max_bytes=64):
-                head += chunk
-                if len(head) >= 64:
-                    break
-        except Exception:
-            head = b""
-        filename, content_type = _artifact_filename_and_type(row, head=head)
-        try:
-            gen = iter_artifact_content(db, job_id, row, max_bytes=_CONTENT_READ_MAX_BYTES)
+            data, content_type, filename, _hit = load_carved_content(db, job_id, artifact_id)
+        except LookupError:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": {"code": "not_found", "message": "Recovered evidence was not found"}},
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(exc)}})
         headers = {
@@ -1182,8 +1309,28 @@ def artifact_content(
             "Cache-Control": "private, max-age=60",
             "X-Content-Type-Options": "nosniff",
         }
-        if hint > 0:
-            headers["Content-Length"] = str(min(hint, _CONTENT_READ_MAX_BYTES))
+        return Response(content=data, media_type=content_type or "application/octet-stream", headers=headers)
+
+    row = _load_artifact_row(db, job_id, artifact_id)
+    if not row:
+        raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": "Artifact not found"}})
+    hint = _size_hint_bytes(row) or 0
+    # Stream large evidence so examiners can open UFED media / DBs without 413.
+    stream_threshold = 8 * 1024 * 1024
+    if download or hint >= stream_threshold:
+        # Avoid probing the source twice: sniffing here would re-open a disk
+        # or scan a full tar shard before the actual response stream starts.
+        # Extensionless files retain a safe .bin filename until inspected.
+        filename, content_type = _artifact_filename_and_type(row)
+        try:
+            gen = iter_artifact_content(db, job_id, row, max_bytes=_CONTENT_READ_MAX_BYTES, prefer_source=True)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": "not_found", "message": str(exc)}})
+        headers = {
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "Cache-Control": "private, max-age=60",
+            "X-Content-Type-Options": "nosniff",
+        }
         return StreamingResponse(gen, media_type=content_type, headers=headers)
 
     try:
@@ -1196,13 +1343,11 @@ def artifact_content(
         # Fall back to streaming instead of failing forensic open.
         filename, content_type = _artifact_filename_and_type(row)
         try:
-            gen = iter_artifact_content(db, job_id, row, max_bytes=_CONTENT_READ_MAX_BYTES)
+            gen = iter_artifact_content(db, job_id, row, max_bytes=_CONTENT_READ_MAX_BYTES, prefer_source=True)
             headers = {
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "private, max-age=60",
             }
-            if exc.size_bytes:
-                headers["Content-Length"] = str(min(exc.size_bytes, _CONTENT_READ_MAX_BYTES))
             return StreamingResponse(gen, media_type=content_type, headers=headers)
         except Exception:
             raise HTTPException(

@@ -9,6 +9,8 @@ import time
 RAG_CHUNK_DB_BATCH = int(os.environ.get("RAG_CHUNK_DB_BATCH", "6000") or 6000)
 from contextlib import ExitStack
 
+from app.config import get_settings
+
 from app.db.sql_helpers import (
     execute,
     fetchall,
@@ -994,6 +996,30 @@ def execute_stage(db, job_id, stage, *, schema_name, stage_run_id):
         from app.services.forensic_media_review import run_media_review
 
         return run_media_review(db, job_id, schema_name=schema_name)
+    if stage == "enrichment" and not mobile:
+        from app.services.processing_profile import is_standard
+
+        if is_standard(db, job_id):
+            # Standard: entity-mention counters are UI statistics only (no report,
+            # retrieval or validation consumer) and the full-text regex pass over
+            # every parse result costs minutes. Semantic vectors are not built in
+            # Standard (lexical/FTS retrieval is deterministic); the limitation is
+            # recorded by validation. Ontology mapping is a single indexed count.
+            ontology = int((fetchone(
+                db,
+                """SELECT count(*) AS c FROM job_artifacts
+                   WHERE job_id=:jid AND encyclopedia_artifact_id IS NOT NULL""",
+                {"jid": job_id},
+            ) or {}).get("c") or 0)
+            return {
+                "status": "ok",
+                "total": 1,
+                "completed": 1,
+                "processing_profile": "standard",
+                "ontology_mapped": ontology,
+                "entity_statistics": "not computed (Standard profile)",
+                "vector_index": {"status": "not_built", "reason": "Standard profile"},
+            }
     if stage == "enrichment":
         from app.services.rag_enrich import run_rag_enrichment_until_complete
 
@@ -1030,6 +1056,17 @@ def execute_stage(db, job_id, stage, *, schema_name, stage_run_id):
             "completed": result.get("scanned", 0),
         }
     if stage == "graph":
+        from app.services.processing_profile import STANDARD_SKIPPED_STAGES, is_standard
+
+        if not mobile and is_standard(db, job_id):
+            return {
+                "status": "skipped",
+                "processing_profile": "standard",
+                "reason": STANDARD_SKIPPED_STAGES["graph"],
+                "total": 0,
+                "completed": 0,
+                "skipped": 0,
+            }
         from app.services.neo4j_sync import sync_job_graph_serial
 
         result = sync_job_graph_serial(
@@ -1289,7 +1326,10 @@ def _validate_complete(db, job_id, *, mobile=False):
     # Semantic coverage is a real barrier when GPU embeddings were requested.
     # A queued/running task is already covered by assert_no_active_producers;
     # additionally reject silent failed tasks with unembedded evidence rows.
-    if not mobile and get_settings().rag_embedding_enabled:
+    from app.services.processing_profile import STANDARD_LIMITATIONS, job_processing_profile
+
+    profile = "mobile" if mobile else job_processing_profile(db, job_id)
+    if not mobile and profile != "standard" and get_settings().rag_embedding_enabled:
         from app.services.disk_vector_sidecar import count_missing_serial_vectors
         missing_vectors = count_missing_serial_vectors(db, job_id)
         if missing_vectors:
@@ -1357,6 +1397,10 @@ def _validate_complete(db, job_id, *, mobile=False):
     from app.services.source_coverage import collect_source_coverage
     result["source_coverage"] = collect_source_coverage(db, job_id, row=row,
         validation=result, processing_complete=True)
+    result["processing_profile"] = profile
+    if profile == "standard":
+        result["profile_limitations"] = list(STANDARD_LIMITATIONS)
+        result["coverage_complete"] = False
     result["acquired_processing_complete"] = True
     result["acquired_evidence_without_exceptions"] = result["coverage_complete"]
     result["coverage_complete"] = False  # Accessibility of the original device is unverified.

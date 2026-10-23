@@ -13,6 +13,7 @@ from copy import deepcopy
 import json
 import logging
 import re
+import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -254,10 +255,16 @@ def _entity_values(records: list[dict[str, Any]], fields: list[str], *, limit: i
     return out
 
 
+_ARTIFACT_ROW_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
 def _artifact_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
     from app.services.catalog_artifact_runner import load_stored_axiom_inventory
     from app.services.report_template_service import resolve_report_artifact_keys
 
+    cached = _ARTIFACT_ROW_CACHE.get(str(job_id))
+    if cached and (time.time() - cached[0]) < 600:
+        return cached[1]
     inventory = load_stored_axiom_inventory(db, job_id)
     if not inventory:
         return []
@@ -307,6 +314,7 @@ def _artifact_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
             "confidence": inv.get("confidence"),
             "status": inv.get("status"),
         })
+    _ARTIFACT_ROW_CACHE[str(job_id)] = (time.time(), out)
     return out
 
 

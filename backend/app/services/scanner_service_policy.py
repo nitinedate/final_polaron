@@ -252,7 +252,24 @@ def scan_templates() -> dict[str, Any]:
         raise ValueError("Duplicate scan template key")
     for template in doc["templates"]:
         _validate_fields(dict(template["settings"]))  # fail loudly on a bad shipped template
+    defaults = [t["key"] for t in doc["templates"] if t.get("default")]
+    if len(defaults) > 1:
+        raise ValueError(f"More than one default scan template: {defaults}")
+    for key in defaults:
+        if not next(t for t in doc["templates"] if t["key"] == key).get("seed_as_builtin"):
+            raise ValueError(f"Default scan template {key} must be seeded as a built-in policy")
     return doc
+
+
+DEFAULT_TEMPLATE_FALLBACK = "polaron"
+
+
+def default_template_key() -> str:
+    """The template preselected at launch (V1.10.2: the Polaron policy)."""
+    for template in scan_templates()["templates"]:
+        if template.get("default"):
+            return str(template["key"])
+    return DEFAULT_TEMPLATE_FALLBACK
 
 
 def template_by_key(key: str) -> dict[str, Any]:

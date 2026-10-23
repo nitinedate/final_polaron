@@ -406,14 +406,29 @@ def test_serial_pdf_preparation_keeps_pages_after_the_legacy_limit():
     assert "FULL_PDF_TAIL" in result["text"]
 
 
-def test_serial_enrichment_reads_records_after_legacy_sample_cap():
+def test_serial_enrichment_reads_records_after_legacy_sample_cap(monkeypatch):
+    # V2026-10-21: entity-mention counters are statistics with no report,
+    # retrieval or validation consumer, so the serial stage samples by default.
+    # FORENSIC_ENRICH_FULL_TEXT=true restores the full-corpus walk pinned here.
     from app.services.rag_enrich import extract_entities_from_normalized
 
     normalized = [{"padding": "x" * 500} for _ in range(100)] + [
         {"username": "final-account"}
     ]
+    monkeypatch.setenv("FORENSIC_ENRICH_FULL_TEXT", "true")
     with policy.stage_context("enrichment"):
         assert extract_entities_from_normalized(normalized)["user"] == 1
+
+
+def test_serial_enrichment_samples_by_default(monkeypatch):
+    from app.services.rag_enrich import extract_entities_from_normalized
+
+    normalized = [{"padding": "x" * 500} for _ in range(100)] + [
+        {"username": "final-account"}
+    ]
+    monkeypatch.delenv("FORENSIC_ENRICH_FULL_TEXT", raising=False)
+    with policy.stage_context("enrichment"):
+        assert "user" not in extract_entities_from_normalized(normalized)
 
 
 def test_serial_graph_reads_every_parsed_record():

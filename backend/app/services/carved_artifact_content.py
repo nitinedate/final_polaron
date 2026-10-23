@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from collections import OrderedDict
 from email import policy
 from email.parser import BytesParser
 from typing import Any
@@ -142,9 +144,29 @@ def _read_hit_bytes(db, job_id: str, hit: dict[str, Any]) -> bytes:
     source_id = str(hit.get("source_artifact_id") or "").strip()
     if source_id:
         try:
-            return _read_from_source_artifact(db, job_id, source_id, offset, limit)
+            from app.services.artifact_preview import _load_artifact_row
+            from app.services.virtual_disk import open_virtual_disk_cached, read_file_range_from_disk
+
+            row = _load_artifact_row(db, job_id, source_id)
+            source_path = str((row or {}).get("file_path") or "").replace("\\", "/")
+            if source_path:
+                vd = open_virtual_disk_cached(db, job_id)
+                data = read_file_range_from_disk(
+                    vd,
+                    source_path,
+                    start_offset=offset,
+                    max_bytes=limit,
+                )
+                if data:
+                    return data
         except Exception:
-            return b""
+            pass
+        # Last resort. Streaming from byte 0 of pagefile.sys is what made mail preview stall.
+        if offset <= 8 * 1024 * 1024:
+            try:
+                return _read_from_source_artifact(db, job_id, source_id, offset, limit)
+            except Exception:
+                return b""
     return b""
 
 
@@ -351,21 +373,56 @@ def carved_artifact_record(db, job_id: str, artifact_id: str) -> dict[str, Any]:
     }
 
 
+_CARVE_CACHE_MAX = 24
+_carve_cache_guard = threading.Lock()
+_carve_cache: OrderedDict[str, tuple[bytes, str, str, dict[str, Any]]] = OrderedDict()
+_carve_locks: dict[str, threading.Lock] = {}
+
+
+def _carve_lock(key: str) -> threading.Lock:
+    with _carve_cache_guard:
+        lock = _carve_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _carve_locks[key] = lock
+        return lock
+
+
 def load_carved_content(db, job_id: str, artifact_id: str) -> tuple[bytes, str, str, dict[str, Any]]:
-    hit = _hit_by_id(db, job_id, artifact_id)
-    if not hit:
-        raise LookupError("Carved artifact not found")
-    data = _read_hit_bytes(db, job_id, hit)
-    if not data:
-        raise FileNotFoundError("Recovered source range is no longer readable")
-    kind = str(hit.get("kind") or "carve").lower()
-    data = _trim_hit_bytes(kind, data)
-    filename = _file_name_for_hit(hit)
-    resolved = resolve_artifact_type(
-        {"file_name": filename, "file_path": filename, "metadata": {}},
-        data=data[:256 * 1024],
-    )
-    return data, resolved.content_type, resolved.normalized_filename, hit
+    """Read one carved range once. Preview and content were each reopening pagefile.sys."""
+    key = f"{job_id}:{artifact_id}"
+    with _carve_cache_guard:
+        cached = _carve_cache.get(key)
+        if cached is not None:
+            _carve_cache.move_to_end(key)
+            return cached
+    with _carve_lock(key):
+        with _carve_cache_guard:
+            cached = _carve_cache.get(key)
+            if cached is not None:
+                _carve_cache.move_to_end(key)
+                return cached
+        hit = _hit_by_id(db, job_id, artifact_id)
+        if not hit:
+            raise LookupError("Carved artifact not found")
+        data = _read_hit_bytes(db, job_id, hit)
+        if not data:
+            raise FileNotFoundError("Recovered source range is no longer readable")
+        kind = str(hit.get("kind") or "carve").lower()
+        data = _trim_hit_bytes(kind, data)
+        filename = _file_name_for_hit(hit)
+        resolved = resolve_artifact_type(
+            {"file_name": filename, "file_path": filename, "metadata": {}},
+            data=data[:256 * 1024],
+        )
+        stored = (data, resolved.content_type, resolved.normalized_filename, hit)
+        if len(data) <= 8_000_000:
+            with _carve_cache_guard:
+                _carve_cache[key] = stored
+                _carve_cache.move_to_end(key)
+                while len(_carve_cache) > _CARVE_CACHE_MAX:
+                    _carve_cache.popitem(last=False)
+        return stored
 
 
 def build_carved_preview(db, job_id: str, artifact_id: str) -> dict[str, Any]:
@@ -395,42 +452,11 @@ def build_carved_preview(db, job_id: str, artifact_id: str) -> dict[str, Any]:
         "size_bytes": len(data),
     }
 
-    # EML is a first-class MIME message: show headers/body and every recoverable
-    # attachment in the third panel rather than the old "signature hit" text.
+    # EML: only a validated RFC 5322 header block is presented as an email.
+    # Python's MIME parser "succeeds" on arbitrary bytes, which is how pagefile
+    # memory (OWA/Outlook JSON state) was shown as a mojibake "Plain text" body.
     if kind == "eml" or content_type == "message/rfc822":
-        details = build_email_preview_details(data, filename)
-        if details.get("parse_ok"):
-            headers = details.get("headers") or {}
-            preview.update(
-                {
-                    "content_type": "message/rfc822",
-                    "artifact_type": "eml",
-                    "encoding": None,
-                    "email": {
-                        "from": headers.get("from") or "",
-                        "to": headers.get("to") or "",
-                        "cc": headers.get("cc") or "",
-                        "bcc": headers.get("bcc") or "",
-                        "subject": headers.get("subject") or filename,
-                        "date": headers.get("date") or "",
-                        "message_id": headers.get("message_id") or "",
-                    },
-                    "body_text": details.get("body_text") or "",
-                    "body_html": details.get("body_html") or "",
-                    "body": (details.get("body_text") or details.get("body_html") or ""),
-                    "attachments": details.get("attachments") or [],
-                    "attachment_count": len(details.get("attachments") or []),
-                }
-            )
-            return preview
-        preview["encoding"] = None
-        preview["content_type"] = "text/plain"
-        preview["body"] = (
-            "Recovered email fragment could not be reconstructed into a complete RFC822 message.\n"
-            f"Source: {source}\nOffset: {_safe_offset(hit.get('offset')):,}\n"
-            "The original bytes remain available from Open/Download."
-        )
-        return preview
+        return _carved_email_or_fragment(preview, data, filename=filename, source=source, hit=hit)
 
     if content_type.startswith(("image/", "audio/", "video/")) or content_type == "application/pdf":
         preview["encoding"] = "url"
@@ -532,3 +558,92 @@ def load_carved_email_attachment(
         data=payload[:256 * 1024] or None,
     )
     return payload, resolved.content_type, resolved.normalized_filename
+
+
+def _carved_email_or_fragment(
+    preview: dict[str, Any], data: bytes, *, filename: str, source: str, hit: dict[str, Any]
+) -> dict[str, Any]:
+    from app.parsers.binary_fragment import build_fragment_view
+    from app.parsers.rfc822_validate import is_readable_body, validate_rfc822
+
+    offset = _safe_offset(hit.get("offset"))
+    check = validate_rfc822(data)
+    preview["rfc822_check"] = check.as_dict()
+    if check.valid:
+        message = data[check.start:]
+        details = build_email_preview_details(message, filename)
+        headers = details.get("headers") or {}
+        body_text = details.get("body_text") or ""
+        body_html = details.get("body_html") or ""
+        preview.update(
+            {
+                "content_type": "message/rfc822",
+                "artifact_type": "eml",
+                "encoding": None,
+                "email": {
+                    "from": headers.get("from") or "",
+                    "to": headers.get("to") or "",
+                    "cc": headers.get("cc") or "",
+                    "bcc": headers.get("bcc") or "",
+                    "subject": headers.get("subject") or filename,
+                    "date": headers.get("date") or "",
+                    "message_id": headers.get("message_id") or "",
+                },
+                "attachments": details.get("attachments") or [],
+                "attachment_count": len(details.get("attachments") or []),
+            }
+        )
+        if body_html or is_readable_body(body_text) or not body_text.strip():
+            preview["body_text"] = body_text
+            preview["body_html"] = body_html
+            preview["body"] = body_text or body_html
+        else:
+            # Valid headers, but the carved range ran into binary after them.
+            body_bytes = message[check.header_end - check.start:] if check.header_end > 0 else b""
+            preview["body_text"] = (
+                "The message headers were recovered intact, but the body region of this carved "
+                "range is binary (overwritten or fragmented). Strings from the body region are "
+                "listed in the fragment view."
+            )
+            preview["body_html"] = ""
+            preview["body"] = preview["body_text"]
+            preview["carved_partial"] = True
+            preview["fragment"] = _fragment_view(
+                build_fragment_view, body_bytes, base=offset + max(check.header_end, 0), source=source,
+                reason="body after a valid header block is not readable text",
+            )
+        if len(data) <= 6_000_000:
+            import base64
+
+            preview["file_base64"] = base64.b64encode(data).decode("ascii")
+        return preview
+
+    # Not an email: a signature hit inside memory / unallocated data.
+    preview.update(
+        {
+            "content_type": "application/octet-stream",
+            "artifact_type": "carved_fragment",
+            "encoding": None,
+            "carved_unparsed": True,
+            "email": None,
+            "attachments": None,
+            "attachment_count": 0,
+            "fragment": _fragment_view(
+                build_fragment_view, data, base=offset, source=source,
+                reason=f"signature hit is not an RFC 5322 message ({check.reason})",
+            ),
+        }
+    )
+    preview["body"] = (
+        f"Signature hit at {source}:{offset:,} is not an e-mail message "
+        f"({check.reason}). The bytes are shown as strings with offsets and a hex view; "
+        "use Download to export the exact range."
+    )
+    preview["body_text"] = preview["body"]
+    return preview
+
+
+def _fragment_view(builder, data: bytes, *, base: int, source: str, reason: str) -> dict[str, Any]:
+    view = builder(data, base_offset=base, source=source, reason=reason)
+    view.pop("text", None)
+    return view

@@ -682,7 +682,9 @@ def classify_external_storage_devices(devices: list[dict[str, Any]]) -> list[dic
 def _usb_fact(db, job_id: str, title: str, *, external_only: bool) -> dict[str, Any]:
     from app.services.catalog_aligned_counts import count_usb_device_records
 
-    raw_count, devices = count_usb_device_records(db, job_id)
+    # Stored inventory only. A live SYSTEM-hive read walks the extraction archive,
+    # and one truncated part drops the database connection.
+    raw_count, devices = count_usb_device_records(db, job_id, live=False)
     physical = classify_external_storage_devices(devices)
     if external_only:
         if not physical:
@@ -893,14 +895,29 @@ def _live_recycle_bin_records(db, job_id: str) -> list[dict[str, Any]]:
         elif name.lower().startswith("$r"):
             rec["payload_path"] = path
 
-    # Parse $I descriptors directly when parse/metadata promotion has not happened.
-    if descriptor_rows:
+    # Parse $I descriptors that are already stored as artifact bytes. Streaming the
+    # extraction archive for every descriptor walks a truncated part and drops
+    # the database connection. Metadata already on the row is kept as-is.
+    readable = []
+    for row in descriptor_rows:
+        if not row.get("minio_uri"):
+            continue
+        path = str(row.get("file_path") or "").replace("\\", "/")
+        name = str(row.get("file_name") or PurePosixPath(path).name or "")
+        token = _recycle_item_token(name)
+        known = by_token.get(token) or {}
+        if known.get("original_path") or known.get("deleted_at") or known.get("original_name"):
+            continue
+        readable.append(row)
+        if len(readable) >= 40:
+            break
+    if readable:
         try:
             from app.services.artifact_live_counts import _read_job_files
             from app.parsers.recycle_bin import parse_recycle_bin_i
 
-            contents = _read_job_files(db, job_id, descriptor_rows, max_bytes=4_000_000)
-            for row in descriptor_rows:
+            contents = _read_job_files(db, job_id, readable, max_bytes=4_000_000)
+            for row in readable:
                 path = str(row.get("file_path") or "").replace("\\", "/")
                 name = str(row.get("file_name") or PurePosixPath(path).name or "")
                 token = _recycle_item_token(name)
@@ -1048,7 +1065,7 @@ def _encrypted_fact(db, job_id: str, title: str) -> dict[str, Any]:
     # scan when possible. The inventory cache prevents re-reading the same job repeatedly.
     try:
         from app.services.encryption_inventory import compute_report_encryption_counts, collect_encryption_artifact
-        compute_report_encryption_counts(db, job_id, scan_encrypted=True)
+        compute_report_encryption_counts(db, job_id, scan_encrypted=False)
         data = collect_encryption_artifact(db, job_id, "Encrypted Files")
     except Exception:
         from app.services.encryption_inventory import collect_encryption_artifact

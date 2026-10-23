@@ -120,9 +120,14 @@ def _register_embedded_fonts() -> tuple[str, str, str]:
     return "Times-Roman", "Times-Bold", "Times-Italic"
 
 
+def _prose_without_tables(content: str) -> str:
+    kept = [line for line in (content or "").splitlines() if not line.strip().startswith("|")]
+    return "\n".join(kept).strip()
+
+
 def _styles() -> dict[str, ParagraphStyle]:
     regular, bold, italic = _register_embedded_fonts()
-    return {
+    styles = {
         "body": ParagraphStyle(
             "ReportBody",
             fontName=regular,
@@ -292,6 +297,9 @@ def _styles() -> dict[str, ParagraphStyle]:
             spaceBefore=10,
         ),
     }
+    for style in styles.values():
+        style.splitLongWords = 0
+    return styles
 
 
 def _rich(text: object) -> str:
@@ -316,6 +324,7 @@ def _heading(text: object, style: ParagraphStyle):
     """Section title plus a rule — avoids <u> character-by-character drawing."""
     label = _clean_export_text(text)
     para = _p(label, style)
+    para.keepWithNext = True
     width = min(
         _USABLE_WIDTH,
         pdfmetrics.stringWidth(label, style.fontName, style.fontSize) + 4,
@@ -349,6 +358,11 @@ def _column_widths(header: list[str], rows: list[list[str]]) -> list[float]:
             weight = 1.6
         else:
             weight = min(2.2, max(0.9, max_len / 18.0))
+        longest = max(
+            (len(part) for value in [str(cell or "")] + sample for part in re.split(r"[\s\\/]+", value)),
+            default=4,
+        )
+        weight = max(weight, min(3.4, longest / 9.0))
         weights.append(weight)
     total = sum(weights) or 1.0
     return [_USABLE_WIDTH * w / total for w in weights]
@@ -362,7 +376,8 @@ def _make_table(header: list[str], rows: list[list[str]], styles: dict[str, Para
         cells = []
         for ci in range(cols):
             style = styles["td_center"] if widths[ci] < 25 * mm else styles["td"]
-            cells.append(_p(row[ci] if ci < len(row) else "", style))
+            from app.services.report_formation_agent import wrap_table_cell
+            cells.append(_p(wrap_table_cell(row[ci] if ci < len(row) else ""), style))
         data.append(cells)
     table = Table(data, colWidths=widths, repeatRows=1, hAlign="CENTER")
     commands = [
@@ -385,29 +400,22 @@ def _make_table(header: list[str], rows: list[list[str]], styles: dict[str, Para
 
 
 def _add_packed_tables(story: list, tables: list[dict[str, Any]], *, title: str, styles: dict[str, ParagraphStyle]) -> None:
-    from app.services.report_formation_agent import pack_annexure_tables
-
-    pages = pack_annexure_tables(tables)
-    for pi, page in enumerate(pages):
-        if pi:
-            story.append(PageBreak())
-            story.append(_heading(f"{title} (continued)", styles["h1"]))
-        for chunk in page:
-            label = str(chunk.get("title") or "").strip()
-            if label:
-                heading = f"{label} (continued)" if chunk.get("continued") else label
-                story.append(_p(heading.upper(), styles["h3"]))
-            note = chunk.get("note")
-            if note and not chunk.get("continued"):
-                story.append(_p(note, styles["note"]))
-            story.append(
-                _make_table(
-                    [str(c) for c in (chunk.get("columns") or [])],
-                    [[str(c) for c in (row or [])] for row in (chunk.get("rows") or [])],
-                    styles,
-                )
+    del title
+    for table in tables:
+        label = str(table.get("title") or "").strip()
+        if label:
+            story.append(_p(label.upper(), styles["h3"]))
+        note = table.get("note")
+        if note:
+            story.append(_p(note, styles["note"]))
+        story.append(
+            _make_table(
+                [str(c) for c in (table.get("columns") or [])],
+                [[str(c) for c in (row or [])] for row in (table.get("rows") or [])],
+                styles,
             )
-            story.append(Spacer(1, 6))
+        )
+        story.append(Spacer(1, 6))
 
 
 def _add_opo(story: list, content: str, *, title: str, styles: dict[str, ParagraphStyle]) -> bool:
@@ -745,19 +753,19 @@ def build_report_pdf(
         if not sec:
             continue
         title = section_title(key, mobile=mobile)
-        content = strip_redundant_section_heading(sec.get("content_md") or "", title)
+        from app.services.source_coverage import strip_source_coverage_from_report
+        content = strip_source_coverage_from_report(strip_redundant_section_heading(sec.get("content_md") or "", title))
 
         if _hidden_section(key, mobile=mobile):
             continue
 
         if key == "cover_page":
             _add_cover(story, content, mobile=mobile, styles=styles)
+            story.append(PageBreak())
             first = False
             continue
 
-        # UI / TOC contract: every listed description starts on a fresh A4 page.
-        if not first:
-            story.append(PageBreak())
+        # Later sections stay on the open page when it still has room.
         first = False
 
         if key == "table_of_contents":
@@ -799,6 +807,9 @@ def build_report_pdf(
         if key in {"annexure", "final_analysis_summary", "os_information", "user_profile_information", "forensic_imaging"}:
             packed = _tables_from_section(sec)
             if packed:
+                prose = _prose_without_tables(content)
+                if prose:
+                    _add_markdown(story, prose, styles)
                 _add_packed_tables(story, packed, title=title, styles=styles)
                 continue
         _add_markdown(story, content, styles)

@@ -737,7 +737,7 @@ DRAFT:
 {draft}
 
 Reply JSON: {{"passed": true/false, "grade": "A-E", "notes": "...", "refusal": false}}"""
-    raw = generate_text(prompt, model=review_model, temperature=0.1)
+    raw = generate_text(prompt, model=review_model, temperature=0.1, timeout=30)
     try:
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
@@ -1341,19 +1341,7 @@ def generate_report(db, job_id: str, *, schema_name: str, report_run_id: str | N
                 pass
             apply_firm_search_path(db, schema_name)
 
-    # Append deterministic coverage after all LLM and recovery passes.
-    from app.services.source_coverage import collect_source_coverage, render_source_coverage
-    source_coverage = collect_source_coverage(db, job_id, processing_complete=True)
-    execute(db, """UPDATE report_sections SET
-        content_md=COALESCE(content_md,'') || :coverage,
-        structured_json=COALESCE(structured_json,'{}'::jsonb) || CAST(:snapshot AS jsonb),
-        updated_at=NOW()
-        WHERE report_run_id=:rid AND section_key='final_analysis_summary'""",
-        {"rid": report_run_id, "coverage": "\n\n" + render_source_coverage(source_coverage),
-         "snapshot": json.dumps({"source_coverage": source_coverage})})
-    db.commit()
-    apply_firm_search_path(db, schema_name)
-
+    # Coverage stays on the processing screen. It is not a report section.
     finished = datetime.now(timezone.utc)
     duration_ms = int((finished - started).total_seconds() * 1000)
     execute(

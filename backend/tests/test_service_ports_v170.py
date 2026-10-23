@@ -8,10 +8,11 @@ def test_no_exposed_services_is_a_finished_result():
     tp, degraded, done = classify_host_coverage({"172.20.10.2": cov}, {})
     row = tp["172.20.10.2"]
     assert degraded == [] and done == ["172.20.10.2"] and row["status"] == "completed"
-    assert row["activity"] == "No exposed services - 0 policy ports closed, 87 not answering (firewall blocking or host offline)"
+    # V1.10.2: nothing answered, so the host was not assessed; say so (it is not a clean result).
+    assert row["activity"] == "No response - not assessed: none of 87 policy TCP ports answered (firewall blocking or host offline)"
     cov.update({"host_responded": True, "port_state_counts": {"closed": 80, "filtered": 7}})
     tp, _, _ = classify_host_coverage({"h": cov}, {})
-    assert tp["h"]["activity"] == "No exposed services - 80 policy ports closed, 7 not answering"
+    assert tp["h"]["activity"] == "No exposed services - host is up; 80 policy ports closed, 7 not answering"
 
 
 def test_no_exposed_without_completed_network_scan_stays_incomplete():

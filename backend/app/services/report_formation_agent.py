@@ -34,8 +34,8 @@ FOOTER_MM = 26
 BODY_HEIGHT_MM = A4_HEIGHT_MM - HEADER_MM - FOOTER_MM
 # Physical-height budget for annexure / structured tables — lockstep with
 # frontend reportPagination.ts / annexure_table_training v2.2.  Not a row cap.
-TABLE_PAGE_UNITS = 26
-TABLE_PACK_SLACK_UNITS = 2
+TABLE_PAGE_UNITS = 42
+TABLE_PACK_SLACK_UNITS = 3
 TABLE_TOTAL_CHARS_PER_LINE = 88
 TABLE_URL_CHARS_PER_LINE = 18
 TABLE_CHARS_PER_LINE = TABLE_URL_CHARS_PER_LINE
@@ -45,12 +45,12 @@ TABLE_NOTE_BASE_UNITS = 1
 TABLE_NOTE_CHARS_PER_LINE = 78
 TABLE_GAP_UNITS = 2
 TABLE_MIN_SPLIT_ROOM_UNITS = 8
-TABLE_MAX_URL_ROWS_FIRST = 5
-TABLE_MAX_URL_ROWS_CONTINUED = 6
+TABLE_MAX_URL_ROWS_FIRST = 18
+TABLE_MAX_URL_ROWS_CONTINUED = 18
 TABLE_MAX_PROSE_ROWS = 2
 TABLE_PROSE_CELL_CHARS = 120
-TABLE_MAX_ROW_UNITS = 16
-_URL_WRAP_RE = re.compile(r"([/?&=._-])")
+TABLE_MAX_ROW_UNITS = 48
+_URL_WRAP_RE = re.compile(r"([/?&=\\])")
 _DATEISH_CELL_RE = re.compile(
     r"^\s*\d{1,4}[/-]\d{1,2}[/-]\d{1,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?\s*$",
     re.IGNORECASE,
@@ -198,6 +198,37 @@ def wrap_table_cell(text: Any) -> str:
     return raw
 
 
+def _column_wrap_chars(header: str, column_count: int) -> int:
+    """Match the rendered column. A procedure cell is much wider than an equal split."""
+    h = str(header or "").strip().lower()
+    if h.startswith("sr") or h in {"no", "no."}:
+        return 8
+    if "procedure" in h:
+        return 80
+    if "observation" in h or "description" in h:
+        return 40
+    if "objective" in h:
+        return 20
+    if "url" in h:
+        return _url_column_chars(column_count)
+    if any(word in h for word in ("path", "host", "server", "profile", "user", "source", "device", "serial", "file", "vendor")):
+        return 26
+    if "date" in h or "time" in h:
+        return 18
+    return max(14, 72 // max(1, column_count))
+
+
+def _url_column_chars(column_count: int) -> int:
+    """URL column width after the narrow serial, browser, and count columns."""
+    if column_count <= 3:
+        return 72
+    if column_count <= 5:
+        return 64
+    if column_count <= 7:
+        return 48
+    return 28
+
+
 def _is_url_like_cell(value: str) -> bool:
     text = str(value or "").strip().lower()
     return text.startswith(("http://", "https://", "www.", "blob:"))
@@ -225,6 +256,26 @@ def max_manageable_table_rows(
     return 14
 
 
+def _soft_wrap_lines(text: str, width: int) -> int:
+    """Line count when a cell breaks on spaces and path separators, never mid-word."""
+    width = max(1, width)
+    tokens = [part for part in re.split(r"\s+", text.strip()) if part]
+    if not tokens:
+        return 1
+    lines = 1
+    column = 0
+    for token in tokens:
+        pieces = re.findall(r"[^\\/]+[\\/]?|[\\/]+", token) or [token]
+        for piece in pieces:
+            if column and column + len(piece) > width:
+                lines += 1
+                column = 0
+            column += len(piece)
+        if column and column + 1 <= width:
+            column += 1
+    return lines
+
+
 def table_row_units(
     row: list[Any] | None,
     *,
@@ -236,17 +287,23 @@ def table_row_units(
     if not cells:
         return 1
     column_count = max(1, len(columns or []) or len(cells))
-    default_width = max(14, TABLE_TOTAL_CHARS_PER_LINE // column_count)
+    headers = [str(c or "") for c in (columns or [])]
     wrapped = 1
-    for raw in cells:
+    for index, raw in enumerate(cells):
         text = " ".join(str(raw or "").split()).strip() or " "
         if _is_url_like_cell(text):
-            width = min(TABLE_URL_CHARS_PER_LINE, default_width)
+            width = _url_column_chars(column_count)
+            wrapped = max(wrapped, max(1, (len(text) + width - 1) // width))
         else:
-            width = chars_per_line if chars_per_line else default_width
-        wrapped = max(wrapped, max(1, (len(text) + width - 1) // width))
-    padding = 1 if wrapped >= 2 else 0
-    return max(1, min(TABLE_MAX_ROW_UNITS, wrapped + padding))
+            width = chars_per_line if chars_per_line else _column_wrap_chars(headers[index] if index < len(headers) else "", column_count)
+            wrapped = max(wrapped, _soft_wrap_lines(text, width))
+    has_url = any(_is_url_like_cell(cell) for cell in cells)
+    has_wrapped_path = any("\\" in cell for cell in cells)
+    # A second visual line needs its own height. Counting it as a one-line row
+    # packs the last USB/path rows into the footer.
+    padding = 2 if wrapped >= 12 else 1 if wrapped >= 2 or has_url else 0
+    units = max(2, min(TABLE_MAX_ROW_UNITS, wrapped + padding))
+    return max(3, units) if has_wrapped_path else units
 
 
 def table_chunk_chrome_units(title: str | None, note: str | None, continued: bool) -> int:

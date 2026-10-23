@@ -674,7 +674,7 @@ def _record_evidence_item(
 def _usb_device_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
     from app.services.catalog_aligned_counts import count_usb_device_records
 
-    _count, devices = count_usb_device_records(db, job_id)
+    _count, devices = count_usb_device_records(db, job_id, live=False)
     out: list[dict[str, Any]] = []
     for rec in devices:
         path = str(rec.get("source") or rec.get("path") or "")
@@ -715,9 +715,35 @@ def _usb_device_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
 
 
 def _phone_device_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
-    from app.services.forensic_inventory import collect_phone_usage
+    from app.services.forensic_inventory import _is_phone_device_id, _iter_normalized_records
 
-    phone = collect_phone_usage(db, job_id)
+    # Stored parse rows only. Re-opening SetupAPI archives here stalls the artifact list.
+    phone_events = []
+    for _path, rec in _iter_normalized_records(
+        db,
+        job_id,
+        where_sql="ja.file_path ILIKE '%setupapi.dev%' OR lower(ja.file_name) IN ('system', 'setupapi.dev.log')",
+        limit=80,
+    ):
+        if rec.get("record_type") != "usb_usage_event":
+            continue
+        if not _is_phone_device_id(rec.get("device_id")):
+            continue
+        phone_events.append(rec)
+    unique: dict[str, dict] = {}
+    for ev in phone_events:
+        key = str(ev.get("serial") or ev.get("device_id") or "")
+        entry = unique.get(key) or {
+            "device_name": ev.get("device_id") or "Phone device",
+            "serial": ev.get("serial"),
+            "source": ev.get("source") or "",
+            "first_seen": ev.get("event_time"),
+            "last_seen": ev.get("event_time"),
+        }
+        if ev.get("event_time"):
+            entry["last_seen"] = ev.get("event_time")
+        unique[key] = entry
+    phone = {"devices": list(unique.values())}
     out: list[dict[str, Any]] = []
     for rec in phone.get("devices") or []:
         path = str(rec.get("source") or "")
@@ -747,7 +773,7 @@ def _phone_device_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
 def _rdp_connection_rows(db: Session, job_id: str) -> list[dict[str, Any]]:
     from app.services.catalog_aligned_counts import count_rdp_connection_records
 
-    _count, conns = count_rdp_connection_records(db, job_id)
+    _count, conns = count_rdp_connection_records(db, job_id, live=False)
     out: list[dict[str, Any]] = []
     for rec in conns:
         path = str(rec.get("source") or "")
@@ -845,7 +871,7 @@ def _url_visit_rows(db: Session, job_id: str, category: str) -> list[dict[str, A
     if target == "malware / phishing urls":
         target = "malware/phishing urls"
     all_urls = target in _BROWSER_HISTORY_NAMES
-    records = collect_job_browser_url_records(db, job_id)
+    records = collect_job_browser_url_records(db, job_id, live=False)
     out: list[dict[str, Any]] = []
     for rec in records:
         url = str(rec.get("url") or "").strip()
@@ -3317,18 +3343,7 @@ def _email_attachment_file_rows(db: Session, job_id: str) -> list[dict[str, Any]
 
     from app.services.email_inventory import email_attachment_browse_where_sql
 
-    # Reconcile historical jobs first.  This promotes extensionless RFC822 rows and
-    # stores deterministic attachment metadata on their parent artifact.
-    try:
-        from app.services.email_mime_inventory import scan_job_email_mime_inventory
-
-        scan_job_email_mime_inventory(db, job_id)
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
+    # Stored attachment metadata only. Re-scanning MIME on a click re-reads archives.
     where = email_attachment_browse_where_sql().strip()
     files = fetchall(
         db,

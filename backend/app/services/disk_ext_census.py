@@ -230,6 +230,26 @@ def ensure_disk_extension_censuses(
             "lnk_disk_count": lnk_count,
         }
 
+    # A job_artifacts census is never "ready" for the AXIOM full-volume rule above,
+    # so every document/LNK/media collector used to regroup all registered files
+    # and rewrite jobs.disk_source (a hot row the stage heartbeat also updates).
+    # Reuse it while the registered-file count is unchanged.
+    if (
+        not force
+        and isinstance(doc_inv, dict)
+        and isinstance(media_inv, dict)
+        and isinstance(lnk_count, int)
+        and str(doc_inv.get("source") or "") == "job_artifacts"
+        and doc_inv.get("by_ext_key") is not None
+    ):
+        current = fetchone(db, "SELECT count(*) AS c FROM job_artifacts WHERE job_id=:jid", {"jid": job_id})
+        if int((current or {}).get("c") or 0) == int(doc_inv.get("enumerated_files") or -1):
+            return {
+                "document_disk_inventory": doc_inv,
+                "media_disk_inventory": media_inv,
+                "lnk_disk_count": lnk_count,
+            }
+
     artifact_census = None
     if not force:
         artifact_census = _registered_file_census(db, job_id)

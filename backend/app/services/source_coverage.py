@@ -6,6 +6,7 @@ Missing records cannot establish deletion, overwriting or absence on a device.
 from __future__ import annotations
 import html
 import json
+import re
 from app.db.sql_helpers import fetchall, fetchone
 
 NOTICE = "Processing 100% means scheduled work has finished. It does not mean full device or evidence coverage."
@@ -91,6 +92,7 @@ def collect_source_coverage(db, job_id, *, row=None, validation=None, processing
 
 
 def render_source_coverage(coverage):
+    """Pipeline and examiner text. Report pages do not include this block."""
     def safe(value):
         return html.escape(str(value)).replace("|", "&#124;").replace("\n", " ")
     parts = ["### Source limitations and evidence coverage", "", coverage["notice"], "",
@@ -103,3 +105,36 @@ def render_source_coverage(coverage):
     else:
         parts.append("No recorded accessibility exceptions; full source coverage remains unverified.")
     return "\n".join(parts) + "\n"
+
+
+_COVERAGE_HEADING = re.compile(r"source limitations and evidence coverage", re.I)
+_COVERAGE_TABLE = re.compile(r"^\|\s*Source\s*\|\s*Limitation\s*\|\s*Follow-up\s*\|", re.I)
+_MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+\S")
+
+
+def strip_source_coverage_from_report(markdown: str) -> str:
+    """Drop the coverage notice and its Source / Limitation / Follow-up table from report text."""
+    lines = str(markdown or "").split("\n")
+    kept: list[str] = []
+    skipping = False
+    skipping_table = False
+    for line in lines:
+        stripped = line.strip()
+        if _COVERAGE_HEADING.search(stripped):
+            skipping = True
+            skipping_table = False
+            continue
+        if skipping:
+            if _MARKDOWN_HEADING.match(stripped) and not _COVERAGE_HEADING.search(stripped):
+                skipping = False
+            else:
+                continue
+        if _COVERAGE_TABLE.match(stripped):
+            skipping_table = True
+            continue
+        if skipping_table:
+            if stripped.startswith("|"):
+                continue
+            skipping_table = False
+        kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip("\n") + ("\n" if kept else "")

@@ -20,6 +20,7 @@ x-extract-volumes: &extract-volumes
 
 x-extract-env: &extract-env
   AETHERIS_SERVICE: mobile-extract
+  AETHERIS_SKIP_BOOT_MIGRATIONS: "1"
   VULN_MODULE_ENABLED: "false"
   DATABASE_URL: postgresql+psycopg2://forensic:forensic@postgres:5432/forensic
   REDIS_URL: redis://redis:6379/4
@@ -155,8 +156,8 @@ services:
         ]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 180s
+      retries: 18
+      start_period: 420s
 
   worker-mobile:
     networks:

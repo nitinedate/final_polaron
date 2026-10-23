@@ -233,3 +233,18 @@ def should_skip_os_vendor(path: str, *, size_bytes: int = 0, os_family: str | No
         return False, None
     rule = classify_os_vendor(path, size_bytes=size_bytes, os_family=os_family)
     return (True, rule) if rule else (False, None)
+
+
+# Standard profile: UWP package *state* holds user evidence (WhatsApp Desktop
+# transfers, Your Phone synced photos/messages, Windows Mail attachments, Sticky
+# Notes), so the user-vendor rule for /appdata/local/packages/ is not applied.
+# Package payload binaries live under Program Files/WindowsApps, which stays skipped.
+STANDARD_EXEMPT_USER_VENDOR_RULES: frozenset[str] = frozenset({"user_vendor_tree:packages"})
+
+
+def classify_os_vendor_standard(path: str, *, size_bytes: int = 0, os_family: str | None = None) -> str | None:
+    """``classify_os_vendor`` as used by the Standard examination profile."""
+    rule = classify_os_vendor(path, size_bytes=size_bytes, os_family=os_family)
+    if rule in STANDARD_EXEMPT_USER_VENDOR_RULES:
+        return None
+    return rule

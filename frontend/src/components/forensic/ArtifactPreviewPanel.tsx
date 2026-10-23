@@ -14,7 +14,9 @@ import { useToast } from "../../lib/toast";
 import type {
   Artifact,
   ArtifactEmailAttachment,
+  ArtifactFragment,
   ArtifactMediaProperties,
+  ArtifactParsedRecords,
   ArtifactPreview,
   ArtifactReview,
 } from "../../lib/types/forensic";
@@ -149,6 +151,16 @@ function EmailPreviewView({
       </div>
 
       <div>
+        {preview.fragment ? (
+          <div className="mb-3">
+            <FragmentView fragment={preview.fragment} />
+          </div>
+        ) : preview.carved_unparsed ? (
+          <div className="mb-2 rounded-md border border-amber-300 bg-amber-50/60 px-3 py-2 text-xs text-amber-800">
+            Signature-carved fragment — not a decodable email. The surrounding bytes are binary, so
+            there is no readable message body.
+          </div>
+        ) : null}
         <div className="mb-2 flex flex-wrap gap-2">
           {preview.body_html ? (
             <button
@@ -239,6 +251,200 @@ function EmailPreviewView({
           </ul>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function ParsedRecordsView({
+  jobId,
+  artifactId,
+  initial,
+}: {
+  jobId: string;
+  artifactId: string;
+  initial: ArtifactParsedRecords;
+}) {
+  const [rows, setRows] = useState<string[][]>(initial.rows);
+  const [hasMore, setHasMore] = useState(initial.has_more);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+
+  useEffect(() => {
+    setRows(initial.rows);
+    setHasMore(initial.has_more);
+    setError(null);
+  }, [initial]);
+
+  async function loadMore() {
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const next = await forensicApi.getArtifactRecords(jobId, artifactId, rows.length, 200);
+      // Columns are chosen per page; map the next page onto the first page's columns.
+      const index = initial.columns.map((c) => next.columns.indexOf(c));
+      setRows((prev) => [...prev, ...next.rows.map((r) => index.map((i) => (i >= 0 ? r[i] ?? "" : "")))]);
+      setHasMore(next.has_more);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Could not load more records");
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  const needle = filter.trim().toLowerCase();
+  const shown = needle ? rows.filter((r) => r.some((cell) => cell.toLowerCase().includes(needle))) : rows;
+
+  return (
+    <div className="space-y-2" data-testid="parsed-records">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-600">
+        <span>
+          <strong className="text-ink-800">{initial.record_count.toLocaleString()}</strong> parsed record(s) ·{" "}
+          {initial.parser}
+          {initial.source === "on_demand_parse" ? " · parsed now and stored" : ""}
+        </span>
+        <input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter loaded rows…"
+          className="h-7 w-48 rounded border border-ink-200 px-2 text-xs"
+        />
+      </div>
+      <div className="max-h-[28rem] overflow-auto rounded border border-ink-100 bg-white">
+        <table className="w-full border-collapse text-left text-[11px]">
+          <thead className="sticky top-0 bg-ink-50">
+            <tr>
+              <th className="border-b border-ink-100 px-2 py-1.5 font-semibold text-ink-500">#</th>
+              {initial.columns.map((c) => (
+                <th key={c} className="border-b border-ink-100 px-2 py-1.5 font-semibold text-ink-600">
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {shown.map((r, i) => (
+              <tr key={i} className="odd:bg-white even:bg-ink-50/40 align-top">
+                <td className="px-2 py-1 text-ink-400">{i + 1}</td>
+                {r.map((cell, j) => (
+                  <td key={j} className="max-w-xs break-words px-2 py-1 font-mono text-ink-800">
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {error ? <p className="text-xs text-amber-700">{error}</p> : null}
+      {hasMore && !needle ? (
+        <Button variant="outline" className="h-7 px-2 text-xs" disabled={loadingMore} onClick={() => void loadMore()}>
+          {loadingMore ? "Loading…" : `Load more (${rows.length.toLocaleString()} of ${initial.record_count.toLocaleString()})`}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function FragmentView({ fragment }: { fragment: ArtifactFragment }) {
+  const [tab, setTab] = useState<"strings" | "indicators" | "hex">("strings");
+  const [minLen, setMinLen] = useState(6);
+  const ind = fragment.indicators || { emails: [], urls: [], windows_paths: [], json_keys: [] };
+  const indicatorCount = ind.emails.length + ind.urls.length + ind.windows_paths.length;
+  const strings = fragment.strings.filter((s) => s.text.length >= minLen);
+  const tabBtn = (id: typeof tab, label: string) => (
+    <button
+      type="button"
+      onClick={() => setTab(id)}
+      className={
+        tab === id
+          ? "rounded-md bg-brand-600 px-2.5 py-1 text-xs font-semibold text-white"
+          : "rounded-md border border-ink-200 px-2.5 py-1 text-xs text-ink-600"
+      }
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div className="space-y-2" data-testid="fragment-view">
+      <div className="rounded-md border border-amber-300 bg-amber-50/60 px-3 py-2 text-xs text-amber-900">
+        <p className="font-semibold">{fragment.classification}</p>
+        {fragment.reason ? <p className="mt-0.5">Not shown as text: {fragment.reason}.</p> : null}
+        <p className="mt-0.5 text-amber-800">
+          Offset {fragment.base_offset.toLocaleString()} · {fragment.stats.size_bytes.toLocaleString()} bytes · entropy{" "}
+          {fragment.stats.entropy} · {fragment.stats.string_count.toLocaleString()} strings
+          {fragment.stats.utf16_string_count ? ` (${fragment.stats.utf16_string_count.toLocaleString()} UTF-16)` : ""}
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        {tabBtn("strings", "Strings")}
+        {tabBtn("indicators", `Indicators (${indicatorCount})`)}
+        {tabBtn("hex", "Hex")}
+        {tab === "strings" ? (
+          <label className="ml-auto flex items-center gap-1 text-[11px] text-ink-500">
+            Min length
+            <select
+              value={minLen}
+              onChange={(e) => setMinLen(Number(e.target.value))}
+              className="h-6 rounded border border-ink-200 text-[11px]"
+            >
+              {[4, 6, 8, 12, 16].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+      </div>
+      {tab === "strings" ? (
+        <div className="max-h-96 overflow-auto rounded border border-ink-100 bg-white">
+          <table className="w-full text-left font-mono text-[11px]">
+            <tbody>
+              {strings.slice(0, 1500).map((s, i) => (
+                <tr key={`${s.offset}-${i}`} className="align-top odd:bg-white even:bg-ink-50/40">
+                  <td className="whitespace-nowrap px-2 py-0.5 text-right text-ink-400">{s.offset.toLocaleString()}</td>
+                  <td className="whitespace-nowrap px-2 py-0.5 text-ink-400">{s.encoding === "utf-16le" ? "U16" : "ASC"}</td>
+                  <td className="break-all px-2 py-0.5 text-ink-800">{s.text}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!strings.length ? <p className="p-3 text-xs text-ink-400">No printable strings at this length.</p> : null}
+        </div>
+      ) : tab === "indicators" ? (
+        <div className="space-y-2 rounded border border-ink-100 bg-white p-3 text-xs">
+          {(
+            [
+              ["E-mail addresses", ind.emails],
+              ["URLs", ind.urls],
+              ["Windows paths", ind.windows_paths],
+              ["JSON / script keys", ind.json_keys],
+            ] as Array<[string, string[]]>
+          ).map(([label, values]) => (
+            <div key={label}>
+              <p className="font-semibold text-ink-700">
+                {label} ({values.length})
+              </p>
+              {values.length ? (
+                <ul className="mt-1 space-y-0.5 font-mono text-[11px] text-ink-800">
+                  {values.map((v) => (
+                    <li key={v} className="break-all">
+                      {v}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-ink-400">None found</p>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <pre className="max-h-96 overflow-auto rounded border border-ink-100 bg-white p-2 font-mono text-[11px] leading-snug text-ink-800">
+          {fragment.hex}
+        </pre>
+      )}
     </div>
   );
 }
@@ -476,6 +682,8 @@ export function ArtifactPreviewPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [contentLoading, setContentLoading] = useState(false);
+  const [contentError, setContentError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [properties, setProperties] = useState<ArtifactMediaProperties | null>(null);
@@ -491,6 +699,9 @@ export function ArtifactPreviewPanel({
 
     const meta = artifact.metadata || {};
     const evidenceKind = String(meta.evidence_kind || "");
+    const carvedMail =
+      String(artifact.id).startsWith("carve-") &&
+      (String(meta.kind || artifact.artifact_type || "").toLowerCase().includes("eml"));
     const mediaArtifactId = meta.media_artifact_id ? String(meta.media_artifact_id) : null;
     const thumbB64 =
       typeof meta.thumbnail_base64 === "string" && meta.thumbnail_base64.length > 80
@@ -499,6 +710,7 @@ export function ArtifactPreviewPanel({
     const thumbType = String(meta.thumbnail_content_type || "image/jpeg");
     // Virtual evidence rows (URL visits / chat messages) carry preview payload in metadata.
     if (
+      !carvedMail && (
       evidenceKind === "url_visit" ||
       evidenceKind === "whatsapp_message" ||
       evidenceKind === "whatsapp_deleted_message" ||
@@ -510,6 +722,7 @@ export function ArtifactPreviewPanel({
       evidenceKind === "browser_history_db" ||
       String(artifact.id).startsWith("ev-") ||
       String(artifact.id).startsWith("carve-")
+      )
     ) {
       const bodyRaw = String(meta.preview_body || meta.body || meta.url || "");
       const body =
@@ -619,10 +832,17 @@ export function ArtifactPreviewPanel({
       cancelled = true;
       controller.abort();
     };
-  }, [jobId, artifact.id, artifact.metadata, artifact.title, artifact.artifact_type]);
+    // The list row already carries the fields this effect branches on.
+    // Depending on the metadata object restarted the request on every detail refresh
+    // and aborted the content download (the canceled request in the network panel).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, artifact.id]);
 
   // Stream any URL-encoded preview (image/video/audio/PDF/binary) — no size gate.
-  const needsAuthBlob = preview?.encoding === "url" && Boolean(preview.content_url);
+  // Carved mail already returns the message in the preview JSON. A second /content
+  // read reopens pagefile.sys and is what shows up as a canceled request.
+  const virtualEvidence = artifact.id.startsWith("carve-") || artifact.id.startsWith("ev-");
+  const needsAuthBlob = !virtualEvidence && preview?.encoding === "url" && Boolean(preview.content_url) && !preview.file_base64;
   const contentTarget = artifactContentTarget(artifact);
   const contentArtifactId = contentTarget.id;
 
@@ -645,27 +865,57 @@ export function ArtifactPreviewPanel({
   }, [jobId, contentArtifactId]);
 
   useEffect(() => {
+    setBlobUrl(null);
+    setContentError(null);
     if (!needsAuthBlob || !contentArtifactId) {
-      setBlobUrl(null);
+      setContentLoading(false);
       return;
     }
-    let cancelled = false;
+    const controller = new AbortController();
     let objectUrl: string | null = null;
+    let active = true;
+    setContentLoading(true);
+    // Bound the wait: a missing MinIO object or blocked backend must not spin forever.
+    const timer = window.setTimeout(() => controller.abort(), 20_000);
     forensicApi
-      .fetchArtifactContent(jobId, contentArtifactId)
+      .fetchArtifactContent(jobId, contentArtifactId, { signal: controller.signal })
       .then((blob) => {
-        if (cancelled) return;
+        if (!active) return;
+        if (!blob.size) throw new Error("Evidence content is empty");
+        // PDF and browser-renderable media are displayed from the original bytes.
         objectUrl = URL.createObjectURL(blob);
         setBlobUrl(objectUrl);
       })
-      .catch(() => {
-        if (!cancelled) setBlobUrl(null);
+      .catch((cause: unknown) => {
+        if (!active) return;
+        setContentError(controller.signal.aborted
+          ? "Preview timed out after 20 seconds. The original evidence remains available for download."
+          : cause instanceof Error ? cause.message : "Preview is unavailable");
+      })
+      .finally(() => {
+        if (active) setContentLoading(false);
+        window.clearTimeout(timer);
       });
     return () => {
-      cancelled = true;
+      active = false;
+      controller.abort();
+      window.clearTimeout(timer);
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [needsAuthBlob, jobId, contentArtifactId]);
+
+  useEffect(() => {
+    if (!preview?.file_base64) return;
+    const type = preview.content_type || "application/octet-stream";
+    const binary = atob(preview.file_base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const objectUrl = URL.createObjectURL(new Blob([bytes], { type }));
+    setBlobUrl(objectUrl);
+    setContentLoading(false);
+    setContentError(null);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [preview?.file_base64, preview?.content_type]);
 
   const device =
     preview?.device_name ||
@@ -721,7 +971,9 @@ export function ArtifactPreviewPanel({
     }
     setDownloading(true);
     try {
-      if (contentArtifactId) {
+      if (preview?.file_base64) {
+        downloadBase64File(preview.file_base64, artifactDownloadName(artifact), preview.content_type || "application/octet-stream");
+      } else if (contentArtifactId) {
         await forensicApi.downloadArtifactContent(jobId, contentArtifactId, artifactDownloadName(artifact));
       } else if (thumb) {
         downloadBase64File(thumb.base64, thumb.fileName, thumb.contentType);
@@ -765,6 +1017,27 @@ export function ArtifactPreviewPanel({
         </div>
       </div>
       <div className="p-4">
+        {(() => {
+          const meta = artifact.metadata || {};
+          const created = String(preview?.file_created || meta.file_created || meta.ctime || meta.created_time || "");
+          const modified = String(preview?.file_modified || meta.file_modified || meta.mtime || meta.modified_at || "");
+          const visited = String(meta.last_visit || (String(meta.evidence_kind || "") === "url_visit" ? artifact.artifact_datetime || "" : ""));
+          const recovered = String(preview?.recovered_at || artifact.created_at || "");
+          const show = (label: string, value: string) => {
+            if (!value) return null;
+            const parsed = new Date(value);
+            const shown = Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+            return <span><strong className="text-ink-800">{label}:</strong> {shown}</span>;
+          };
+          if (!created && !modified && !visited && !recovered) return null;
+          return (
+            <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-600">
+              {show(String(meta.evidence_kind || "") === "url_visit" ? "Visited" : "Created", created || visited)}
+              {show("Modified", modified)}
+              {show("Recovered", recovered)}
+            </div>
+          );
+        })()}
         {properties ? (
           <div className="mb-3 rounded-xl border border-ink-100 bg-white p-3">
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-600">
@@ -800,6 +1073,16 @@ export function ArtifactPreviewPanel({
           </p>
         )}
         {loading && <Spinner className="py-6" />}
+        {!loading && contentLoading && !blobUrl && (
+          <div className="flex items-center gap-2 py-3 text-sm text-ink-500">
+            <Spinner /> Loading original evidence preview…
+          </div>
+        )}
+        {!loading && contentError && !blobUrl && (
+          <p role="alert" className="rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+            {contentError} Use Download to access the original file, or try another artifact.
+          </p>
+        )}
         {error && !loading && <p className="text-sm text-ink-400">{error}</p>}
         {preview && !loading && (
           <>
@@ -845,7 +1128,14 @@ export function ArtifactPreviewPanel({
             ) : null}
             {!imageSrc && !(mediaSrc && preview.content_type.startsWith("video/")) && !(mediaSrc && preview.content_type === "application/pdf") && (
               <>
-                {preview.email ||
+                {preview.parsed_records ? (
+                  <ParsedRecordsView jobId={jobId} artifactId={artifact.id} initial={preview.parsed_records} />
+                ) : preview.fragment && !preview.email ? (
+                  <div className="space-y-2">
+                    {preview.body ? <p className="text-xs text-ink-600">{preview.body.split("\n")[0]}</p> : null}
+                    <FragmentView fragment={preview.fragment} />
+                  </div>
+                ) : preview.email ||
                 preview.content_type === "message/rfc822" ||
                 (preview.attachments && preview.attachments.length > 0 && /eml|mail|message/i.test(preview.artifact_type || "")) ? (
                   <EmailPreviewView

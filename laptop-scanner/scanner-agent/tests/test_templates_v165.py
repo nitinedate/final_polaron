@@ -33,8 +33,12 @@ def test_every_shipped_template_validates_and_has_nessus_reference():
         req = validate_request({"template": template["key"]})
         assert req["template"] == template["key"]
         assert template.get("reference") or template.get("nessus_reference")
-        assert template["vendor"] in {"nessus", "nexpose", "aetheris"}
-        if template["category"] == "threat":
+        assert template["vendor"] in {"polaron", "nessus", "nexpose", "aetheris"}
+        if template["vendor"] == "polaron":
+            # V1.10.2: Polaron default package = Nessus Basic Network Scan ports + report ports.
+            assert template["key"] == "polaron" and template.get("default") is True
+            assert template["nessus_template"] == "Basic Network Scan" and template["nexpose_template"] is None
+        elif template["category"] == "threat":
             # V1.6.9: not in the Nessus 10.11 scanner list, so never labelled as a Nessus template.
             assert template["nessus_template"] is None and template["name"].startswith("Threat check:")
         elif template["vendor"] == "nexpose":

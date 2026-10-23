@@ -21,8 +21,16 @@ def test_physical_reports_are_unpacked_and_every_pdf_trained_the_model():
 
 
 def test_model_teaches_queries_and_observation_shape_without_exemplar_facts():
-    from app.services.document_report_model import extraction_queries_for_objective, load_document_report_model, trained_objective
+    from app.services.document_report_model import (
+        extraction_queries_for_objective,
+        load_document_report_model,
+        trained_objective,
+        trained_procedure_text,
+    )
 
+    email = trained_procedure_text("All Email IDs Used in the Browser")
+    assert email.lower().startswith("the browser history")
+    assert trained_procedure_text("Access from unauthorized devices") == ""
     usb = trained_objective("USB and External Device Usage")
     assert usb is not None
     queries = " ".join(extraction_queries_for_objective("USB and External Device Usage")).lower()

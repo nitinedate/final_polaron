@@ -53,11 +53,13 @@ export interface ScanPolicy {
   template_key?: string | null;
   /** V1.8.0 */
   template_name?: string | null;
-  vendor?: "nexpose" | "nessus" | "aetheris" | "custom" | string | null;
+  vendor?: "polaron" | "nexpose" | "nessus" | "aetheris" | "custom" | string | null;
   category?: string | null;
   requires_credentials?: string[];
   credentials_missing?: boolean;
   is_builtin?: boolean;
+  /** V1.10.2: built-in row of the default template (Polaron policy). */
+  is_default?: boolean;
   lifecycle_state?: string;
   compliance_framework: string | null;
   created_by: string | null;
@@ -79,13 +81,15 @@ export interface ScanPolicyTemplate {
   key: string;
   name: string;
   /** V1.8.0: which scanner's built-in template this mirrors */
-  vendor?: "nexpose" | "nessus" | "aetheris" | string;
+  vendor?: "polaron" | "nexpose" | "nessus" | "aetheris" | string;
   /** null for Aetheris threat checks that have no current Nessus template */
   nessus_template: string | null;
   /** Rapid7 InsightVM / Nexpose built-in template name, when vendor is nexpose */
   nexpose_template?: string | null;
   /** created automatically as a ready-to-use policy */
   seed_as_builtin?: boolean;
+  /** V1.10.2: preselected at launch and in New policy (Polaron policy) */
+  is_default?: boolean;
   reference?: string | null;
   category: "discovery" | "vulnerability" | "compliance" | "threat" | string;
   description: string;
@@ -100,6 +104,7 @@ export interface ScanPolicyTemplate {
     safe_checks?: string;
     optimize_test?: string;
     custom_tcp_ports?: number[];
+    custom_udp_ports?: number[];
     require_credentials?: string[];
     nvt_families?: string[];
     cve_watchlist?: string[];
@@ -269,6 +274,10 @@ export interface ScanJobTargetProgress {
     results_evidenced?: number;
     warnings?: number;
     port_state_counts?: { open?: number; closed?: number; filtered?: number };
+    /** V1.10.2: false when nothing on the host answered, so it was not assessed. */
+    host_responded?: boolean;
+    icmp_echo?: "reply" | "no_reply" | "unavailable" | string | null;
+    silent_cause?: "host_firewall" | "client_isolation_suspected" | "no_answer" | string | null;
   };
 }
 

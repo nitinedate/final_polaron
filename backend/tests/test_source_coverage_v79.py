@@ -64,6 +64,18 @@ def test_reads_are_job_scoped_without_schema_mutation(monkeypatch):
     assert 'WHERE job_id=:jid' in calls[0][0]
 
 
+def test_report_pages_omit_the_coverage_block():
+    result = coverage.build_source_coverage(processing_complete=True)
+    rendered = coverage.render_source_coverage(result)
+    report = "Analysis finding.\n\n" + rendered + "\n### Next heading\nKept.\n"
+    cleaned = coverage.strip_source_coverage_from_report(report)
+    assert "Source limitations" not in cleaned
+    assert "100%" not in cleaned
+    assert "| Source |" not in cleaned
+    assert "### Next heading" in cleaned
+    assert "Kept." in cleaned
+
+
 def test_report_escapes_source_names():
     result = coverage.build_source_coverage({'source_limitations': [
         {'code': 'inaccessible', 'source': '<script>|bad\nsource'}]})

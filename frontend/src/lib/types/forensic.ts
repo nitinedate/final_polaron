@@ -740,6 +740,7 @@ export interface CategoryNode {
 }
 
 export interface CategoryTree {
+  taxonomy?: Array<{key: string; title: string; items: Array<{key: string; title: string}>}>;
   categories: CategoryNode[];
   total: number;
   platform?: string | null;
@@ -781,11 +782,64 @@ export interface ArtifactPreview {
   body_text?: string;
   body_html?: string;
   encoding?: "base64" | "url" | null;
+  /** Original file bytes when the preview response already has them. */
+  file_base64?: string | null;
   content_url?: string | null;
   email?: ArtifactEmailHeaders;
   attachments?: ArtifactEmailAttachment[];
   attachment_count?: number;
+  /** True when a carved EML fragment was not a decodable email (no readable body). */
+  carved_unparsed?: boolean;
+  /** Headers valid, body region binary. */
+  carved_partial?: boolean;
+  /** Stage-5 (or on-demand) parsed records shown as a table. */
+  parsed_records?: ArtifactParsedRecords | null;
+  /** Strings / indicators / hex for bytes that are not a decodable object. */
+  fragment?: ArtifactFragment | null;
+  transport_headers?: string;
   device_name?: string | null;
+  file_created?: string | null;
+  file_modified?: string | null;
+  recovered_at?: string | null;
+}
+
+export interface ArtifactParsedRecords {
+  parser: string | null;
+  parser_version?: string | null;
+  family: string;
+  record_count: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  columns: string[];
+  rows: string[][];
+  source: "stored_parse" | "on_demand_parse" | string;
+  parsed_at?: string;
+}
+
+export interface ArtifactFragmentString {
+  offset: number;
+  encoding: "ascii" | "utf-16le" | string;
+  text: string;
+}
+
+export interface ArtifactFragment {
+  classification: string;
+  reason: string;
+  source: string;
+  base_offset: number;
+  stats: {
+    size_bytes: number;
+    scanned_bytes: number;
+    entropy: number;
+    printable_ratio: number;
+    string_count: number;
+    utf16_string_count: number;
+  };
+  indicators: { emails: string[]; urls: string[]; windows_paths: string[]; json_keys: string[] };
+  strings: ArtifactFragmentString[];
+  hex: string;
+  hex_bytes: number;
 }
 
 export interface CaseSubject {
@@ -1451,6 +1505,10 @@ export interface AcquisitionStartPayload {
   device_condition?: string;
   network_isolated?: boolean | null;
   create_working_copy?: boolean;
+  /** Explicit on-device authorizations (Android). "whatsapp_generate_key_and_backup" writes to the device. */
+  authorized_actions?: string[];
+  /** 64-digit WhatsApp end-to-end backup key (Android), when known or just created on-device. */
+  whatsapp_64_digit_key?: string;
   /** Optional IMAP cloud mailboxes (Gmail/Outlook app passwords). */
   cloud_mailboxes?: Array<{
     provider: string;

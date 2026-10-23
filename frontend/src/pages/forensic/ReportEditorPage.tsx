@@ -8,7 +8,7 @@ import {
   ReportCaseExhibitProvider,
   ReportEvidencePages,
   ReportEvidenceTocContext,
-  ReportSectionPagesWithActions,
+  ReportDocumentFlow,
   reportPagePlan,
 } from "../../components/forensic/ReportDocumentPreview";
 import { forensicApi } from "../../lib/forensicApi";
@@ -433,42 +433,16 @@ export function ReportEditorPage() {
         <ReportEvidenceTocContext.Provider value={{ page: evidencePageStart }}>
         <ReportCaseExhibitProvider jobId={jobId!}>
         <div className="space-y-3">
-          {sectionsWithPages.map(({ section, pageStart }) => (
-            <Card key={section.id} className="p-5">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <h3 className="font-bold capitalize text-ink-900">{section.section_key.replace(/_/g, " ")}</h3>
-                  <div className="mt-1 flex flex-wrap gap-2">
-                    <Badge tone={STATUS_TONE[section.verification_status] ?? "neutral"}>
-                      {section.verification_status}
-                    </Badge>
-                    {section.section_confidence != null && (
-                      <Badge tone="indigo">{Math.round(section.section_confidence * 100)}% confidence</Badge>
-                    )}
-                    {section.conflicts && section.conflicts.length > 0 && (
-                      <Badge tone="amber">{section.conflicts.length} validation conflict(s)</Badge>
-                    )}
-                  </div>
-                </div>
-              </div>
-              {section.narrative_content || section.structured_json ? (
-                <div className="mt-4 flex flex-col items-center rounded-xl bg-slate-100 p-4">
-                  <ReportSectionPagesWithActions
-                    section={section}
-                    pageStart={pageStart}
-                    jobId={jobId!}
-                    allSections={sections}
-                    onUpdated={onSectionUpdated}
-                  />
-                </div>
-              ) : (
-                <p className="mt-4 text-sm italic text-ink-400">No narrative content yet.</p>
-              )}
-              {section.citations && section.citations.length > 0 && (
-                <p className="mt-3 text-xs text-ink-400">{section.citations.length} citation(s)</p>
-              )}
-            </Card>
-          ))}
+          <div className="flex flex-wrap gap-2">
+            {sectionsWithPages.map(({ section }) => (
+              <Badge key={section.id || section.section_key} tone={STATUS_TONE[section.verification_status] ?? "neutral"}>
+                {section.section_key.replace(/_/g, " ")}
+              </Badge>
+            ))}
+          </div>
+          <div className="flex flex-col items-center rounded-xl bg-slate-100 p-4">
+            <ReportDocumentFlow sections={sections} jobId={jobId!} onUpdated={onSectionUpdated} />
+          </div>
           {jobId && (
             <Card className="p-5">
               <h3 className="font-bold text-ink-900">Evidences</h3>

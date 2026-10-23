@@ -3,6 +3,10 @@
 Modes:
   full       — extract nearly everything (minimal NTFS skips only)
   defensible — court-safe default: forensic evidence + uncertain/user files (when in doubt, keep)
+  standard   — Standard examination profile: defensible include rules, minus OS/vendor
+               trees and vendor application assets (binaries, icons, UI scripts, fonts)
+               under Windows\\, Program Files and ProgramData. Named forensic artifacts
+               claimed specifically by the OS scope pack are never excluded.
   forensic   — encyclopedia / RAG evidence set (skips WinSxS DLL noise)
   fast       — aggressive include-hints only
 
@@ -349,6 +353,61 @@ def _ext(name: str) -> str:
     return PurePosixPath(name).suffix.lower()
 
 
+# --- Standard profile -------------------------------------------------------
+# Vendor roots whose *assets* are identical on every machine of a build and carry
+# no case facts. User data stored there (documents, logs, databases, scripts,
+# archives, configs) is NOT matched by the extension set below and stays.
+STANDARD_VENDOR_ROOTS: tuple[str, ...] = (
+    "windows/",
+    "program files/",
+    "program files (x86)/",
+    "programdata/",
+)
+STANDARD_VENDOR_ASSET_EXTENSIONS: frozenset[str] = frozenset({
+    # executables / libraries / drivers
+    ".dll", ".exe", ".sys", ".drv", ".ocx", ".cpl", ".ax", ".efi", ".mui", ".mun", ".nls",
+    ".tlb", ".winmd", ".com", ".scr", ".ime", ".tsp", ".msi", ".msp", ".msu", ".bin",
+    ".pyd", ".pyc", ".so", ".node", ".jar", ".class", ".lib", ".pdb",
+    # component store / catalogs / manifests / resources
+    ".cat", ".mum", ".manifest", ".pnf", ".pri", ".resources", ".resx", ".xaml", ".xbf",
+    # fonts
+    ".ttf", ".ttc", ".otf", ".fon",
+    # product images / UI art
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".cur", ".ani", ".svg", ".webp", ".tif", ".tiff",
+    # bundled web UI
+    ".js", ".mjs", ".css", ".map", ".html", ".htm", ".json", ".xml", ".pak", ".asar", ".wasm",
+    # bundled sounds / demo media / help
+    ".wav", ".mp3", ".wma", ".mp4", ".wmv", ".chm", ".hlp",
+})
+
+
+def standard_vendor_asset_rule(path: str, *, os_family: str | None = None) -> str | None:
+    """Rule id when ``path`` is a vendor application asset Standard does not extract.
+
+    Never matches: user profiles, FORENSIC_KEEP_PREFIXES (hives, event logs,
+    Prefetch, Amcache, INF/SetupAPI, Start Menu, Defender/WLAN/network data),
+    anything the OS scope pack claims *specifically* (named artifacts such as
+    Panther/unattend.xml, Scheduled Tasks, SRUM), and extensions outside the
+    vendor-asset set (documents, logs, databases, archives, scripts, configs).
+    """
+    p = _norm(path)
+    if not p or not p.startswith(STANDARD_VENDOR_ROOTS):
+        return None
+    if _starts_with_any(p, FORENSIC_KEEP_PREFIXES):
+        return None
+    ext = _ext(PurePosixPath(p).name)
+    if ext not in STANDARD_VENDOR_ASSET_EXTENSIONS:
+        return None
+    try:
+        from app.services.os_artifact_scope import scope_claim_strength
+
+        if scope_claim_strength(p, os_family=os_family) == "specific":
+            return None
+    except Exception:
+        return None  # scope pack unavailable -> conservative: keep
+    return "standard_vendor_asset"
+
+
 def resolve_skip_system_paths(
     *,
     mode: str,
@@ -367,6 +426,9 @@ def resolve_skip_system_paths(
 
     if mode_l == "defensible":
         return False, "defensible_mode_selective_include"
+
+    if mode_l == "standard":
+        return False, "standard_mode_selective_include"
 
     if mode_l == "fast":
         return True, "fast_mode_broad_skip"
@@ -394,7 +456,7 @@ def matches_skip_prefix(
         return True
 
     mode_l = (mode or "").strip().lower()
-    if mode_l in ("forensic", "defensible"):
+    if mode_l in ("forensic", "defensible", "standard"):
         return _starts_with_any(p, ALWAYS_SKIP_PREFIXES_MINIMAL)
 
     family = (os_family or "").strip().lower()
@@ -731,6 +793,20 @@ def should_extract_node(
             return False, "defensible_filter"
         return True, None
 
+    if mode_l == "standard":
+        # The rule itself defers to specific scope-pack claims and KEEP prefixes.
+        rule = standard_vendor_asset_rule(path, os_family=os_family)
+        if rule:
+            return False, rule
+        if not matches_defensible_include(
+            path,
+            uncertain_max_bytes=uncertain_max_bytes,
+            size_bytes=size_bytes,
+            os_family=os_family,
+        ):
+            return False, "standard_filter"
+        return True, None
+
     if mode_l == "forensic":
         if matches_forensic_include(path, os_family=os_family):
             return True, None
@@ -813,7 +889,10 @@ def filter_policy_summary(
         "extract_mode": mode_l,
         "skip_system_paths": skip,
         "policy_reason": reason,
-        "forensic_noise_prefixes": list(FORENSIC_NOISE_PREFIXES) if mode_l in ("forensic", "defensible") else [],
-        "forensic_keep_prefixes": list(FORENSIC_KEEP_PREFIXES) if mode_l in ("forensic", "defensible") else [],
-        "include_uncertain": mode_l == "defensible",
+        "forensic_noise_prefixes": list(FORENSIC_NOISE_PREFIXES) if mode_l in ("forensic", "defensible", "standard") else [],
+        "forensic_keep_prefixes": list(FORENSIC_KEEP_PREFIXES) if mode_l in ("forensic", "defensible", "standard") else [],
+        "include_uncertain": mode_l in ("defensible", "standard"),
+        "standard_vendor_roots": list(STANDARD_VENDOR_ROOTS) if mode_l == "standard" else [],
+        "standard_vendor_asset_extensions": sorted(STANDARD_VENDOR_ASSET_EXTENSIONS) if mode_l == "standard" else [],
+        "os_vendor_trees": "skip" if mode_l == "standard" else None,
     }

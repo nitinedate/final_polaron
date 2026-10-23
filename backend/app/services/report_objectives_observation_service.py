@@ -35,6 +35,25 @@ from app.services.structured_observation_service import (
 )
 
 
+def printed_procedure(title: str, objective: dict[str, Any]) -> str:
+    """Use the procedure learned from the trained report model when one matches."""
+    from app.services.document_report_model import trained_procedure_text
+
+    statement = str(
+        objective.get("statement")
+        or objective.get("description")
+        or objective.get("objective_text")
+        or ""
+    )
+    trained = trained_procedure_text(title, statement)
+    if trained:
+        return trained
+    return format_procedure_for_report(
+        str(objective.get("procedure_text") or objective.get("procedure") or ""),
+        title=title,
+    )
+
+
 def build_intake_context(intake: dict[str, Any]) -> str:
     """Small client-safe intake block used only as report-writing context."""
     lines: list[str] = []
@@ -221,9 +240,9 @@ def fill_objective_observations(
 ) -> str:
     """Generate Section C from the supplied AXIOM KB and current-case evidence.
 
-    The previous V7 path maintained independent per-title evidence dictionaries,
-    AXIOM prompt templates, generic artifact totals and a second LLM planning layer.
-    Those sources of truth are intentionally not used here.
+    The printed observation is the deterministic evidence brief. A writing model
+    is not asked to rewrite it, and a second model is not asked to extract
+    quotes. Saved observations are reused so a resumed report does not redo them.
     """
     from app.services.evidence_contract_planner import attach_evidence_contracts_to_objectives
     from app.services.mobile_report_service import is_mobile_intake
@@ -264,18 +283,65 @@ def fill_objective_observations(
     )
 
     heading = "## OBJECTIVE, OBSERVATION with FINDINGS" if mobile else "## C. OBJECTIVE, PROCEDURE & OBSERVATION"
-    from app.services.source_coverage import collect_source_coverage, render_source_coverage
+    from app.services.source_coverage import collect_source_coverage
     source_coverage = collect_source_coverage(db, job_id, processing_complete=True)
-    parts: list[str] = [heading, "", render_source_coverage(source_coverage)]
-    intake_context = build_intake_context(intake)
+    parts: list[str] = [heading, ""]
 
-    question_retrieval_cache: dict = {}
+    from app.db.sql_helpers import fetchall
+
+    saved_by_id: dict[str, dict[str, Any]] = {}
+    for row in fetchall(
+        db,
+        """SELECT objective_id, observation_md, structured_json
+           FROM job_objective_observations WHERE job_id=:jid""",
+        {"jid": job_id},
+    ) or []:
+        stored = row.get("structured_json") or {}
+        if isinstance(stored, str):
+            try:
+                stored = json.loads(stored)
+            except json.JSONDecodeError:
+                stored = {}
+        saved_by_id[str(row.get("objective_id") or "")] = {
+            "observation_md": str(row.get("observation_md") or "").strip(),
+            "structured_json": stored if isinstance(stored, dict) else {},
+        }
+
     for idx, objective in enumerate(objectives, 1):
         title = display_objective_title(objective, db)
         _progress("objective", idx, n_obj, title)
+        oid = str(objective.get("id") or objective.get("objective_id") or "")
+        saved = saved_by_id.get(oid) or {}
+        if saved.get("observation_md"):
+            observation = str(saved["observation_md"])
+            question_analysis = (saved.get("structured_json") or {}).get("investigation_question_analysis") or {}
+            objective_text = format_client_objective(title) or "To examine this area using the controlled forensic procedure."
+            procedure_text = printed_procedure(title, objective)
+            from app.services.forensic_question_analysis import render_question_analysis
+            parts.extend(
+                [
+                    f"### {idx}. {title}",
+                    "",
+                    "**Objective**",
+                    "",
+                    objective_text,
+                    "",
+                    "**Procedure**",
+                    "",
+                    procedure_text,
+                    "",
+                    "**Observation**",
+                    "",
+                    observation,
+                    render_question_analysis(question_analysis),
+                    "",
+                ]
+            )
+            continue
 
-        # Build + persist the deterministic observation first. This is the authoritative
-        # evidence result even when the writing model is later used for readability.
+        # The evidence brief is already the finding. Rewriting each objective with the
+        # 14B model, then again for question extraction, is what held Section C for
+        # about a minute per objective. The saved text is what the report prints.
         built = build_structured_observation(
             db,
             job_id,
@@ -286,64 +352,27 @@ def fill_objective_observations(
         )
         brief = ((built.get("structured_json") or {}).get("evidence_brief") or {})
         deterministic = str(built.get("observation_md") or "").strip()
-        observation = deterministic
+        observation = _finalize_observation(
+            deterministic,
+            title=title,
+            device_label=device_label,
+            fallback=deterministic,
+            brief=brief,
+        )
 
-        indexed_chunks: list[dict[str, Any]] = []
-        if polish_with_llm and primary_model:
-            try:
-                indexed_chunks = retrieve_objective_evidence(
-                    db,
-                    job_id,
-                    objective,
-                    schema_name=schema_name,
-                    top_k=12,
-                    skip_vector=True,
-                )
-            except Exception:
-                indexed_chunks = []
-            indexed_evidence = _indexed_evidence_for_agent(indexed_chunks)
-            try:
-                polished = generate_text(
-                    _observation_prompt(
-                        objective,
-                        brief=brief,
-                        indexed_evidence=indexed_evidence,
-                        deterministic_draft=deterministic,
-                        intake_context=intake_context,
-                    ),
-                    model=primary_model,
-                    system=REPORT_AGENT_SYSTEM_RULES,
-                    temperature=0.08,
-                    timeout=45,
-                ).strip()
-            except Exception:
-                polished = ""
-            observation = _finalize_observation(
-                polished,
-                title=title,
-                device_label=device_label,
-                fallback=deterministic,
-                brief=brief,
-            )
-        else:
-            observation = _finalize_observation(
-                deterministic,
-                title=title,
-                device_label=device_label,
-                fallback=deterministic,
-                brief=brief,
-            )
-
-        # Persist the exact text that will appear in Section C so Analysis Summary and
-        # audit/review views do not retain an older generic observation.
         built["observation_md"] = observation
         structured_json = built.get("structured_json") or {}
-        from app.services.forensic_question_analysis import analyze_questions, render_question_analysis
-        question_analysis = analyze_questions(db, job_id, title, schema_name=schema_name,
-            model=primary_model if polish_with_llm else None, retrieval_cache=question_retrieval_cache)
+        from app.services.forensic_question_analysis import render_question_analysis
+        # Keyword retrieval scans every parsed artifact (ILIKE over normalized JSON).
+        # That search was taking longer than the finding itself. The observation
+        # already states the evidence, so the report does not run it per objective.
+        question_analysis = {
+            "questions": [],
+            "findings": [],
+            "limitations": [],
+        }
         structured_json["source_coverage"] = source_coverage
         structured_json["investigation_question_analysis"] = question_analysis
-        structured_json["indexed_evidence_used_for_writing"] = _indexed_evidence_for_agent(indexed_chunks)
         built["structured_json"] = structured_json
         persist_job_observation(db, job_id, built)
 
@@ -351,10 +380,7 @@ def fill_objective_observations(
         # Saved intake/database wording is retained only as selection metadata and may
         # not override the controlled report definition at generation time.
         objective_text = format_client_objective(title) or "To examine this area using the controlled forensic procedure."
-        procedure_text = format_procedure_for_report(
-            str(objective.get("procedure_text") or objective.get("procedure") or ""),
-            title=title,
-        )
+        procedure_text = printed_procedure(title, objective)
 
         parts.extend(
             [
@@ -403,7 +429,6 @@ def assemble_section_c_from_saved_observations(
         ensure_all_objectives_in_report,
         sanitize_section_c_markdown,
     )
-    from app.services.report_objective_evidence import format_procedure_for_report
     from app.services.report_template_service import resolve_report_objectives
 
     objectives = resolve_report_objectives(db, job_id, intake)
@@ -428,9 +453,7 @@ def assemble_section_c_from_saved_observations(
 
     mobile = is_mobile_intake(intake)
     heading = "## OBJECTIVE, OBSERVATION with FINDINGS" if mobile else "## C. OBJECTIVE, PROCEDURE & OBSERVATION"
-    from app.services.source_coverage import collect_source_coverage, render_source_coverage
-    source_coverage = collect_source_coverage(db, job_id, processing_complete=True)
-    parts: list[str] = [heading, "", render_source_coverage(source_coverage)]
+    parts: list[str] = [heading, ""]
     for idx, objective in enumerate(objectives, 1):
         oid = str(objective.get("id") or objective.get("objective_id") or "")
         title = display_objective_title(objective, db)
@@ -438,10 +461,7 @@ def assemble_section_c_from_saved_observations(
         if not observation:
             observation = f"See the examination record for {title}."
         objective_text = format_client_objective(title) or "To examine this area using the controlled forensic procedure."
-        procedure_text = format_procedure_for_report(
-            str(objective.get("procedure_text") or objective.get("procedure") or ""),
-            title=title,
-        )
+        procedure_text = printed_procedure(title, objective)
         from app.services.forensic_question_analysis import render_question_analysis
         saved = (obs_by_id.get(oid) or {}).get("structured_json") or {}
         if isinstance(saved, str):

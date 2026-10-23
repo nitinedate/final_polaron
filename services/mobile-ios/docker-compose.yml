@@ -10,6 +10,7 @@ x-gpu: &gpu
 
 x-mobile-env: &mobile-env
   AETHERIS_SERVICE: mobile-ios
+  AETHERIS_SKIP_BOOT_MIGRATIONS: "1"
   VULN_MODULE_ENABLED: "false"
   DATABASE_URL: postgresql+psycopg2://forensic:forensic@postgres:5432/forensic
   REDIS_URL: redis://redis:6379/2
@@ -166,8 +167,8 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 180s
+      retries: 18
+      start_period: 420s
 
   worker-build:
     <<: *app-common

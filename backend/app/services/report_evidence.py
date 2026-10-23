@@ -626,9 +626,9 @@ def gather_annexure_structured(db, job_id: str, *, url_sample_limit: int = 15) -
         })
 
     if "usb_devices" in annexure_kinds:
-        from app.services.axiom_aligned_counts import count_usb_device_records
+        from app.services.catalog_aligned_counts import count_usb_device_records
 
-        total, devices = count_usb_device_records(db, job_id)
+        total, devices = count_usb_device_records(db, job_id, live=False)
         shown = min(total, url_sample_limit) if total > 0 else 0
         rows = []
         for i, dev in enumerate(devices[:shown], 1):

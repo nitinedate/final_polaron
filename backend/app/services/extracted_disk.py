@@ -315,12 +315,13 @@ def _filter_nodes(
     settings,
     *,
     os_info: dict | None = None,
+    mode_override: str | None = None,
 ) -> tuple[list[dict], dict]:
     """Pre-filter file list before sharding — avoids expensive TSK reads on junk paths.
 
     OS-aware: Windows full mode never broad-skips WinSxS/WindowsApps/LogFiles/etc.
     """
-    mode = (settings.extract_mode or "full").strip().lower()
+    mode = mode_override or (settings.extract_mode or "full").strip().lower()
     family = (os_info or {}).get("family") or "unknown"
     skip_system, policy_reason = resolve_skip_system_paths(
         mode=mode,
@@ -351,11 +352,22 @@ def _filter_nodes(
     except Exception:  # pragma: no cover
         os_vendor_mode = lambda: "keep"  # noqa: E731
         should_skip_os_vendor = lambda *a, **k: (False, None)  # noqa: E731
-    stats["os_vendor_mode"] = os_vendor_mode()
+    # Standard profile enables the V45 tree-level vendor exclusion for this job
+    # only; other modes keep following EXTRACT_OS_VENDOR_TREES (default keep).
+    try:
+        from app.services.extract_os_vendor_noise import classify_os_vendor_standard
+    except Exception:  # pragma: no cover
+        classify_os_vendor_standard = lambda *a, **k: None  # noqa: E731
+    standard_mode = mode == "standard"
+    stats["os_vendor_mode"] = "skip" if standard_mode else os_vendor_mode()
     for node in nodes:
         rel = node["path"]
         size = int(node.get("size_bytes") or 0)
-        skip_vendor, vendor_rule = should_skip_os_vendor(rel, size_bytes=size, os_family=family)
+        if standard_mode:
+            vendor_rule = classify_os_vendor_standard(rel, size_bytes=size, os_family=family)
+            skip_vendor = bool(vendor_rule)
+        else:
+            skip_vendor, vendor_rule = should_skip_os_vendor(rel, size_bytes=size, os_family=family)
         if skip_vendor:
             stats["filtered_out"] += 1
             stats[vendor_rule or "os_vendor_tree"] = stats.get(vendor_rule or "os_vendor_tree", 0) + 1
@@ -1276,6 +1288,8 @@ def _persist_partial_manifest(
         fetchone(db, "SELECT disk_source FROM jobs WHERE id=:job_id", {"job_id": job_id})
     )
     merged = merge_mobile_meta_into_disk_source(manifest, extract_mobile_meta(prior))
+    if prior.get("processing_profile") in ("standard", "deep"):
+        merged["processing_profile"] = prior["processing_profile"]
     execute(
         db,
         "UPDATE jobs SET disk_source=CAST(:ds AS jsonb), updated_at=NOW() WHERE id=:job_id",
@@ -1369,7 +1383,22 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
     nodes: list[dict] = []
     filter_stats: dict = {}
     all_nodes: list[dict] = []
-    mode = (settings.extract_mode or "forensic").strip().lower()
+    # New two-profile selection. Legacy jobs retain their checkpoint/env policy.
+    profile_row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:jid", {"jid": job_id})
+    raw_source = (profile_row or {}).get("disk_source") or {}
+    if isinstance(raw_source, str):
+        try:
+            raw_source = json.loads(raw_source)
+        except (ValueError, TypeError):
+            raw_source = {}
+    profile = raw_source.get("processing_profile") if isinstance(raw_source, dict) else None
+    # Standard previously mapped to "defensible" ("when in doubt, keep"), which on
+    # Windows is nearly the same file set as Deep. "standard" adds the vendor-tree
+    # and vendor-asset exclusions; every exclusion is counted in filter_stats.
+    # A resumed extraction keeps the mode saved in its checkpoint (below).
+    mode = {"standard": "standard", "deep": "full"}.get(
+        profile, (settings.extract_mode or "forensic").strip().lower()
+    )
     nodes_uri = (existing_cp or {}).get("nodes_uri")
     loaded_from_cache = False
 
@@ -1632,7 +1661,7 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
             stage="extract",
             interval_sec=15.0,
         ):
-            nodes, filter_stats = _filter_nodes(all_nodes, settings, os_info=os_info)
+            nodes, filter_stats = _filter_nodes(all_nodes, settings, os_info=os_info, mode_override=mode)
             if any(enum_coverage.values()):
                 # Preserve the limitation in the extract manifest/checkpoint;
                 # do not silently equate processed=100% with full coverage.
@@ -1849,7 +1878,7 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
         ):
             all_nodes = enumerate_all_files(vd, on_progress=on_enum_progress)
         os_info = detect_os_from_paths(all_nodes)
-        nodes, filter_stats = _filter_nodes(all_nodes, settings, os_info=os_info)
+        nodes, filter_stats = _filter_nodes(all_nodes, settings, os_info=os_info, mode_override=mode)
         from app.services.disk_manifest import upload_extract_nodes
 
         nodes_uri = upload_extract_nodes(job_id, nodes, zstd_level=settings.extract_zstd_level)

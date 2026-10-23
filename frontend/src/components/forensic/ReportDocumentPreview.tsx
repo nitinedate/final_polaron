@@ -14,7 +14,9 @@ import {
   paginateArtifactItemCosts,
   paginateNarrativeLines,
   paginateOpoCards,
+  tableChunkChromeUnits,
   tableChunkUnits,
+  tableRowUnits,
   takeOpoCardPrefix,
   visualNarrativeLines,
 } from "../../lib/reportPagination";
@@ -129,7 +131,7 @@ function wrapFriendlyCell(text: string): string {
     !DATEISH_CELL_RE.test(raw) &&
     (/^https?:\/\//i.test(raw) || /^www\./i.test(raw) || /^[A-Za-z]:[\\/]/.test(raw) || raw.includes("\\") || (raw.split("/").length > 4 && /[A-Za-z]/.test(raw)));
   if (shouldWrap) {
-    return raw.replace(/([/?&=._-])/g, "$1\u200b");
+    return raw.replace(/([\\/])/g, "$1\u200b");
   }
   return raw;
 }
@@ -231,13 +233,49 @@ export function artifactCatalogFromMarkdown(content: string): { sections?: Artif
   return catalogHasItems({ sections }) ? { sections } : null;
 }
 
+function stripSourceCoverage(markdown: string): string {
+  const lines = markdown.split("\n");
+  const kept: string[] = [];
+  let skipping = false;
+  let skippingTable = false;
+  for (const line of lines) {
+    const stripped = line.trim();
+    if (/source limitations and evidence coverage/i.test(stripped)) {
+      skipping = true;
+      skippingTable = false;
+      continue;
+    }
+    if (skipping) {
+      if (/^#{1,6}\s+\S/.test(stripped) && !/source limitations and evidence coverage/i.test(stripped)) skipping = false;
+      else continue;
+    }
+    if (/^\|\s*Source\s*\|\s*Limitation\s*\|\s*Follow-up\s*\|/i.test(stripped)) {
+      skippingTable = true;
+      continue;
+    }
+    if (skippingTable) {
+      if (stripped.startsWith("|")) continue;
+      skippingTable = false;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function isSourceCoverageTable(table: { title?: string; columns?: string[] }): boolean {
+  const title = (table.title ?? "").toLowerCase();
+  if (title.includes("source limitations")) return true;
+  const columns = (table.columns ?? []).map((col) => col.trim().toLowerCase());
+  return columns.includes("source") && columns.includes("limitation") && columns.includes("follow-up");
+}
+
 /** Enrich section with parsed markdown tables / catalog when structured_json is sparse. */
 export function enhanceSectionForPreview(section: ReportSection): ReportSection {
   const sj: Record<string, unknown> = { ...(section.structured_json ?? {}) };
-  const narrative = section.narrative_content ?? "";
+  const narrative = stripSourceCoverage(section.narrative_content ?? "");
 
-  const parsed = parseMarkdownTables(narrative);
-  const existingTables = Array.isArray(sj.tables) ? (sj.tables as AnnexureTable[]) : [];
+  const parsed = parseMarkdownTables(narrative).filter((table) => !isSourceCoverageTable(table));
+  const existingTables = (Array.isArray(sj.tables) ? (sj.tables as AnnexureTable[]) : []).filter((table) => !isSourceCoverageTable(table));
   const parsedRows = parsed.reduce((sum, table) => sum + table.rows.length, 0);
   const existingRows = existingTables.reduce((sum, table) => sum + (table.rows?.length ?? 0), 0);
   const humanEdited = Boolean(sj.human_edit_baseline);
@@ -254,6 +292,8 @@ export function enhanceSectionForPreview(section: ReportSection): ReportSection 
         note,
       };
     });
+  } else if (Array.isArray(sj.tables)) {
+    sj.tables = existingTables;
   }
 
   if (section.section_key === "artifact_summary") {
@@ -265,7 +305,11 @@ export function enhanceSectionForPreview(section: ReportSection): ReportSection 
     Object.assign(sj, coverFromMarkdown(narrative));
   }
 
-  return { ...section, structured_json: Object.keys(sj).length ? sj : section.structured_json };
+  return {
+    ...section,
+    narrative_content: narrative,
+    structured_json: Object.keys(sj).length ? sj : section.structured_json,
+  };
 }
 
 function sectionOrderForSections(sections: ReportSection[]): string[] {
@@ -311,29 +355,121 @@ const REPORT_TOC_ROWS: Array<{ key: string; label: string }> = [
   { key: "appendix", label: "F. APPENDIX" },
 ];
 
+const OPAQUE_SECTION_KEYS = new Set([
+  "cover_page",
+  "table_of_contents",
+  "introduction",
+  "artifact_summary",
+  "objectives_procedure_observation",
+  "suspicious_activity",
+]);
+
+const FLOW_PAGE_UNITS = 34;
+
+type FlowBlock = {
+  section: ReportSection;
+  title: string;
+  lines: string[];
+  tables: AnnexureTable[];
+  cost: number;
+};
+
+type FlowEntry =
+  | { kind: "opaque"; section: ReportSection; pageStart: number; pageCount: number }
+  | { kind: "sheets"; sheets: FlowBlock[][]; pageStart: number };
+
+function flowBlockCost(lines: string[], tables: AnnexureTable[]): number {
+  let cost = 2;
+  cost += pageVisualCost(lines);
+  tables.forEach((table, idx) => {
+    cost += (idx || lines.length ? TABLE_GAP_UNITS : 0) + tableChunkUnits({ ...table, rows: table.rows ?? [], continued: Boolean(table.continued) });
+  });
+  return Math.max(1, cost);
+}
+
+function blocksFromSection(section: ReportSection): FlowBlock[] {
+  const view = enhanceSectionForPreview(section);
+  const title = visibleSectionTitle(view);
+  return paginateSectionContent(view).map((page, idx) => ({
+    section: view,
+    title: idx === 0 ? title : `${title} (continued)`,
+    lines: page.lines,
+    tables: page.tables,
+    cost: flowBlockCost(page.lines, page.tables),
+  }));
+}
+
+function packFlowBlocks(blocks: FlowBlock[], capacity = FLOW_PAGE_UNITS): FlowBlock[][] {
+  const pages: FlowBlock[][] = [];
+  let current: FlowBlock[] = [];
+  let used = 0;
+  for (const block of blocks) {
+    if (current.length && used + block.cost > capacity) {
+      pages.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(block);
+    used += block.cost;
+  }
+  if (current.length) pages.push(current);
+  return pages;
+}
+
+export function buildReportFlow(sections: ReportSection[]): {
+  entries: FlowEntry[];
+  starts: Map<string, number>;
+  evidencePageStart: number;
+} {
+  const ordered = orderReportSections(sections);
+  const starts = new Map<string, number>();
+  const entries: FlowEntry[] = [];
+  let page = 1;
+  let pending: FlowBlock[] = [];
+
+  const flush = () => {
+    if (!pending.length) return;
+    const sheets = packFlowBlocks(pending);
+    const pageStart = page;
+    for (const sheet of sheets) {
+      for (const block of sheet) {
+        if (!starts.has(block.section.section_key)) starts.set(block.section.section_key, page);
+      }
+      page += 1;
+    }
+    entries.push({ kind: "sheets", sheets, pageStart });
+    pending = [];
+  };
+
+  for (const section of ordered) {
+    if (OPAQUE_SECTION_KEYS.has(section.section_key)) {
+      flush();
+      const pageCount = Math.max(1, countPreviewPages(section));
+      starts.set(section.section_key, page);
+      entries.push({ kind: "opaque", section, pageStart: page, pageCount });
+      page += pageCount;
+      continue;
+    }
+    pending.push(...blocksFromSection(section));
+  }
+  flush();
+  return { entries, starts, evidencePageStart: page };
+}
+
 export function reportPagePlan(sections: ReportSection[]): {
   plan: Array<{ section: ReportSection; pageStart: number }>;
   evidencePageStart: number;
 } {
-  const ordered = orderReportSections(sections);
-  let page = 1;
-  const plan = ordered.map((section) => {
-    const pageStart = page;
-    page += countPreviewPages(section);
-    return { section, pageStart };
-  });
-  return { plan, evidencePageStart: page };
+  const flow = buildReportFlow(sections);
+  const plan = orderReportSections(sections).map((section) => ({
+    section,
+    pageStart: flow.starts.get(section.section_key) ?? 1,
+  }));
+  return { plan, evidencePageStart: flow.evidencePageStart };
 }
 
 export function computeSectionPageStarts(sections: ReportSection[]): Map<string, number> {
-  const ordered = orderReportSections(sections);
-  const starts = new Map<string, number>();
-  let page = 1;
-  for (const section of ordered) {
-    starts.set(section.section_key, page);
-    page += countPreviewPages(section);
-  }
-  return starts;
+  return buildReportFlow(sections).starts;
 }
 
 function TableOfContentsPreview({ sections }: { sections: ReportSection[] }) {
@@ -486,17 +622,52 @@ function paginateSectionContent(section: ReportSection): SectionPage[] {
     lines: pageLines,
     tables: [] as AnnexureTable[],
   }));
-  const last = pages[pages.length - 1];
-  const leftover = TABLE_PAGE_UNITS - pageVisualCost(last.lines);
-  const firstCost = packed[0].reduce(
-    (n, chunk, idx) => n + (idx ? TABLE_GAP_UNITS : 0) + tableChunkUnits(chunk),
-    0,
-  );
-  if (firstCost <= leftover) {
-    last.tables.push(...packed.shift()!);
+  const queue = packed.map((page) => page.map((chunk) => ({ ...chunk, rows: [...(chunk.rows ?? [])] })));
+  const roomOn = (page: SectionPage) => {
+    const narrative = pageVisualCost(page.lines);
+    const tables = page.tables.reduce(
+      (n, chunk, idx) =>
+        n + (idx || page.lines.length ? TABLE_GAP_UNITS : 0) + tableChunkUnits({ ...chunk, rows: chunk.rows ?? [], continued: Boolean(chunk.continued) }),
+      0,
+    );
+    return TABLE_PAGE_UNITS - narrative - tables;
+  };
+  while (queue.length) {
+    const last = pages[pages.length - 1];
+    const nextPage = queue[0];
+    const next = nextPage[0];
+    if (!next) {
+      queue.shift();
+      continue;
+    }
+    const room = roomOn(last);
+    const gap = last.tables.length || last.lines.length ? TABLE_GAP_UNITS : 0;
+    const chrome = tableChunkChromeUnits(next.title, next.note, Boolean(next.continued));
+    const firstRow = (next.rows ?? [])[0];
+    if (!firstRow || gap + chrome + tableRowUnits(firstRow, next.columns ?? []) > room) {
+      break;
+    }
+    let take = 0;
+    let rowCost = 0;
+    while (take < (next.rows ?? []).length) {
+      const cost = tableRowUnits(next.rows[take], next.columns ?? []);
+      if (gap + chrome + rowCost + cost > room) break;
+      rowCost += cost;
+      take += 1;
+    }
+    if (!take) break;
+    last.tables.push({
+      ...next,
+      rows: next.rows.slice(0, take),
+    });
+    next.rows = next.rows.slice(take);
+    next.continued = true;
+    next.note = undefined;
+    if (!next.rows.length) nextPage.shift();
+    if (!nextPage.length) queue.shift();
   }
-  for (const tablePage of packed) {
-    pages.push({ lines: [], tables: tablePage });
+  for (const tablePage of queue) {
+    if (tablePage.length) pages.push({ lines: [], tables: tablePage });
   }
   return pages.filter((page) => page.lines.length || page.tables.length);
 }
@@ -513,13 +684,13 @@ function OneStructuredTable({ table }: { table: AnnexureTable }) {
       {table.note && !table.continued && (
         <p className="mb-2 text-[12px] italic text-ink-600">{table.note}</p>
       )}
-      <table className="w-full table-fixed border-collapse text-[11.5px] leading-snug [break-inside:auto]">
+      <table className="w-full border-collapse text-[11.5px] leading-snug [break-inside:auto]">
         <thead>
           <tr className="bg-[#ffc000] text-black">
             {(table.columns ?? []).map((col) => (
               <th
                 key={col}
-                className="break-words border border-black px-2 py-2 text-center font-bold [overflow-wrap:break-word] [word-break:break-word]"
+                className="border border-black px-2 py-2 text-center font-bold [word-break:normal]"
               >
                 {col}
               </th>
@@ -530,7 +701,7 @@ function OneStructuredTable({ table }: { table: AnnexureTable }) {
           {(table.rows ?? []).map((row, ri) => (
             <tr key={ri} className={clsx("[break-inside:avoid] [page-break-inside:avoid]", ri % 2 === 0 ? "bg-[#d9e2f3]" : "bg-white")}>
               {(table.columns ?? []).map((_, ci) => (
-                <td key={ci} className="border border-black px-2 py-2 align-top [overflow-wrap:break-word] [word-break:break-word]">
+                <td key={ci} className="border border-black px-2 py-2 align-top [word-break:normal]">
                   {wrapFriendlyCell(row[ci] ?? "")}
                 </td>
               ))}
@@ -1499,7 +1670,7 @@ function ReportPageFrame({
               {title}
             </h2>
           )}
-          <div className="min-h-0 flex-1 overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-visible">
             {editable ? <EditableReportBody>{children}</EditableReportBody> : children}
           </div>
         </div>
@@ -1689,26 +1860,133 @@ export function countPreviewPages(section: ReportSection): number {
 
 function SectionActionsPanel({
   jobId,
-  section,
+  sections,
   onUpdated,
   editing,
   setEditing,
 }: {
   jobId: string;
-  section: ReportSection;
+  sections: ReportSection[];
   onUpdated: (updated: ReportSection) => void;
   editing: boolean;
   setEditing: (value: boolean) => void;
 }) {
+  const section = sections[0];
+  if (!section) return null;
   return (
     <div className="mx-auto mb-6 mt-4 w-[210mm] max-w-full">
       <ReportSectionReview
         jobId={jobId}
         section={section}
+        sections={sections}
         onUpdated={onUpdated}
         editing={editing}
         setEditing={setEditing}
       />
+    </div>
+  );
+}
+
+function FlowSheet({
+  sheet,
+  pageNo,
+  editing,
+}: {
+  sheet: FlowBlock[];
+  pageNo: number;
+  editing: Record<string, boolean>;
+}) {
+  return (
+    <ReportPageFrame hideTitle pageNo={pageNo} editable>
+      <div className="space-y-4">
+        {sheet.map((block, idx) => {
+          const sj = (block.section.structured_json ?? {}) as Record<string, unknown>;
+          const baseline = String(sj.human_edit_baseline ?? "").trim();
+          return (
+            <ReportEditProvider
+              key={`${block.section.section_key}-${idx}`}
+              editing={Boolean(editing[block.section.section_key])}
+              baselineLines={plainNarrativeLines(baseline)}
+              sectionKey={block.section.section_key}
+            >
+              <div>
+                <h2 className="mt-2 mb-3 text-[18px] leading-snug font-black uppercase text-[#082c5c] underline decoration-[#082c5c] decoration-2 underline-offset-4">
+                  {block.title}
+                </h2>
+                <NarrativeBlock lines={block.lines} />
+                {block.tables.map((table, tableIdx) => (
+                  <OneStructuredTable key={`${table.title ?? "table"}-${tableIdx}`} table={table} />
+                ))}
+              </div>
+            </ReportEditProvider>
+          );
+        })}
+      </div>
+    </ReportPageFrame>
+  );
+}
+
+export function ReportDocumentFlow({
+  sections,
+  jobId,
+  onUpdated,
+}: {
+  sections: ReportSection[];
+  jobId: string;
+  onUpdated: (updated: ReportSection) => void;
+}) {
+  const flow = buildReportFlow(sections);
+  const [editing, setEditing] = useState<Record<string, boolean>>({});
+  return (
+    <div className="space-y-6">
+      {flow.entries.map((entry, entryIdx) => {
+        if (entry.kind === "opaque") {
+          return (
+            <ReportSectionPagesWithActions
+              key={entry.section.id || `${entry.section.section_key}-${entryIdx}`}
+              section={entry.section}
+              pageStart={entry.pageStart}
+              jobId={jobId}
+              allSections={sections}
+              onUpdated={onUpdated}
+            />
+          );
+        }
+        return entry.sheets.map((sheet, sheetIdx) => {
+          const pageNo = entry.pageStart + sheetIdx;
+          const later = new Set(
+            entry.sheets.slice(sheetIdx + 1).flatMap((next) => next.map((block) => block.section.section_key)),
+          );
+          const ending: ReportSection[] = [];
+          const seen = new Set<string>();
+          for (const block of sheet) {
+            const key = block.section.section_key;
+            if (seen.has(key) || later.has(key)) continue;
+            seen.add(key);
+            ending.push(block.section);
+          }
+          return (
+            <div key={`sheet-${entryIdx}-${sheetIdx}`} className="flex flex-col items-center">
+              <FlowSheet sheet={sheet} pageNo={pageNo} editing={editing} />
+              {ending.length > 0 && (
+                <SectionActionsPanel
+                  jobId={jobId}
+                  sections={ending}
+                  onUpdated={onUpdated}
+                  editing={ending.some((section) => editing[section.section_key])}
+                  setEditing={(value) =>
+                    setEditing((current) => {
+                      const next = { ...current };
+                      for (const section of ending) next[section.section_key] = value;
+                      return next;
+                    })
+                  }
+                />
+              )}
+            </div>
+          );
+        });
+      })}
     </div>
   );
 }
@@ -1740,7 +2018,7 @@ export function ReportSectionPagesWithActions({
           actions={
             <SectionActionsPanel
               jobId={jobId}
-              section={section}
+              sections={[section]}
               onUpdated={onUpdated}
               editing={editing}
               setEditing={setEditing}

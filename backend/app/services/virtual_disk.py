@@ -1626,6 +1626,55 @@ def iter_file_from_disk(
     raise FileNotFoundError(rel_path)
 
 
+def read_file_range_from_disk(
+    vd: VirtualDisk,
+    rel_path: str,
+    *,
+    start_offset: int = 0,
+    inode: int | None = None,
+    max_bytes: int = 8 * 1024 * 1024,
+) -> bytes:
+    """Read one byte range. Does not scan from the start of a large file."""
+    rel_path = (rel_path or "").replace("\\", "/").lstrip("/")
+    start = max(int(start_offset or 0), 0)
+    want = max(int(max_bytes or 0), 0)
+    if want <= 0:
+        return b""
+    if vd._fs_info and _pytsk3:
+        fentry = None
+        if inode is not None:
+            try:
+                fentry = vd._fs_info.open_meta(int(inode))
+            except Exception:
+                fentry = None
+        if fentry is None and rel_path:
+            for candidate in (rel_path, rel_path.lstrip("/")):
+                try:
+                    fentry = vd._fs_info.open(candidate)
+                    break
+                except Exception:
+                    fentry = None
+        if fentry is None:
+            return b""
+        size = int(getattr(getattr(fentry.info, "meta", None), "size", 0) or 0)
+        if size and start >= size:
+            return b""
+        n = min(want, size - start) if size else want
+        if n <= 0:
+            return b""
+        data = fentry.read_random(start, n)
+        return bytes(data or b"")
+
+    root = Path(vd.root_folder) if vd.root_folder else None
+    if root is not None and rel_path:
+        full = root / rel_path.replace("/", os.sep)
+        if full.is_file():
+            with full.open("rb") as handle:
+                handle.seek(start)
+                return handle.read(want)
+    return b""
+
+
 def read_full_file_from_disk(
     vd: VirtualDisk,
     rel_path: str,

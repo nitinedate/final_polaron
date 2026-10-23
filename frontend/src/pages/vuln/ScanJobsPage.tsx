@@ -20,14 +20,16 @@ import type {
 } from "../../lib/types/vuln";
 
 /** V1.8.0: launch-dialog policy groups (custom first, then built-ins by scanner). */
-const POLICY_GROUP_ORDER = ["custom", "nexpose", "nessus", "aetheris"];
+const POLICY_GROUP_ORDER = ["polaron", "custom", "nexpose", "nessus", "aetheris"];
 const POLICY_GROUP_LABEL: Record<string, string> = {
+  polaron: "Polaron (default)",
   custom: "Your policies",
   nexpose: "Nexpose / InsightVM equivalents (built-in)",
   nessus: "Nessus equivalents (built-in)",
   aetheris: "Threat checks (built-in)",
 };
-const DEFAULT_TEMPLATE_KEY = "nx_full_audit";
+// V1.10.2: the server marks the default template (is_default); this is only the fallback.
+const DEFAULT_TEMPLATE_KEY = "polaron";
 
 function policyGroup(p: ScanPolicy): string {
   if (!p.is_builtin) return "custom";
@@ -822,6 +824,11 @@ function scannerIsScanReady(scanner: Scanner | null | undefined): boolean {
   return !isEdgeAgentScanner(scanner) || scanner?.openvas_ready === true;
 }
 
+/** V1.10.2: a finished host on which nothing answered was not assessed. */
+function notAssessed(row: { status?: string; coverage?: { verdict?: string; host_responded?: boolean } | null }): boolean {
+  return row.status === "completed" && row.coverage?.verdict === "no_exposed_services" && row.coverage?.host_responded === false;
+}
+
 function targetStatusTone(status: string): "neutral" | "green" | "amber" | "red" | "indigo" {
   const s = (status || "").toLowerCase();
   if (s === "completed") return "green";
@@ -1009,7 +1016,10 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                 <p className="text-xs text-ink-500">
                   {targetRows.filter((t) => t.status === "scanning" || t.status === "running").length} scanning
                   {" · "}
-                  {targetRows.filter((t) => t.status === "completed").length} finished · {targetRows.filter((t) => t.status === "incomplete").length} incomplete
+                  {targetRows.filter((t) => t.status === "completed" && !notAssessed(t)).length} finished
+                  {targetRows.some(notAssessed) ? ` · ${targetRows.filter(notAssessed).length} no response (not assessed)` : ""}
+                  {" · "}
+                  {targetRows.filter((t) => t.status === "incomplete").length} incomplete
                   {" · "}
                   {targetRows.length} total
                 </p>
@@ -1038,7 +1048,11 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                         <tr key={row.ip} className="border-t border-ink-100">
                           <td className="px-4 py-2 font-mono text-ink-800">{row.ip}</td>
                           <td className="px-3 py-2">
+                            {notAssessed(row) ? (
+                              <Badge tone="amber">No response</Badge>
+                            ) : (
                             <Badge tone={targetStatusTone(row.status)}>{({ pending: "Waiting", scanning: "In progress", running: "In progress", completed: "Completed", failed: "Fail", incomplete: "Incomplete", skipped: "Skipped", cancelled: "Cancelled" } as Record<string, string>)[row.status] || row.status}</Badge>
+                            )}
                           </td>
                           <td className="px-3 py-2 text-right tabular-nums text-ink-700" title="Engine progress, not service coverage">{typeof row.progress_pct === "number" ? `${Math.round(Math.min(100, Math.max(0, row.progress_pct)))}%` : "—"}</td>
                           <td className="px-3 py-2 text-ink-600">
@@ -1427,10 +1441,13 @@ function LaunchModal({
       setPoliciesLoading(false);
       setForm((prev) => {
         if (prev.policy_id) return prev;
-        const preferred = res.rows.find((p) => p.is_builtin && p.template_key === DEFAULT_TEMPLATE_KEY);
+        const defaultKey = tpls.find((t) => t.is_default)?.key || DEFAULT_TEMPLATE_KEY;
+        const preferred =
+          res.rows.find((p) => p.is_builtin && p.is_default) ||
+          res.rows.find((p) => p.is_builtin && p.template_key === defaultKey);
         if (preferred) return { ...prev, policy_id: preferred.id };
-        if (!res.rows.length && tpls.some((t) => t.key === DEFAULT_TEMPLATE_KEY)) {
-          return { ...prev, policy_id: `tpl:${DEFAULT_TEMPLATE_KEY}` };
+        if (!res.rows.length && tpls.some((t) => t.key === defaultKey)) {
+          return { ...prev, policy_id: `tpl:${defaultKey}` };
         }
         return prev;
       });
@@ -1679,6 +1696,7 @@ function LaunchModal({
                 {rows.map((p) => (
                   <option key={p.id} value={p.id} disabled={Boolean(p.credentials_missing)}>
                     {p.name}
+                    {p.is_default ? " (default)" : ""}
                     {p.credentials_missing ? " (needs a credential)" : ""}
                   </option>
                 ))}
@@ -1699,6 +1717,9 @@ function LaunchModal({
               {selectedTemplate.description}
               {selectedTemplate.vendor === "nexpose" && selectedTemplate.nexpose_template
                 ? ` (Nexpose: ${selectedTemplate.nexpose_template})`
+                : ""}
+              {selectedTemplate.vendor === "polaron" && selectedTemplate.tcp_port_count_floor
+                ? ` Scope: ${selectedTemplate.tcp_port_count_floor} TCP / ${selectedTemplate.udp_port_count ?? 0} UDP ports.`
                 : ""}
             </p>
           ) : null}

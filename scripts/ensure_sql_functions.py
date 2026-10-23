@@ -101,26 +101,38 @@ def find_migration(name: str) -> Path | None:
 
 
 def main() -> None:
-    for name in MIGRATION_FILES:
-        path = find_migration(name)
-        if path is None:
-            print(f"skip missing migration: {name}")
-            continue
-        sql = path.read_text(encoding="utf-8")
-        # Never apply unreplaced firm DDL templates (would create a "{schema}" schema).
-        if "{schema}" in sql and "CREATE SCHEMA" in sql.upper():
-            print(f"skip template with placeholder: {name}")
-            continue
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("SET LOCAL statement_timeout = '15s'"))
-                conn.execute(text(sql))
-            print(f"applied {name}")
-        except Exception as exc:
-            # Idempotent helpers — one optional SQL file must not block API boot.
-            # A live extract can hold locks; skip and let uvicorn start.
-            print(f"warn: {name}: {exc}")
-    print("SQL migration helpers applied.")
+    # On a secondary Compose stack sharing one PostgreSQL, the stack that owns the
+    # DB has already applied these idempotent helpers. Re-running them here only
+    # blocks on the other stack's locks (minutes of statement/lock timeouts),
+    # delaying uvicorn past the api healthcheck. Skip and start promptly.
+    from app.services.firm_migrations import boot_migrations_disabled
+
+    skip_boot = boot_migrations_disabled()
+    if skip_boot:
+        print("skip SQL migration helpers: AETHERIS_SKIP_BOOT_MIGRATIONS set")
+    else:
+        # A doomed ALTER on a locked shared table should fail fast, not after 15s.
+        per_call_timeout = os.environ.get("AETHERIS_MIGRATION_STATEMENT_TIMEOUT", "15s")
+        for name in MIGRATION_FILES:
+            path = find_migration(name)
+            if path is None:
+                print(f"skip missing migration: {name}")
+                continue
+            sql = path.read_text(encoding="utf-8")
+            # Never apply unreplaced firm DDL templates (would create a "{schema}" schema).
+            if "{schema}" in sql and "CREATE SCHEMA" in sql.upper():
+                print(f"skip template with placeholder: {name}")
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"SET LOCAL statement_timeout = '{per_call_timeout}'"))
+                    conn.execute(text(sql))
+                print(f"applied {name}")
+            except Exception as exc:
+                # Idempotent helpers — one optional SQL file must not block API boot.
+                # A live extract can hold locks; skip and let uvicorn start.
+                print(f"warn: {name}: {exc}")
+        print("SQL migration helpers applied.")
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '15s'"))

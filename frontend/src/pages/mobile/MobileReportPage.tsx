@@ -6,7 +6,7 @@ import {
   ReportCaseExhibitProvider,
   ReportEvidencePages,
   ReportEvidenceTocContext,
-  ReportSectionPagesWithActions,
+  ReportDocumentFlow,
   reportPagePlan,
 } from "../../components/forensic/ReportDocumentPreview";
 import { forensicApi } from "../../lib/forensicApi";
@@ -40,25 +40,14 @@ function MobileReportSheets({
   sections: ReportSection[];
   onUpdated: (updated: ReportSection) => void;
 }) {
-  const { plan, evidencePageStart } = reportPagePlan(sections);
+  const { evidencePageStart } = reportPagePlan(sections);
   return (
     <ReportEvidenceTocContext.Provider value={{ page: evidencePageStart }}>
       <ReportCaseExhibitProvider jobId={jobId}>
       <div className="space-y-3">
-        {plan.map(({ section, pageStart }) => (
-          <Card key={section.id} className="p-5">
-            <h3 className="font-bold capitalize text-ink-900">{section.section_key.replace(/_/g, " ")}</h3>
-            <div className="mt-4 flex flex-col items-center rounded-xl bg-slate-100 p-4">
-              <ReportSectionPagesWithActions
-                section={section}
-                pageStart={pageStart}
-                jobId={jobId}
-                allSections={sections}
-                onUpdated={onUpdated}
-              />
-            </div>
-          </Card>
-        ))}
+        <div className="flex flex-col items-center rounded-xl bg-slate-100 p-4">
+          <ReportDocumentFlow sections={sections} jobId={jobId} onUpdated={onUpdated} />
+        </div>
         <Card className="p-5">
           <h3 className="font-bold text-ink-900">Evidences</h3>
           <p className="mt-1 text-sm text-ink-500">

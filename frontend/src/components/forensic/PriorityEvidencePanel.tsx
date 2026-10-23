@@ -48,12 +48,12 @@ export function PriorityEvidencePanel({ jobId }: { jobId: string }) {
     </div>
     <div className="mb-3 flex flex-wrap gap-2">{families.map(([key, label]) => <Button key={key}
       variant={family === key ? "brand" : "outline"} onClick={() => { setFamily(key); setPage(1); setPreview(null); }}>
-      {label}{key !== "suspicious" && priority ? ` (${(priority.families[key] || 0).toLocaleString()})` : ""}
+      {label}{key !== "suspicious" && priority ? ` (${(priority.families?.[key] || 0).toLocaleString()})` : ""}
     </Button>)}</div>
     {family === "suspicious" && <p className="mb-3 text-xs text-ink-600">{media?.note}</p>}
     {error && <p role="alert" className="mb-3 text-sm text-red-700">{error}</p>}
     {loading ? <Spinner /> : <>
-      {family === "suspicious" ? <div className="max-h-[520px] space-y-3 overflow-auto">{media?.items.map(item => {
+      {family === "suspicious" ? <div className="max-h-[520px] space-y-3 overflow-auto">{media?.items?.map(item => {
         const card = {...item,...item.data,job_id:jobId} as SuspiciousActivityCard;
         return <div key={card.id} className="rounded-lg border p-3 text-xs">
           <p className="font-semibold">{card.category.replace(/_/g," ")} · pending examiner review</p>
@@ -65,11 +65,11 @@ export function PriorityEvidencePanel({ jobId }: { jobId: string }) {
           {card.job_artifact_id && <Button variant="outline" onClick={() => void openSource(card.job_artifact_id!)}>Open original evidence</Button>}
         </div>;
       })}</div> : <div className="max-h-[520px] overflow-auto"><table className="w-full text-left text-xs"><thead><tr className="border-b"><th className="p-2">Record / time</th><th className="p-2">Content</th><th className="p-2">Source evidence</th></tr></thead><tbody>
-        {priority?.items.map((item) => <tr key={item.artifact_id} className="border-b align-top"><td className="p-2">{item.artifact_type}<br />{item.timestamp_utc || "Time unavailable"}<br /><strong>{item.state.replace(/_/g, " ")}</strong></td>
+        {priority?.items?.map((item) => <tr key={item.artifact_id} className="border-b align-top"><td className="p-2">{item.artifact_type}<br />{item.timestamp_utc || "Time unavailable"}<br /><strong>{String(item.state || "unknown").replace(/_/g, " ")}</strong></td>
           <td className="max-w-md p-2"><p className="whitespace-pre-wrap break-words">{String(item.data.body || item.data.url || item.data.title || item.data.name || item.data.note || "Source record")}</p>
             {item.data.reference_only === true && <p className="font-semibold text-amber-800">Reference only — this database entry does not establish recovery of the file content.</p>}
             <details><summary className="cursor-pointer">Full record and provenance</summary><pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all">{JSON.stringify({ data: item.data, forensic: item.forensic }, null, 2)}</pre></details>
-            {item.linked_media?.map((link) => <Button key={link.id} variant="outline" onClick={() => void openSource(link.id)}>{link.file_path.split("/").pop()} · {link.match_basis.replace(/_/g, " ")}</Button>)}</td>
+            {item.linked_media?.map((link) => <Button key={link.id} variant="outline" onClick={() => void openSource(link.id)}>{String(link.file_path || "Evidence").split("/").pop()} · {String(link.match_basis || "linked").replace(/_/g, " ")}</Button>)}</td>
           <td className="max-w-xs break-all p-2">{String(item.forensic.source_path || "")}<br /><span className="font-mono text-[10px]">{String(item.forensic.source_sha256 || "")}</span>
             {item.job_artifact_id && <Button variant="outline" onClick={() => void openSource(item.job_artifact_id!)}>Open source</Button>}</td></tr>)}</tbody></table></div>}
       {total === 0 && <p className="py-4 text-xs text-ink-600">No records captured in this category yet. For Android chats and browser history, check acquired private databases and matching backup keys. Deleted or overwritten bytes may be unavailable.</p>}

@@ -21,6 +21,14 @@ class IngestPathBody(BaseModel):
     browse_path: str = ""
     # When true, skip folder listing (client already called list-folder).
     skip_folder_list: bool = False
+    # standard | deep.  None = keep the profile already stored on the job (set by
+    # PUT /jobs/{id}/processing-profile when the examiner picks the mode); a
+    # default here used to overwrite a stored "deep" choice with "standard".
+    processing_profile: str | None = None
+
+
+class ProcessingProfileBody(BaseModel):
+    processing_profile: str  # standard | deep
 
 
 class ListFolderBody(BaseModel):

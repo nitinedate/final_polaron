@@ -30,7 +30,9 @@ def validate_candidates(raw, sources):
 def analyze_questions(db, job_id, title, *, schema_name, model=None, retrieval_cache=None):
     from app.retrieval.hybrid import hybrid_retrieve
     from app.services.model_router import generate_text
-    questions = questions_for_title(title)
+    # A handful of keyword lookups is enough. Scoring every related question
+    # with a second model call was a full minute on each objective.
+    questions = questions_for_title(title)[:4]
     if not questions:
         return {'questions':[], 'findings':[]}
     retrieval_cache = retrieval_cache if retrieval_cache is not None else {}
@@ -44,7 +46,7 @@ def analyze_questions(db, job_id, title, *, schema_name, model=None, retrieval_c
                 hits = retrieval_cache[cache_key]
             else:
                 hits = hybrid_retrieve(db, job_id, q['query'], top_k=2,
-                    schema_name=schema_name, skip_vector=False)
+                    schema_name=schema_name, skip_vector=True)
                 retrieval_cache[cache_key] = hits
         except Exception:
             db.rollback()
@@ -72,7 +74,22 @@ def analyze_questions(db, job_id, title, *, schema_name, model=None, retrieval_c
             state = 'not examined — candidate sources await examiner review'
         results.append({**q,'status':state,'source_ids':ids})
     findings = []
-    if model and sources:
+    if sources and not model:
+        for sid, source in sources.items():
+            content = str(source.get('content') or '').strip()
+            quote = content[:320]
+            if len(quote) < 12:
+                continue
+            findings.append({
+                'question_id': source['question_id'],
+                'source_id': sid,
+                'quote': quote,
+                'fields': {},
+                'file_path': source['file_path'],
+                'chunk_id': source['chunk_id'],
+                'status': 'candidate — examiner review required',
+            })
+    elif model and sources:
         prompt = ('Extract candidate evidence for these forensic questions. Return ONLY JSON '
             '{"findings":[{"source_id":"...","quote":"exact contiguous source excerpt",'
             '"fields":{"employer":"literal evidenced value","role":"literal value"}}]}. '

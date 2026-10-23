@@ -15,7 +15,7 @@ from app.db.sql_helpers import execute, fetchall, fetchone
 from app.db.tenant import get_tenant_context
 from app.deps import CurrentUser, firm_db, require_firm_permission, require_firm_permission_released
 from app.models.platform import Firm
-from app.schemas.forensic import IngestPathBody, JobCreate, ListFolderBody, ResolveFolderBody
+from app.schemas.forensic import IngestPathBody, JobCreate, ListFolderBody, ProcessingProfileBody, ResolveFolderBody
 from app.service_identity import (
     ANDROID_JOB_TYPES,
     FORENSIC,
@@ -2169,6 +2169,18 @@ def ingest_host_path(
     current: CurrentUser = Depends(require_firm_permission("job:run")),
 ):
     _ensure_job(db, job_id)
+    from app.services.processing_profile import (
+        PROFILE_LABELS,
+        normalize_requested_profile,
+        resolve_ingest_profile,
+        set_job_processing_profile,
+        stored_profile,
+    )
+
+    try:
+        normalize_requested_profile(body.processing_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     # A phone job is always registered as "mobile" even when the panel state
     # still says "disk" (page reload, missing router state): the empty
     # 03_Working_Copy folder must resolve to the 05_Exports payload shards.
@@ -2188,6 +2200,31 @@ def ingest_host_path(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail={"error": {"code": "register_failed", "message": str(e)}})
+
+    # Freeze the profile with this registered source before extraction starts.
+    # Never change an already extracted source's processing policy.
+    if source_type != "mobile" and result["accepted"]:
+        existing_profile = fetchone(db, "SELECT extracted_disk_uri FROM jobs WHERE id=:id", {"id": job_id})
+        current_profile = stored_profile(db, job_id)
+        profile = resolve_ingest_profile(body.processing_profile, current_profile)
+        if existing_profile and existing_profile.get("extracted_disk_uri"):
+            if current_profile and profile != current_profile:
+                raise HTTPException(status_code=409, detail="Cannot change examination mode after extraction has completed")
+        else:
+            set_job_processing_profile(db, job_id, profile)
+            try:
+                write_disk_log(
+                    db,
+                    job_id,
+                    f"Examination mode: {PROFILE_LABELS.get(profile, profile)} (processing_profile={profile}"
+                    + (", from examiner selection" if body.processing_profile else ", from stored job setting")
+                    + ")",
+                    stage="evidence_register",
+                    metadata={"processing_profile": profile, "requested": body.processing_profile},
+                )
+            except Exception:
+                pass
+        db.commit()
 
     processing_queued = False
     if body.auto_process and result["accepted"]:
@@ -2222,6 +2259,77 @@ def ingest_host_path(
         "accepted": result["accepted"],
         "skipped": result.get("skipped", []),
         "readiness": result.get("readiness"),
+    }
+
+
+@router.put("/jobs/{job_id}/processing-profile")
+def set_processing_profile(
+    job_id: str,
+    body: ProcessingProfileBody,
+    db: Session = Depends(firm_db),
+    current: CurrentUser = Depends(require_firm_permission("job:run")),
+):
+    """Store the examiner's Standard/Deep choice on the job as soon as it is made.
+
+    Every intake path (server drive, client upload, Download Agent, resume) then
+    uses the stored value; the profile is frozen once extraction has started.
+    """
+    _ensure_job(db, job_id)
+    from app.services.processing_profile import (
+        PROFILE_LABELS,
+        extraction_started,
+        normalize_requested_profile,
+        set_job_processing_profile,
+        stored_profile,
+    )
+
+    try:
+        profile = normalize_requested_profile(body.processing_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if not profile:
+        raise HTTPException(status_code=422, detail="processing_profile must be standard or deep")
+    if _job_source_type(db, job_id) == "mobile":
+        raise HTTPException(status_code=409, detail="Examination mode applies to disk images only")
+    current_profile = stored_profile(db, job_id)
+    if current_profile == profile:
+        return {"job_id": job_id, "processing_profile": profile, "changed": False, "locked": extraction_started(db, job_id)}
+    if extraction_started(db, job_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Extraction already started as {PROFILE_LABELS.get(current_profile or '', current_profile or 'legacy')}. "
+                "Create a new job (or re-extract) to examine this evidence in another mode."
+            ),
+        )
+    set_job_processing_profile(db, job_id, profile)
+    try:
+        write_disk_log(
+            db,
+            job_id,
+            f"Examination mode set to {PROFILE_LABELS.get(profile, profile)} by examiner",
+            stage="evidence_register",
+            metadata={"processing_profile": profile, "previous": current_profile},
+        )
+    except Exception:
+        pass
+    db.commit()
+    return {"job_id": job_id, "processing_profile": profile, "changed": True, "locked": False}
+
+
+@router.get("/jobs/{job_id}/processing-profile")
+def get_processing_profile(
+    job_id: str,
+    db: Session = Depends(firm_db),
+    current: CurrentUser = Depends(require_firm_permission("job:read")),
+):
+    _ensure_job(db, job_id)
+    from app.services.processing_profile import extraction_started, job_processing_profile
+
+    return {
+        "job_id": job_id,
+        "processing_profile": job_processing_profile(db, job_id),
+        "locked": extraction_started(db, job_id),
     }
 
 

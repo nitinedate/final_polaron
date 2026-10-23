@@ -14,6 +14,9 @@ interface ArtifactCategoryTreeProps {
   onSelect: (category: string | null, subCategory: string | null) => void;
   total?: number;
   jobId?: string;
+  taxonomy?: Array<{key: string; title: string; count?: number; items: Array<{key: string; title: string; count?: number}>}>;
+  catalogSelected?: { catalogKey: string | null; catalogSection: string | null };
+  onCatalogSelect?: (catalogKey: string | null, catalogSection: string | null) => void;
 }
 
 function buildScopeLookup(sections: ArtifactCatalogSection[]) {
@@ -72,6 +75,9 @@ export function ArtifactCategoryTree({
   onSelect,
   total,
   jobId,
+  taxonomy = [],
+  catalogSelected,
+  onCatalogSelect,
 }: ArtifactCategoryTreeProps) {
   const toast = useToast();
   const [scopeSections, setScopeSections] = useState<ArtifactCatalogSection[]>([]);
@@ -79,6 +85,7 @@ export function ArtifactCategoryTree({
   const [scopeLoading, setScopeLoading] = useState(Boolean(jobId));
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [taxonomyOpen, setTaxonomyOpen] = useState<Set<string>>(new Set(["connected_devices"]));
 
   const grouped = useMemo(
     () =>
@@ -258,9 +265,39 @@ export function ArtifactCategoryTree({
       )}
 
       <nav className="flex-1 overflow-y-auto p-2">
+        {taxonomy.length > 0 && (
+          <section aria-label="Forensic artifact taxonomy" className="mb-3 border-b border-ink-100 pb-3">
+            <p className="px-2 py-2 text-xs font-bold text-ink-600">Forensic artifact categories</p>
+            <p className="px-2 pb-2 text-[10px] text-ink-400">Report-aligned headings. Counts are shown only when backed by parsed artifact records.</p>
+            {taxonomy.map((section) => (
+              <div key={section.key}>
+                <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-2 text-left text-xs font-semibold hover:bg-ink-50"
+                  aria-expanded={taxonomyOpen.has(section.key)}
+                  onClick={() => { onCatalogSelect?.(null, section.title); setTaxonomyOpen((old) => {
+                    const next = new Set(old);
+                    if (next.has(section.key)) next.delete(section.key); else next.add(section.key);
+                    return next;
+                  }); }}>
+                  {taxonomyOpen.has(section.key) ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                  <span className="flex-1">{section.title}</span>
+                  <span className="text-ink-400 tabular-nums">{Number(section.count ?? section.items.reduce((sum, item) => sum + (Number(item.count) || 0), 0)).toLocaleString()}</span>
+                </button>
+                {taxonomyOpen.has(section.key) && /web/i.test(section.title) && (
+                  <button type="button" onClick={() => onCatalogSelect?.("visited-urls", null)} className={clsx("flex w-full gap-2 pl-8 pr-2 py-1.5 text-left text-xs hover:bg-ink-50", catalogSelected?.catalogKey === "visited-urls" ? "bg-brand-50 text-brand-700" : "text-ink-600")}>
+                    <span className="min-w-0 flex-1">Visited URLs</span>
+                  </button>
+                )}
+                {taxonomyOpen.has(section.key) && section.items.map((item) => (
+                  <button key={item.key} type="button" onClick={() => onCatalogSelect?.(item.key, null)} className={clsx("flex w-full gap-2 pl-8 pr-2 py-1.5 text-left text-xs hover:bg-ink-50", catalogSelected?.catalogKey === item.key ? "bg-brand-50 text-brand-700" : "text-ink-600")}><span className="min-w-0 flex-1">{item.title}</span><span className="tabular-nums text-ink-400">{Number(item.count ?? 0).toLocaleString()}</span></button>
+                ))}
+              </div>
+            ))}
+          </section>
+        )}
+        <p className="px-2 py-2 text-xs font-bold text-ink-600">Evidence files by type</p>
         <button
           type="button"
-          onClick={() => onSelect(null, null)}
+          onClick={() => { onCatalogSelect?.(null, null); onSelect(null, null); }}
           className={clsx(
             "mb-1 flex w-full items-center rounded-lg px-3 py-2 text-left text-sm font-medium transition",
             allSelected ? "bg-brand-50 text-brand-700 ring-1 ring-brand-200" : "text-ink-600 hover:bg-ink-50"

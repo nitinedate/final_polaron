@@ -4,7 +4,7 @@
  */
 
 /** Wrapped text lines that fit below the section title and above the footer. */
-export const NARRATIVE_PAGE_LINES = 26;
+export const NARRATIVE_PAGE_LINES = 34;
 export const NARRATIVE_CHARS_PER_LINE = 88;
 /**
  * Section C page budget — lockstep with Report Formation Agent
@@ -23,7 +23,7 @@ export const OPO_MIN_SPLIT_ROOM_UNITS = 6;
  * Each catalog item is the previous panel block: name + count + wrapped description.
  * Units are ~one text line. Leave slack so overflow:hidden never clips Report Agent text.
  */
-export const ARTIFACT_PAGE_UNITS = 28;
+export const ARTIFACT_PAGE_UNITS = 36;
 export const ARTIFACT_GROUP_HEADER_UNITS = 2;
 /** Fallback when a description is missing: name, count, one description line. */
 export const ARTIFACT_ITEM_UNITS = 4;
@@ -41,19 +41,22 @@ export const TABLE_TOTAL_CHARS_PER_LINE = 88;
  * v2.4. Overflow:hidden clips anything that enters the footer/page-number band.
  * Missing serials (7 then 9) are worse than leftover white space.
  */
-export const TABLE_PAGE_UNITS = 26;
-export const TABLE_PACK_SLACK_UNITS = 2;
+export const TABLE_PAGE_UNITS = 42;
+export const TABLE_PACK_SLACK_UNITS = 3;
 export const TABLE_GAP_UNITS = 2;
 export const TABLE_MIN_SPLIT_ROOM_UNITS = 8;
 /** Visible wrap width of a URL cell on a 5-column A4 table (~35mm). */
 export const TABLE_URL_CHARS_PER_LINE = 18;
-/** Hard cap so a wrapping URL table never walks into the letterhead footer. */
-export const TABLE_MAX_URL_ROWS_FIRST = 5;
-export const TABLE_MAX_URL_ROWS_CONTINUED = 6;
+/**
+ * Safety ceiling for URL tables. The page budget decides how many one-line
+ * rows fit; this only stops a bad height estimate from running into the footer.
+ */
+export const TABLE_MAX_URL_ROWS_FIRST = 18;
+export const TABLE_MAX_URL_ROWS_CONTINUED = 18;
 /** 4-column Objective/Procedure/Observation rows are tall; two is the safe page max. */
 export const TABLE_MAX_PROSE_ROWS = 2;
 export const TABLE_PROSE_CELL_CHARS = 120;
-export const TABLE_MAX_ROW_UNITS = 16;
+export const TABLE_MAX_ROW_UNITS = 48;
 
 export function artifactItemUnits(description = "", name = ""): number {
   const nameLines = Math.max(1, Math.ceil(String(name || "Artifact").trim().length / ARTIFACT_DESC_CHARS_PER_LINE));
@@ -115,7 +118,11 @@ export function takeFittingPrefix(text: string, maxVisual: number): { fit: strin
   const rest = sentences.slice(restStart).join(" ").trim();
   if (!fit && maxVisual >= 1) {
     const room = Math.max(NARRATIVE_CHARS_PER_LINE, maxVisual * NARRATIVE_CHARS_PER_LINE);
-    return { fit: text.slice(0, room).trim(), rest: text.slice(room).trim() };
+    if (text.length <= room) return { fit: text, rest: "" };
+    const window = text.slice(0, room);
+    const cut = window.lastIndexOf(" ");
+    const at = cut >= 24 ? cut : room;
+    return { fit: text.slice(0, at).trim(), rest: text.slice(at).trim() };
   }
   return { fit, rest };
 }
@@ -237,6 +244,27 @@ function isUrlLikeCell(value: string): boolean {
   return /^(?:https?:\/\/|blob:|www\.)/i.test(value.trim());
 }
 
+/** Characters that fit in the URL column once narrow columns take their share. */
+function urlColumnChars(columnCount: number): number {
+  if (columnCount <= 3) return 72;
+  if (columnCount <= 5) return 64;
+  if (columnCount <= 7) return 48;
+  return 28;
+}
+
+/** Characters that fit in one rendered column. Tall procedure cells must not be counted as a short row. */
+function columnWrapChars(header: string, columnCount: number): number {
+  const h = header.trim().toLowerCase();
+  if (/^sr\b|^no\.?$/.test(h) || h.includes("sr no") || h.includes("sr. no")) return 8;
+  if (h.includes("procedure")) return 80;
+  if (h.includes("observation") || h.includes("description")) return 40;
+  if (h.includes("objective")) return 20;
+  if (h.includes("url")) return urlColumnChars(columnCount);
+  if (/path|host|server|profile|user|source|device|serial|file|vendor/.test(h)) return 26;
+  if (h.includes("date") || h.includes("time")) return 18;
+  return Math.max(14, Math.floor(72 / Math.max(1, columnCount)));
+}
+
 function rowHasUrlCell(row: string[]): boolean {
   return row.some((cell) => isUrlLikeCell(String(cell ?? "")));
 }
@@ -265,21 +293,48 @@ export function maxManageableTableRows(
  * that height packs rows 7-8 under the footer; overflow:hidden then hides them
  * while the next page starts at 9.
  */
+function softWrapLines(value: string, width: number): number {
+  const room = Math.max(1, width);
+  const tokens = value.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return 1;
+  let lines = 1;
+  let column = 0;
+  for (const token of tokens) {
+    const pieces = token.match(/[^\\/]+[\\/]?|[\\/]+/g) ?? [token];
+    for (const piece of pieces) {
+      if (column && column + piece.length > room) {
+        lines += 1;
+        column = 0;
+      }
+      column += piece.length;
+    }
+    if (column && column + 1 <= room) column += 1;
+  }
+  return lines;
+}
+
 export function tableRowUnits(row: string[], columns: string[] = []): number {
   const columnCount = Math.max(1, columns.length || row.length || 1);
-  const charsPerColumn = Math.max(14, Math.floor(TABLE_TOTAL_CHARS_PER_LINE / columnCount));
   let wrappedLines = 1;
   const cells = row.length ? row : [""];
-  cells.forEach((raw) => {
+  cells.forEach((raw, index) => {
     const value = String(raw ?? "").replace(/\s+/g, " ").trim();
-    const width = isUrlLikeCell(value)
-      ? Math.min(TABLE_URL_CHARS_PER_LINE, charsPerColumn)
-      : charsPerColumn;
-    const lineCount = Math.max(1, Math.ceil(Math.max(1, value.length) / width));
+    const url = isUrlLikeCell(value);
+    const width = url
+      ? urlColumnChars(columnCount)
+      : columnWrapChars(columns[index] ?? "", columnCount);
+    const lineCount = url
+      ? Math.max(1, Math.ceil(Math.max(1, value.length) / width))
+      : softWrapLines(value || " ", width);
     wrappedLines = Math.max(wrappedLines, lineCount);
   });
-  const padding = wrappedLines >= 2 ? 1 : 0;
-  return Math.max(1, Math.min(TABLE_MAX_ROW_UNITS, wrappedLines + padding));
+  const hasUrl = cells.some((raw) => isUrlLikeCell(String(raw ?? "")));
+  const hasWrappedPath = cells.some((raw) => /\\/.test(String(raw ?? "")));
+  // A second visual line needs its own height. Counting it as a one-line row
+  // packs the last USB/path rows into the footer.
+  const padding = wrappedLines >= 12 ? 2 : wrappedLines >= 2 || hasUrl ? 1 : 0;
+  const units = Math.max(2, Math.min(TABLE_MAX_ROW_UNITS, wrappedLines + padding));
+  return hasWrappedPath ? Math.max(3, units) : units;
 }
 
 export function tableChunkChromeUnits(

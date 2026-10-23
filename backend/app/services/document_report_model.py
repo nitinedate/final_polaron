@@ -71,6 +71,18 @@ def trained_objective(title: str, statement: str = "") -> dict[str, Any] | None:
     return best[1]
 
 
+def trained_procedure_text(title: str, statement: str = "") -> str:
+    """Examiner procedure learned from the physical reports.
+
+    Generic retrieval instructions are not printed. Case facts stay out of this
+    sentence; the observation still comes from the current case only.
+    """
+    method = str((document_model_for_agent(title, statement).get("examination_method") or "")).strip()
+    if not method or method.lower().startswith("search extracted content"):
+        return ""
+    return method if method.endswith((".", "!", "?")) else method + "."
+
+
 def extraction_queries_for_objective(title: str, statement: str = "") -> list[str]:
     row = trained_objective(title, statement)
     if not row:

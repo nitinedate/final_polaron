@@ -410,21 +410,32 @@ tr[class*="bg-brand-100"] th {
 .report-a4-content {
   position: absolute;
   top: var(--a4-header);
-  bottom: calc(var(--a4-footer) + var(--a4-pagenum));
+  bottom: calc(var(--a4-footer) + var(--a4-pagenum) + 3mm);
   left: 0;
   right: 0;
   box-sizing: border-box;
   overflow: hidden;
   z-index: 1;
   padding: 8mm 16mm 2mm;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 /* Reference forensic reports place INTRODUCTION roughly one normal text line below
    the letterhead rather than leaving a large dashboard-style gap. */
 .report-a4-content--introduction {
   padding-top: 5mm;
+}
+
+.report-a4-content table {
+  table-layout: auto;
+}
+
+.report-a4-content th,
+.report-a4-content td {
+  word-break: normal;
+  overflow-wrap: break-word;
+  hyphens: manual;
 }
 
 .report-a4-content--cover {
@@ -524,7 +535,7 @@ tr[class*="bg-brand-100"] th {
   }
   .report-a4-content {
     top: 44mm !important;
-    bottom: 36mm !important; /* 26mm footer + 10mm page-number band */
+    bottom: 39mm !important; /* 26mm footer + 10mm page number + 3mm clearance */
     padding-top: 8mm !important;
   }
   .report-a4-content--introduction {

@@ -191,12 +191,12 @@ def job_review_summary(db: Session, job_id: str, *, limit: int = 120) -> dict[st
           OR lower(coalesce(file_path, '')) LIKE '%discord%'
           OR lower(coalesce(file_path, '')) LIKE '%tiktok%'
           OR lower(coalesce(file_name, '')) ~ '\\.[a-z0-9]{1,8}\\.(exe|scr|bat|cmd|ps1|vbs|js|hta|msi|com)$'
-          OR coalesce(metadata::text, '') ILIKE '%"is_deleted": true%'
-          OR coalesce(metadata::text, '') ILIKE '%"extension_mismatch": true%'
-          OR coalesce(metadata::text, '') ILIKE '%"double_extension": true%'
-          OR metadata->>'suspicious_activity'='true'
-          OR coalesce(metadata::text, '') ILIKE '%"is_modified": true%'
-          OR coalesce(metadata::text, '') ~* '(powershell|pwsh|cmd\\.exe|mshta|rundll32|regsvr32|wscript|cscript|certutil|bitsadmin)'
+          OR metadata->>'is_deleted' IN ('true','1','t')
+          OR metadata->>'extension_mismatch' IN ('true','1','t')
+          OR metadata->>'double_extension' IN ('true','1','t')
+          OR metadata->>'suspicious_activity' = 'true'
+          OR metadata->>'is_modified' IN ('true','1','t')
+          OR lower(coalesce(file_path, '') || ' ' || coalesce(file_name, '')) ~ '(powershell|pwsh|cmd\\.exe|mshta|rundll32|regsvr32|wscript|cscript|certutil|bitsadmin)'
         )
     """
     total_row = fetchone(

@@ -49,3 +49,5 @@ whatsapp-chat-exporter[android_backup]==0.13.0
 # an examiner-authorized fallback after Polaron native CRYPT handling.
 wa-crypt-tools==0.1.0
 pytest==8.3.4
+
+fonttools>=4.53,<5

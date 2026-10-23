@@ -9,7 +9,8 @@ $files = @(
     "004_firm_rbac_seed_function.sql",
     "005_restrict_firm_user_role.sql",
     "036_ensure_platform_admin.sql",
-    "037_search_performance_indexes.sql"
+    "037_search_performance_indexes.sql",
+    "045_artifact_open_performance.sql"
 )
 
 foreach ($f in $files) {

@@ -10,6 +10,23 @@ from sqlalchemy.orm import Session
 from app.db.sql_helpers import fetchall, fetchone
 from app.services.catalog_categories import canonical_category
 
+# Indexable EML(X) browse predicate. The handbook OR of path ILIKE clauses
+# cannot use ix_job_artifacts_job_ext_id and was timing out the artifact list.
+_EML_BROWSE_WHERE = """
+(
+  lower(coalesce(extension,'')) IN ('.eml', '.emlx')
+  OR lower(coalesce(file_name,'')) LIKE '%.eml'
+  OR lower(coalesce(file_name,'')) LIKE '%.emlx'
+  OR lower(coalesce(metadata->>'detected_extension','')) IN ('.eml', '.emlx')
+  OR lower(coalesce(metadata->>'normalized_filename','')) LIKE '%.eml'
+  OR lower(coalesce(metadata->>'normalized_filename','')) LIKE '%.emlx'
+  OR lower(coalesce(metadata->>'content_type','')) = 'message/rfc822'
+  OR lower(coalesce(metadata->>'resolved_content_type','')) = 'message/rfc822'
+  OR coalesce(metadata->>'email_mime_validated','false') IN ('true','1','t')
+)
+AND coalesce(metadata->>'derived_from_mailbox','false') NOT IN ('true','1','t')
+"""
+
 
 def list_where_for_email_attachments(*, job_id: str) -> tuple[str, dict[str, Any]]:
     from app.services.email_inventory import email_attachment_files_where
@@ -28,7 +45,6 @@ def list_where_for_artifact_name(
     """Build a WHERE suffix (AND …) plus params for one catalog artifact."""
     from app.services.catalog_aligned_counts import _norm_axiom_name, document_extensions_for
     from app.services.axiom_section_queries import (
-        EMLX_FILE_WHERE,
         JUMP_LIST_WHERE,
         LNK_FILE_WHERE,
         LOGFILE_ANALYSIS_WHERE,
@@ -78,19 +94,9 @@ def list_where_for_artifact_name(
         return email_attachment_files_where(base_params={"jid": job_id})
 
     if name in {"eml(x) files", "eml files"}:
-        # Self-heal historical jobs before applying the list predicate.  The MIME
-        # scan promotes byte-validated extensionless messages into message/rfc822
-        # metadata, so a stored non-zero catalog count cannot open to an empty pane.
-        try:
-            from app.services.email_mime_inventory import scan_job_email_mime_inventory
-
-            scan_job_email_mime_inventory(db, job_id)
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        return f" AND ({EMLX_FILE_WHERE.strip()})", params
+        # Browse must not re-parse every message. The MIME scan reads archives and
+        # blocks the only API worker for minutes. Counts were already stored.
+        return f" AND ({_EML_BROWSE_WHERE})", params
 
     if name == "windows mail":
         return f" AND ({WINDOWS_MAIL_WHERE.strip()})", params

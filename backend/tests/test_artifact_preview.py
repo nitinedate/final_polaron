@@ -53,7 +53,7 @@ def test_build_preview_returns_url_encoding_for_pdf(monkeypatch) -> None:
     monkeypatch.setattr(artifact_preview, "resolve_artifact_bytes", lambda *args, **kwargs: b"%PDF-1.4")
 
     preview = artifact_preview.build_artifact_preview(_FakeDb(), "job", "a1")
-    assert preview["encoding"] == "url"
+    assert preview["encoding"] is None
     assert preview["content_type"] == "application/pdf"
 
 
@@ -73,7 +73,7 @@ def test_build_preview_docx_keeps_office_mime_not_hex(monkeypatch) -> None:
     monkeypatch.setattr(artifact_preview, "resolve_artifact_bytes", lambda *args, **kwargs: data)
 
     preview = artifact_preview.build_artifact_preview(_FakeDb(), "job", "a1")
-    assert preview["encoding"] == "url"
+    assert preview["encoding"] is None
     assert "officedocument" in preview["content_type"] or "wordprocessing" in preview["content_type"]
     assert preview["content_type"] != "text/plain"
     assert "Hex" not in (preview.get("body") or "")
@@ -134,7 +134,7 @@ def test_build_preview_docx_shows_extracted_text(monkeypatch) -> None:
         "file_path": "Mail/Attachments/invoice.docx",
         "file_name": "invoice.docx",
         "extension": ".docx",
-        "minio_uri": None,
+        "minio_uri": "s3://bucket/invoice.docx",
         "metadata": {},
     }
     monkeypatch.setattr(artifact_preview, "_load_artifact_row", lambda db, jid, aid: row)

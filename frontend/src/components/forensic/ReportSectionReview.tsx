@@ -10,6 +10,8 @@ import type { ReportSection } from "../../lib/types/forensic";
 interface ReportSectionReviewProps {
   jobId: string;
   section: ReportSection;
+  /** Other sections that end on this same page. One button row updates all of them. */
+  sections?: ReportSection[];
   onUpdated: (section: ReportSection) => void;
   editing: boolean;
   setEditing: (value: boolean) => void;
@@ -35,6 +37,7 @@ function existingBaseline(section: ReportSection): string {
 export function ReportSectionReview({
   jobId,
   section,
+  sections,
   onUpdated,
   editing,
   setEditing,
@@ -44,14 +47,17 @@ export function ReportSectionReview({
   const [showFeedback, setShowFeedback] = useState(false);
   const [feedback, setFeedback] = useState("");
   const preEditNarrative = useRef(section.narrative_content ?? "");
+  const targets = sections && sections.length > 0 ? sections : [section];
 
   async function setStatus(status: string) {
     setBusy(true);
     try {
-      const updated = await forensicApi.patchReportSection(jobId, section.section_key, {
-        verification_status: status,
-      });
-      onUpdated(updated);
+      for (const item of targets) {
+        const updated = await forensicApi.patchReportSection(jobId, item.section_key, {
+          verification_status: status,
+        });
+        onUpdated(updated);
+      }
       toast.success(`Section ${status}`);
     } catch (e: unknown) {
       toast.error(e instanceof Error ? e.message : "Update failed");
@@ -61,35 +67,42 @@ export function ReportSectionReview({
   }
 
   async function saveEdit() {
-    const roots = editorsForSection(section.section_key);
-    const draft = roots.map((el) => serializeEditableBody(el)).filter(Boolean).join("\n\n").trim();
-    if (!draft) {
+    const drafts = targets
+      .map((item) => {
+        const roots = editorsForSection(item.section_key);
+        const draft = roots.map((el) => serializeEditableBody(el)).filter(Boolean).join("\n\n").trim();
+        return { item, draft };
+      })
+      .filter((entry) => entry.draft);
+    if (!drafts.length) {
       toast.error("The page is empty — add text before saving");
       return;
     }
     setBusy(true);
     try {
-      const sourceCards = section.section_key === "suspicious_activity" && Boolean((section.structured_json?.suspicious_activity as unknown[])?.length);
-      const baseline = existingBaseline(section) || (sourceCards ? String(section.structured_json?.examiner_observations_md || "### Examiner observations\n\nNo examiner observations recorded.") : preEditNarrative.current);
-      const parsedTables = mergeContinuedTables(parseMarkdownTables(draft));
-      const structured: Record<string, unknown> = {
-        ...(section.structured_json ?? {}),
-        human_edit_baseline: baseline,
-      };
-      if (sourceCards) structured.examiner_observations_md = draft;
-      if (parsedTables.length > 0) {
-        structured.tables = parsedTables;
+      for (const { item, draft } of drafts) {
+        const sourceCards = item.section_key === "suspicious_activity" && Boolean((item.structured_json?.suspicious_activity as unknown[])?.length);
+        const baseline = existingBaseline(item) || (sourceCards ? String(item.structured_json?.examiner_observations_md || "### Examiner observations\n\nNo examiner observations recorded.") : preEditNarrative.current);
+        const parsedTables = mergeContinuedTables(parseMarkdownTables(draft));
+        const structured: Record<string, unknown> = {
+          ...(item.structured_json ?? {}),
+          human_edit_baseline: baseline,
+        };
+        if (sourceCards) structured.examiner_observations_md = draft;
+        if (parsedTables.length > 0) {
+          structured.tables = parsedTables;
+        }
+        const updated = await forensicApi.patchReportSection(jobId, item.section_key, {
+          narrative_content: draft,
+          structured_json: structured,
+          verification_status: "approved",
+        });
+        onUpdated({
+          ...updated,
+          narrative_content: updated.narrative_content ?? draft,
+          structured_json: updated.structured_json ?? structured,
+        });
       }
-      const updated = await forensicApi.patchReportSection(jobId, section.section_key, {
-        narrative_content: draft,
-        structured_json: structured,
-        verification_status: "approved",
-      });
-      onUpdated({
-        ...updated,
-        narrative_content: updated.narrative_content ?? draft,
-        structured_json: updated.structured_json ?? structured,
-      });
       setEditing(false);
       toast.success("Saved to the report draft");
     } catch (e: unknown) {
@@ -106,15 +119,19 @@ export function ReportSectionReview({
     }
     setBusy(true);
     try {
-      await forensicApi.submitFeedback(jobId, {
-        section_key: section.section_key,
-        feedback_type: "change_request",
-        content: feedback.trim(),
-      });
-      const updated = await forensicApi.patchReportSection(jobId, section.section_key, {
-        verification_status: "needs_review",
-      });
-      onUpdated(updated);
+      for (const item of targets) {
+        await forensicApi.submitFeedback(jobId, {
+          section_key: item.section_key,
+          feedback_type: "change_request",
+          content: feedback.trim(),
+        });
+      }
+      for (const item of targets) {
+        const updated = await forensicApi.patchReportSection(jobId, item.section_key, {
+          verification_status: "needs_review",
+        });
+        onUpdated(updated);
+      }
       setShowFeedback(false);
       setFeedback("");
       toast.success("Change request recorded");

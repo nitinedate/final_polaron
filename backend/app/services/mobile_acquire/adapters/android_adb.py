@@ -322,7 +322,13 @@ class AndroidAdbAdapter:
         destination: Path,
         progress: ProgressFn | None = None,
         cancel: Callable[[], bool] | None = None,
+        authorized_actions: list[str] | None = None,
+        whatsapp_64_digit_key: str = "",
+        intake_key_candidates: list[str] | None = None,
     ) -> AcquisitionOutcome:
+        self._authorized_actions = tuple(authorized_actions or ())
+        self._whatsapp_64_digit_key = whatsapp_64_digit_key or ""
+        self._intake_key_candidates = tuple(intake_key_candidates or ())
         device_id = profile.serial
         outcome = AcquisitionOutcome(ok=True, adapter=self.name, method=method)
         destination.mkdir(parents=True, exist_ok=True)
@@ -389,6 +395,13 @@ class AndroidAdbAdapter:
             if private.get("interrupted"):
                 outcome.interrupted = True
                 return outcome
+            # WhatsApp private key + live DB via EXISTING root (read-only). This
+            # never escalates; when the device is not rooted it records a precise
+            # gap. The key is staged where the decryption ladder looks.
+            try:
+                self._capture_whatsapp_key(device_id, destination, outcome)
+            except Exception as exc:
+                outcome.warnings.append(f"WhatsApp key capture error: {exc}")
             self._pull_targets(device_id, SHARED_STORAGE_TARGETS,
                                destination / "shared_storage", outcome, progress, cancel)
             self._pull_targets(device_id, PRIVILEGED_TARGETS,
@@ -400,10 +413,97 @@ class AndroidAdbAdapter:
             outcome.errors.append(f"Method {method.value} is not implemented by this adapter.")
             return outcome
 
+        # WhatsApp decrypt agent — pulls the public WhatsApp tree + key, decrypts
+        # existing (or, when authorized, freshly created) backups into msgstore.db.
+        # Read-only unless the examiner authorized on-device backup creation.
+        try:
+            self._run_whatsapp_decrypt_agent(device_id, destination, outcome, cancel)
+        except Exception as exc:  # never abort a completed acquisition on the agent
+            outcome.warnings.append(f"WhatsApp decrypt agent error: {exc}")
+
         outcome.device_metadata = profile.as_dict()
         if outcome.errors:
             outcome.ok = False
         return outcome
+
+    def _capture_whatsapp_key(self, device_id, destination: Path, outcome) -> None:
+        """Capture WhatsApp files/key (+ live msgstore.db) via existing root, read-only.
+
+        Logs every command and file to the acquisition outcome and a JSON log, and
+        stages the key so the WhatsApp decrypt agent (run next) can use it. Does NOT
+        gain root — on an unrooted device it records an actionable coverage gap.
+        """
+        from app.services.mobile_acquire.whatsapp_key_capture import (
+            capture_whatsapp_key,
+            write_capture_log,
+        )
+
+        result = capture_whatsapp_key(adb=self.adb, serial=device_id or "", out_dir=destination)
+        try:
+            write_capture_log(result, destination)
+        except Exception:
+            pass
+        for rec in result.staged_paths:
+            p = Path(rec)
+            if p.is_file():
+                outcome.files_written.append(str(p))
+                try:
+                    outcome.bytes_written += p.stat().st_size
+                except OSError:
+                    pass
+        outcome.coverage_gaps.extend(result.limitations)
+        outcome.errors.extend(result.errors)
+        keys = len(result.key_files)
+        dbs = len(result.live_db_files)
+        detail = (
+            f"WhatsApp key capture via {result.root_mode or 'no-root'}: "
+            f"{keys} key file(s), {dbs} live DB(s)."
+            if result.root_available
+            else "WhatsApp key capture: device not rooted; key not collected (no escalation attempted)."
+        )
+        (outcome.coverage_gaps if (keys or dbs) else outcome.warnings).append(detail)
+        self._wa_key_capture = result
+
+    def _run_whatsapp_decrypt_agent(self, device_id, destination: Path, outcome, cancel) -> None:
+        from app.services.mobile_acquire.whatsapp_decrypt_agent import (
+            DecryptAgentRequest,
+            WhatsAppDecryptAgent,
+        )
+
+        agent_dir = destination / "whatsapp_decrypt_agent"
+        req = DecryptAgentRequest(
+            adb=self.adb,
+            serial=device_id or "",
+            out_dir=agent_dir,
+            authorized_actions=tuple(getattr(self, "_authorized_actions", ())),
+            supplied_64_digit_key=getattr(self, "_whatsapp_64_digit_key", ""),
+            intake_key_candidates=tuple(getattr(self, "_intake_key_candidates", ())),
+            cancel=cancel,
+        )
+        agent = WhatsAppDecryptAgent()
+        result = agent.run(req)
+        try:
+            agent.write_manifest(req, result)
+        except Exception:
+            pass
+        # Register produced files on the acquisition outcome.
+        for path in agent_dir.rglob("*"):
+            if path.is_file():
+                outcome.files_written.append(str(path))
+                try:
+                    outcome.bytes_written += path.stat().st_size
+                except OSError:
+                    pass
+        outcome.coverage_gaps.extend(result.limitations)
+        outcome.errors.extend(result.errors)
+        decrypted = len(result.decrypted_databases)
+        detail = (
+            f"WhatsApp decrypt agent: {decrypted} database(s) decrypted"
+            + (" (device modified: new backup created)" if result.device_modified else " (read-only)")
+            + "."
+        )
+        outcome.warnings.append(detail) if not decrypted else outcome.coverage_gaps.append(detail)
+        self._wa_agent_result = result
 
     def _resolve_userdata_partition(self, device_id: str | None) -> str | None:
         """Locate a userdata block device via /dev/block/by-name (rooted)."""

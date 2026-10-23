@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -175,22 +176,20 @@ def _persist_email_mime_classification(
     return {"persisted": True, "attachments": len(attachments)}
 
 
-def _scan_one_message(
+def _scan_message_bytes(
     db,
     job_id: str,
     row: dict[str, Any],
+    data: bytes | None,
     *,
     extensionless_candidate: bool,
 ) -> tuple[dict[str, Any] | None, bool]:
     path = str(row.get("file_path") or row.get("file_name") or "")
-    # Extensionless population can be very large.  A 64 KiB RFC header gate avoids
-    # fully reading unrelated browser/cache binaries.
+    # A 64 KiB RFC header gate keeps unrelated browser/cache binaries out.
     if extensionless_candidate:
-        head = _read_artifact_bytes(db, job_id, row, max_bytes=_EMAIL_HEAD_BYTES)
+        head = (data or b"")[:_EMAIL_HEAD_BYTES]
         if not head or not is_extensionless_email_candidate(head):
             return None, False
-
-    data = _read_artifact_bytes(db, job_id, row, max_bytes=_EMAIL_MAX_BYTES)
     if not data:
         return None, True
     info = analyze_mime_message(data, path)
@@ -200,6 +199,59 @@ def _scan_one_message(
     info = dict(info)
     info["persisted"] = bool(persisted.get("persisted"))
     return info, False
+
+
+def _scan_one_message(
+    db,
+    job_id: str,
+    row: dict[str, Any],
+    *,
+    extensionless_candidate: bool,
+) -> tuple[dict[str, Any] | None, bool]:
+    if extensionless_candidate:
+        head = _read_artifact_bytes(db, job_id, row, max_bytes=_EMAIL_HEAD_BYTES)
+        if not head or not is_extensionless_email_candidate(head):
+            return None, False
+    data = _read_artifact_bytes(db, job_id, row, max_bytes=_EMAIL_MAX_BYTES)
+    return _scan_message_bytes(db, job_id, row, data, extensionless_candidate=False)
+
+
+def _iter_message_bytes(db, job_id: str, rows: list[dict[str, Any]]):
+    """One streamed pass per tar shard for all rows; single-file reader only as fallback."""
+    from app.services.artifact_live_counts import iter_job_file_contents
+
+    for row, data, resolved in iter_job_file_contents(db, job_id, rows, max_bytes=_EMAIL_MAX_BYTES):
+        if not resolved:
+            data = _read_artifact_bytes(db, job_id, row, max_bytes=_EMAIL_MAX_BYTES)
+        yield row, data
+
+
+_SCAN_LOCKS_GUARD = threading.Lock()
+_SCAN_JOB_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _scan_job_lock(job_id: str) -> threading.Lock:
+    with _SCAN_LOCKS_GUARD:
+        lock = _SCAN_JOB_LOCKS.get(job_id)
+        if lock is None:
+            lock = _SCAN_JOB_LOCKS[job_id] = threading.Lock()
+        return lock
+
+
+# Stage 5 already ran ``is_extensionless_email_candidate`` on every extensionless
+# file it parsed (app.parsers.run_parser -> "email_mime"). A file that parsed as
+# something else is not RFC822; only email_mime hits and files without a
+# successful parse stay candidates.
+_EXTENSIONLESS_STAGE5_FILTER = """
+  AND NOT (
+    coalesce(job_artifacts.parse_status, '') = 'parsed'
+    AND coalesce(job_artifacts.metadata->>'email_mime_validated', 'false') NOT IN ('true', '1', 't')
+    AND NOT EXISTS (
+      SELECT 1 FROM artifact_parse_results apr
+      WHERE apr.job_artifact_id = job_artifacts.id AND apr.parser_name = 'email_mime'
+    )
+  )
+"""
 
 
 def scan_job_email_mime_inventory(
@@ -217,7 +269,22 @@ def scan_job_email_mime_inventory(
     """
     if use_cache and job_id in _JOB_SCAN_CACHE:
         return dict(_JOB_SCAN_CACHE[job_id])
+    # EML(X) Files and Email Attachments call this concurrently; one scan serves both.
+    with _scan_job_lock(str(job_id)):
+        if use_cache and job_id in _JOB_SCAN_CACHE:
+            return dict(_JOB_SCAN_CACHE[job_id])
+        return _scan_job_email_mime_inventory_impl(
+            db, job_id, max_eml_files=max_eml_files, max_extensionless=max_extensionless,
+        )
 
+
+def _scan_job_email_mime_inventory_impl(
+    db,
+    job_id: str,
+    *,
+    max_eml_files: int,
+    max_extensionless: int,
+) -> dict[str, Any]:
     exclude = _system_mail_exclude()
     totals: dict[str, Any] = {
         "scan_version": _EMAIL_SCAN_VERSION,
@@ -249,10 +316,9 @@ def scan_job_email_mime_inventory(
             LIMIT :lim""",
         {"j": job_id, "lim": max_eml_files},
     )
-    for row in eml_rows:
-        aid = str(row.get("id") or "")
-        processed_ids.add(aid)
-        info, failed = _scan_one_message(db, job_id, row, extensionless_candidate=False)
+    processed_ids.update(str(row.get("id") or "") for row in eml_rows)
+    for row, data in _iter_message_bytes(db, job_id, eml_rows):
+        info, failed = _scan_message_bytes(db, job_id, row, data, extensionless_candidate=False)
         totals["eml_emlx_files_scanned"] += 1
         if failed or not info:
             totals["parse_failures"] += 1
@@ -272,6 +338,7 @@ def scan_job_email_mime_inventory(
             WHERE job_id=:j
               AND ({EXTENSIONLESS_EML_CANDIDATE_WHERE.strip()})
               {exclude}
+              {_EXTENSIONLESS_STAGE5_FILTER}
             ORDER BY
               CASE
                 WHEN lower(replace(coalesce(file_path,''), '\\', '/')) LIKE '%/mail/%' THEN 0
@@ -282,12 +349,10 @@ def scan_job_email_mime_inventory(
             LIMIT :lim""",
         {"j": job_id, "lim": max_extensionless},
     )
-    for row in ext_rows:
-        aid = str(row.get("id") or "")
-        if aid in processed_ids:
-            continue
+    ext_rows = [row for row in ext_rows if str(row.get("id") or "") not in processed_ids]
+    for row, data in _iter_message_bytes(db, job_id, ext_rows):
         totals["extensionless_candidates_scanned"] += 1
-        info, failed = _scan_one_message(db, job_id, row, extensionless_candidate=True)
+        info, failed = _scan_message_bytes(db, job_id, row, data, extensionless_candidate=True)
         if failed:
             totals["parse_failures"] += 1
             continue

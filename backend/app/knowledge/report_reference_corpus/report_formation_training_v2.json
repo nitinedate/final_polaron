@@ -130,17 +130,17 @@
     "learned_from": "Ex-1 through Ex-5 examiner reports plus the Seger formation validation PDF.",
     "physical_budget": {
       "a4_body_after_letterhead_and_page_number_mm": 196,
-      "page_units": 26,
+      "page_units": 42,
       "title_units": 2,
       "header_units": 2,
       "gap_units": 2,
       "min_split_room_units": 8,
       "url_chars_per_line": 18,
       "total_chars_per_line": 88,
-      "max_url_rows_first": 5,
-      "max_url_rows_continued": 6,
+      "max_url_rows_first": 18,
+      "max_url_rows_continued": 18,
       "max_prose_rows": 2,
-      "pack_slack_units": 2,
+      "pack_slack_units": 3,
       "max_row_units": 16
     },
     "rules": [

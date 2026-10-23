@@ -141,6 +141,10 @@ interface HostEvidencePanelProps {
   initialSourceType?: HostSourceType;
   /** Windows folder from a completed live acquire — pre-fill and allow auto-register. */
   initialEvidencePath?: string;
+  /** Examination mode already stored on the job (disk_source.processing_profile). */
+  initialProcessingProfile?: "standard" | "deep" | null;
+  /** True once extraction has started: the mode is frozen for this case. */
+  processingProfileLocked?: boolean;
   /** Letters Drive Mount agent attached at Create job. */
   recommendedLetters?: string[];
   capabilityLabel?: string | null;
@@ -319,6 +323,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       lockedSourceType,
       initialSourceType,
       initialEvidencePath,
+      initialProcessingProfile,
+      processingProfileLocked,
       recommendedLetters,
       capabilityLabel,
       mobileOsLabel,
@@ -349,9 +355,52 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     }
   }, [onEvidenceOriginChange, onSourceModeChange, onSourceTransportChanged]);
   const panelRef = useRef<HTMLDivElement>(null);
+  const registerPickedFolderRef = useRef<(folder: StagedEvidenceFolder) => Promise<void>>(async () => undefined);
   const browserRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(false);
   const [registering, setRegistering] = useState(false);
+  const [processingProfile, setProcessingProfileState] = useState<"standard" | "deep">(
+    initialProcessingProfile === "deep" ? "deep" : "standard"
+  );
+  // Several registration callbacks are memoised (useCallback with stable deps) and
+  // the browse dialog keeps the first-render callback. Reading the mode from a ref
+  // guarantees the request carries the examiner's *current* choice — the stale
+  // closure is what sent "standard" after Deep examination was selected.
+  const processingProfileRef = useRef<"standard" | "deep">(processingProfile);
+  const profileTouchedRef = useRef(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+
+  useEffect(() => {
+    if (profileTouchedRef.current) return;
+    if (initialProcessingProfile === "deep" || initialProcessingProfile === "standard") {
+      processingProfileRef.current = initialProcessingProfile;
+      setProcessingProfileState(initialProcessingProfile);
+    }
+  }, [initialProcessingProfile]);
+
+  const changeProcessingProfile = useCallback(
+    async (next: "standard" | "deep") => {
+      if (processingProfileLocked) return;
+      const previous = processingProfileRef.current;
+      if (next === previous) return;
+      profileTouchedRef.current = true;
+      processingProfileRef.current = next;
+      setProcessingProfileState(next);
+      setProfileSaving(true);
+      try {
+        await forensicApi.setProcessingProfile(jobId, next);
+      } catch (e: unknown) {
+        processingProfileRef.current = previous;
+        setProcessingProfileState(previous);
+        toastRef.current.error(
+          e instanceof Error ? `Examination mode not saved: ${e.message}` : "Examination mode not saved"
+        );
+      } finally {
+        setProfileSaving(false);
+      }
+    },
+    [jobId, processingProfileLocked]
+  );
   const [remounting, setRemounting] = useState(false);
   const remountingRef = useRef(false);
   const [startingAgent, setStartingAgent] = useState(false);
@@ -1064,7 +1113,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         return;
       }
       // Only one source can be registered safely with the current backend.
-      await registerPickedFolder(folders[0]);
+      // Call the latest registerPickedFolder (this callback is memoised once).
+      await registerPickedFolderRef.current(folders[0]);
     },
     []
   );
@@ -1120,6 +1170,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
   }
 
   async function registerPickedFolder(folder: StagedEvidenceFolder) {
+    // Mode is read from processingProfileRef inside ingestAtResolvedPath.
     if (folder.intake === "office" && folder.hostPath) setManualPath(folder.hostPath);
     else if (folder.name) setManualPath(folder.name);
 
@@ -1239,6 +1290,8 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     onRegisterError?.(msg);
     toastRef.current.error(msg);
   }
+
+  registerPickedFolderRef.current = registerPickedFolder;
 
   const openEvidenceFolderBrowse = useCallback(async () => {
     await openNativeFolderPicker();
@@ -1425,6 +1478,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         source_type: sourceType,
         auto_process: autoProcess,
         skip_folder_list: true,
+        processing_profile: processingProfileRef.current,
       });
       onRegisterProgress?.({
         active: true,
@@ -1663,6 +1717,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         selected_names: isHostSegmentSource(sourceType) ? segments : undefined,
         auto_process: autoProcess,
         skip_folder_list: true,
+        processing_profile: processingProfileRef.current,
       });
       if (ingest.processing_queued) {
         toast.success("Disk folder selected — virtual disk build started automatically");
@@ -2007,7 +2062,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           onRefreshMounts={() => void refreshDriveMountsOnHost()}
           onStartAgent={() => void startHostDriveAgent()}
         />
-        {selectionLabel ? (
+      {selectionLabel ? (
           <div className="rounded-md border border-brand-200 bg-brand-50/60 px-3 py-2 text-xs text-ink-700">
             <span className="font-semibold text-brand-800">Selected:</span> {selectionLabel}
           </div>
@@ -2179,6 +2234,37 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         </div>
       )}
 
+        {sourceType === "disk" && !disabled ? (
+        <fieldset className="mb-3 rounded-md border border-ink-100 p-3 text-xs" data-testid="examination-mode">
+          <legend className="font-semibold">Examination mode</legend>
+          <label className="mr-4 inline-flex items-center gap-1">
+            <input type="radio" name={`profile-${jobId}`} checked={processingProfile === "standard"}
+              onChange={() => void changeProcessingProfile("standard")}
+              disabled={registering || profileSaving || Boolean(processingProfileLocked)} />
+            Standard forensic
+          </label>
+          <label className="inline-flex items-center gap-1">
+            <input type="radio" name={`profile-${jobId}`} checked={processingProfile === "deep"}
+              onChange={() => void changeProcessingProfile("deep")}
+              disabled={registering || profileSaving || Boolean(processingProfileLocked)} />
+            Deep examination
+          </label>
+          {processingProfileLocked ? (
+            <p className="mt-2 font-medium text-ink-700">
+              Fixed for this case — extraction already ran as{" "}
+              {processingProfile === "deep" ? "Deep examination" : "Standard forensic"}. Create a new job to
+              examine the same evidence in the other mode.
+            </p>
+          ) : profileSaving ? (
+            <p className="mt-2 text-ink-500">Saving examination mode…</p>
+          ) : null}
+          <p className="mt-2 text-ink-500">
+            {processingProfile === "standard"
+              ? "Report-focused. Extracts user files and all named forensic artifacts (registry, event logs, Prefetch, Amcache, SRUM, LNK, browser, email); skips OS binaries and vendor app assets. No unallocated carving, relationship graph or semantic vectors; picture/video review covers user files only. All exclusions are recorded in the report limitations."
+              : "Full examination. Extracts every file, carves unallocated space, reviews all pictures and videos, builds the relationship graph and semantic vectors. Substantially longer processing time."}
+          </p>
+        </fieldset>
+      ) : null}
       {!helperOnline && isLiveMobileSource ? (
         <div className="mb-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-950">
           <p className="font-semibold">Local HostDrive helper is offline (port 9876)</p>

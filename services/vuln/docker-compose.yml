@@ -10,6 +10,7 @@ include:
 
 x-vuln-env: &vuln-env
   AETHERIS_SERVICE: vuln
+  AETHERIS_SKIP_BOOT_MIGRATIONS: "1"
   VULN_MODULE_ENABLED: "true"
   DATABASE_URL: postgresql+psycopg2://forensic:forensic@postgres:5432/forensic
   REDIS_URL: redis://redis:6379/3
@@ -90,8 +91,8 @@ services:
         ]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 180s
+      retries: 18
+      start_period: 420s
 
   worker-nessus:
     networks:

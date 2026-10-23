@@ -31,6 +31,7 @@ const ReportEditorPage = lazy(() => import("./pages/forensic/ReportEditorPage").
 const ReportListPage = lazy(() => import("./pages/forensic/ReportListPage").then(module => ({ default: module.ReportListPage })));
 import { SearchEvidencePage } from "./pages/forensic/SearchEvidencePage";
 import { ArtifactExplorerPage } from "./pages/forensic/ArtifactExplorerPage";
+import { ArtifactPageErrorBoundary } from "./components/forensic/ArtifactPageErrorBoundary";
 import { DiskArtifactsHubPage } from "./pages/forensic/DiskArtifactsHubPage";
 import { MobileArtifactsDirectoryPage } from "./pages/mobile/MobileArtifactsDirectoryPage";
 import { MobileArtifactsPage } from "./pages/mobile/MobileArtifactsPage";
@@ -385,7 +386,7 @@ export default function App() {
             element={
               <RequireFirmScope>
                 <RequirePermission perm="artifact:read">
-                  <ArtifactExplorerPage />
+                  <ArtifactPageErrorBoundary><ArtifactExplorerPage /></ArtifactPageErrorBoundary>
                 </RequirePermission>
               </RequireFirmScope>
             }

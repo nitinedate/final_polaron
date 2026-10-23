@@ -103,6 +103,18 @@ const ACTIVE_STATUSES = new Set([
 
 const MAX_LIVE_LOGS = 200;
 
+/** Mobile extraction / backup jobs have no Standard/Deep examination mode. */
+function isMobileEvidenceJob(job: Job, lockedSourceType?: string): boolean {
+  return (
+    lockedSourceType === "mobile" ||
+    job.type === "mobile_extraction" ||
+    job.type === "ios_backup" ||
+    job.type === "android_backup" ||
+    String(job.disk_source?.source_type || "") === "mobile" ||
+    Boolean(job.disk_source?.mobile_os)
+  );
+}
+
 function mergeLogs(prev: ExtractionLog[], incoming: ExtractionLog[]): ExtractionLog[] {
   if (incoming.length === 0) return prev;
   const ids = new Set(prev.map((l) => l.id));
@@ -515,11 +527,20 @@ export function JobDetailPage() {
     if (autoFolderOpened.current) return;
     if (!locationState.autoSelectFolder) return;
     autoFolderOpened.current = true;
+    if (!isMobileEvidenceJob(job, locationState.lockedSourceType)) {
+      // Disk jobs: the examiner first chooses Standard forensic / Deep examination,
+      // then clicks "Browse drives". Opening the drive dialog on arrival skipped
+      // that choice, so only bring the evidence panel into view here.
+      const timer = window.setTimeout(() => {
+        uploadPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 250);
+      return () => window.clearTimeout(timer);
+    }
     const timer = window.setTimeout(() => {
       evidencePanelRef.current?.openEvidenceFolder();
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [job, locationState.autoSelectFolder, locationState.prefillEvidencePath]);
+  }, [job, locationState.autoSelectFolder, locationState.lockedSourceType, locationState.prefillEvidencePath]);
 
   const refreshArtifacts = useCallback(async () => {
     if (!jobId) return;
@@ -873,13 +894,7 @@ export function JobDetailPage() {
     );
   }
 
-  const isMobileJob =
-    locationState.lockedSourceType === "mobile" ||
-    job.type === "mobile_extraction" ||
-    job.type === "ios_backup" ||
-    job.type === "android_backup" ||
-    String(job.disk_source?.source_type || "") === "mobile" ||
-    Boolean(job.disk_source?.mobile_os);
+  const isMobileJob = isMobileEvidenceJob(job, locationState.lockedSourceType);
   const mobileOsRaw = String(locationState.mobileOs || job.disk_source?.mobile_os || "").toLowerCase();
   const mobileOsLabel =
     mobileOsRaw === "android" ? "Android" : mobileOsRaw === "ios" ? "iOS" : mobileOsRaw === "other" ? "Other / Unknown" : null;
@@ -937,9 +952,10 @@ export function JobDetailPage() {
               </>
             ) : (
               <>
-                Click <strong>Select evidence directory…</strong>, choose the required folder from any available
-                HDD, SSD, USB/pendrive, external drive or mapped network drive. The selected path is processed
-                in place without a separate download step.
+                Choose the <strong>Examination mode</strong> (Standard forensic or Deep examination), then click{" "}
+                <strong>Browse drives</strong> and select the evidence folder from any available HDD, SSD,
+                USB/pendrive, external drive or mapped network drive. The selected path is processed in place
+                without a separate download step.
               </>
             )}
           </p>
@@ -1246,6 +1262,16 @@ export function JobDetailPage() {
                 locationState.prefillEvidencePath
                 || (typeof job.disk_source?.evidence_folder === "string" ? job.disk_source.evidence_folder : "")
                 || (typeof job.disk_source?.last_host_path === "string" ? job.disk_source.last_host_path : "")
+              }
+              initialProcessingProfile={
+                job.disk_source?.processing_profile === "deep" || job.disk_source?.processing_profile === "standard"
+                  ? job.disk_source.processing_profile
+                  : null
+              }
+              processingProfileLocked={
+                Boolean(job.extracted_disk_uri)
+                || Number(job.files_extracted || 0) > 0
+                || Boolean(job.disk_source && typeof job.disk_source.index_uri === "string" && job.disk_source.index_uri)
               }
               recommendedLetters={recommendedDriveLetters}
               capabilityLabel={capabilityLabel}

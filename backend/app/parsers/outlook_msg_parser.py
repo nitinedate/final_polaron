@@ -1,6 +1,7 @@
 """Outlook .msg parser with attachment extraction.
 
-Uses ``extract-msg`` when available.  The source evidence is never rewritten;
+Uses ``extract-msg`` when available, otherwise the olefile MS-OXMSG reader
+(``mapi_msg_ole``).  The source evidence is never rewritten;
 conversion here is only an in-memory examiner preview/download representation.
 """
 
@@ -74,7 +75,14 @@ def build_msg_preview_details(data: bytes, path: str = "") -> dict[str, Any]:
     try:
         msg, temp_path = _open_msg(data)
     except Exception as exc:
-        return {"parse_ok": False, "error": str(exc)[:200]}
+        # extract-msg is optional (not in requirements.txt). Fall back to the
+        # olefile MS-OXMSG reader so .msg evidence always opens.
+        from app.parsers.mapi_msg_ole import parse_msg_ole
+
+        details = parse_msg_ole(data, path)
+        if not details.get("parse_ok"):
+            details.setdefault("error", str(exc)[:200])
+        return details
 
     try:
         headers = {
@@ -139,8 +147,10 @@ def build_msg_preview_details(data: bytes, path: str = "") -> dict[str, Any]:
 def load_msg_attachment_bytes(data: bytes, index: int) -> tuple[bytes, str | None, str]:
     try:
         msg, temp_path = _open_msg(data)
-    except Exception as exc:
-        raise LookupError("MSG attachment parser unavailable") from exc
+    except Exception:
+        from app.parsers.mapi_msg_ole import load_msg_attachment_ole
+
+        return load_msg_attachment_ole(data, index)
     try:
         attachments = list(getattr(msg, "attachments", []) or [])
         if index < 0 or index >= len(attachments):

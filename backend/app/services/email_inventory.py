@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from typing import Any
 
 from app.db.sql_helpers import fetchall, fetchone
@@ -41,6 +43,7 @@ def clear_email_count_cache(job_id: str | None = None) -> None:
     from app.services.email_mime_inventory import clear_email_mime_scan_cache
 
     clear_email_mime_scan_cache(job_id)
+    clear_parsed_record_count_cache(job_id)
 
 
 _WEBMAIL_PATTERNS: dict[str, list[re.Pattern[str]]] = {
@@ -107,30 +110,86 @@ def _iter_parsed_records(db, job_id: str, *, pattern: str, limit: int = 500):
                 yield row.get("file_path"), rec
 
 
-def _count_parsed_records(db, job_id: str, *, record_type: str) -> int:
-    """Sum parsed record counts for a record_type across all parse results (no row cap)."""
-    row = fetchone(
+# Every record type an Email & Calendar collector asks for. Counting them in ONE
+# pass replaces 6-8 separate full expansions of every parse-result JSON array
+# in the job (each call previously ran jsonb_array_elements over all rows).
+_EMAIL_RECORD_TYPES: tuple[str, ...] = (
+    "email_attachment",
+    "attachment",
+    "windows_mail_message",
+    "windows_mail",
+    "outlook_message",
+    "outlook_task",
+    "outlook_contact",
+    "outlook_appointment",
+    "calendar_event",
+)
+_PARSED_COUNT_TTL_SEC = 1800.0
+_PARSED_COUNT_LOCK = threading.Lock()
+_PARSED_COUNT_JOB_LOCKS: dict[str, threading.Lock] = {}
+_PARSED_COUNT_CACHE: dict[str, tuple[float, dict[str, int]]] = {}
+
+
+def _parsed_count_job_lock(job_id: str) -> threading.Lock:
+    with _PARSED_COUNT_LOCK:
+        lock = _PARSED_COUNT_JOB_LOCKS.get(job_id)
+        if lock is None:
+            lock = _PARSED_COUNT_JOB_LOCKS[job_id] = threading.Lock()
+        return lock
+
+
+def clear_parsed_record_count_cache(job_id: str | None = None) -> None:
+    with _PARSED_COUNT_LOCK:
+        if job_id is None:
+            _PARSED_COUNT_CACHE.clear()
+        else:
+            _PARSED_COUNT_CACHE.pop(str(job_id), None)
+
+
+def _parsed_record_counts(db, job_id: str, record_types: tuple[str, ...]) -> dict[str, int]:
+    rows = fetchall(
         db,
-        """SELECT coalesce(sum(
-               CASE
-                 WHEN elem->>'record_type' = :rt THEN
-                   coalesce(
-                     nullif(elem->>'count', '')::bigint,
-                     nullif(elem->>'message_count', '')::bigint,
-                     1
-                   )
-                 ELSE 0
-               END
-           ), 0) AS c
+        """SELECT elem->>'record_type' AS rt,
+                  coalesce(sum(coalesce(
+                    nullif(elem->>'count', '')::bigint,
+                    nullif(elem->>'message_count', '')::bigint,
+                    1
+                  )), 0) AS c
            FROM job_artifacts ja
            JOIN artifact_parse_results apr ON apr.job_artifact_id = ja.id
-           LEFT JOIN LATERAL jsonb_array_elements(
+           CROSS JOIN LATERAL jsonb_array_elements(
              CASE WHEN jsonb_typeof(apr.normalized) = 'array' THEN apr.normalized ELSE '[]'::jsonb END
-           ) AS elem ON TRUE
-           WHERE ja.job_id = :j""",
-        {"j": job_id, "rt": record_type},
+           ) AS elem
+           WHERE ja.job_id = :j AND elem->>'record_type' = ANY(:types)
+           GROUP BY 1""",
+        {"j": job_id, "types": list(record_types)},
     )
-    return int(row["c"]) if row else 0
+    return {str(r["rt"]): int(r["c"] or 0) for r in rows}
+
+
+def _count_parsed_records(db, job_id: str, *, record_type: str) -> int:
+    """Sum parsed record counts for a record_type across all parse results (no row cap).
+
+    Same predicate and arithmetic as before; the job's email/calendar types are
+    aggregated once (single-flight per job) and served from memory afterwards.
+    """
+    job_id = str(job_id)
+    if record_type not in _EMAIL_RECORD_TYPES:
+        return int(_parsed_record_counts(db, job_id, (record_type,)).get(record_type, 0))
+    now = time.monotonic()
+    with _PARSED_COUNT_LOCK:
+        hit = _PARSED_COUNT_CACHE.get(job_id)
+    if hit and now - hit[0] < _PARSED_COUNT_TTL_SEC:
+        return int(hit[1].get(record_type, 0))
+    with _parsed_count_job_lock(job_id):
+        with _PARSED_COUNT_LOCK:
+            hit = _PARSED_COUNT_CACHE.get(job_id)
+        if not hit or time.monotonic() - hit[0] >= _PARSED_COUNT_TTL_SEC:
+            counts = _parsed_record_counts(db, job_id, _EMAIL_RECORD_TYPES)
+            hit = (time.monotonic(), counts)
+            with _PARSED_COUNT_LOCK:
+                _PARSED_COUNT_CACHE[job_id] = hit
+    return int(hit[1].get(record_type, 0))
 
 
 def count_eml_files(db, job_id: str) -> dict[str, Any]:

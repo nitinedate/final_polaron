@@ -147,6 +147,24 @@ class DeviceDetector:
 # Request / result
 # ---------------------------------------------------------------------------
 
+def _acquire_accepts(adapter, param: str) -> bool:
+    """True when the adapter's acquire() declares ``param`` (or **kwargs).
+
+    Protects simulated/third-party android_adb adapters from receiving optional
+    kwargs they never declared.
+    """
+    import inspect
+
+    try:
+        sig = inspect.signature(adapter.acquire)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if param in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 @dataclass
 class AcquisitionRequest:
     case_id: str
@@ -170,6 +188,15 @@ class AcquisitionRequest:
     create_working_copy: bool = True
     # Optional IMAP cloud mailbox credentials (Gmail/Outlook app passwords).
     cloud_mailboxes: list[dict[str, Any]] = field(default_factory=list)
+    # Explicit examiner-authorized on-device actions (e.g. the WhatsApp decrypt
+    # agent's "generate key + create backup", which WRITES to the evidence
+    # device). Empty means the acquisition stays read-only.
+    authorized_actions: list[str] = field(default_factory=list)
+    # The 64-digit WhatsApp end-to-end key the examiner read from the device,
+    # used only when a new backup is created on-device or already known.
+    whatsapp_64_digit_key: str = ""
+    # Key material already captured in Intake (hex strings), passed to the agent.
+    intake_key_candidates: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -449,6 +476,10 @@ class CollectionOrchestrator:
         }
         if adapter.name == "ios_lockdown":
             kwargs["backup_password"] = request.backup_password
+        if adapter.name == "android_adb" and _acquire_accepts(adapter, "authorized_actions"):
+            kwargs["authorized_actions"] = list(request.authorized_actions or [])
+            kwargs["whatsapp_64_digit_key"] = request.whatsapp_64_digit_key or ""
+            kwargs["intake_key_candidates"] = list(request.intake_key_candidates or [])
 
         try:
             outcome: AcquisitionOutcome = adapter.acquire(**kwargs)

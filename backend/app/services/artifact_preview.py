@@ -34,6 +34,7 @@ _DOWNLOADABLE_BINARY_EXTENSIONS = frozenset({
     ".exe", ".dll", ".msi", ".apk", ".ipa", ".dmg", ".iso", ".bin",
 })
 _PREVIEW_TEXT_LIMIT = 120_000
+_INLINE_FILE_MAX_BYTES = 6_000_000
 _STORE_MAX_BYTES = 50_000_000
 _PREVIEW_READ_MAX_BYTES = 10 * 1024 * 1024
 _EMAIL_READ_MAX_BYTES = 32 * 1024 * 1024
@@ -428,10 +429,17 @@ def _guess_content_type(path: str, extension: str | None) -> str:
         return "application/vnd.ms-excel" if ext == ".xls" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if ext in {".doc", ".docx"}:
         return "application/msword" if ext == ".doc" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    if ext in {".mp4", ".m4v", ".webm"}:
-        return "video/mp4"
-    if ext in {".mp3", ".m4a"}:
-        return "audio/mpeg"
+    if ext in {".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".mpeg", ".mpg", ".3gp"}:
+        return {
+            ".mkv": "video/x-matroska",
+            ".webm": "video/webm",
+            ".wmv": "video/x-ms-wmv",
+            ".avi": "video/x-msvideo",
+            ".mov": "video/quicktime",
+            ".flv": "video/x-flv",
+        }.get(ext, "video/mp4")
+    if ext in {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma"}:
+        return "audio/mpeg" if ext in {".mp3", ".wma"} else "audio/mp4" if ext in {".m4a", ".aac"} else "audio/ogg" if ext == ".ogg" else "audio/flac"
     if ext in {".wav"}:
         return "audio/wav"
     if ext in {".json"}:
@@ -442,6 +450,56 @@ def _guess_content_type(path: str, extension: str | None) -> str:
         return "message/rfc822"
     guessed, _ = mimetypes.guess_type(path)
     return guessed or "application/octet-stream"
+
+
+def _evidence_times(row: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    """Filesystem times when the image recorded them, otherwise when the file was recovered."""
+    created = (
+        meta.get("ctime")
+        or meta.get("created_time")
+        or meta.get("created")
+        or meta.get("birth_time")
+        or meta.get("file_created")
+    )
+    modified = (
+        meta.get("mtime")
+        or meta.get("modified_time")
+        or meta.get("modified_at")
+        or meta.get("last_write")
+        or meta.get("file_modified")
+    )
+    recovered = row.get("created_at")
+    if hasattr(recovered, "isoformat"):
+        recovered = recovered.isoformat()
+    return {
+        "file_created": str(created) if created else None,
+        "file_modified": str(modified) if modified else None,
+        "recovered_at": str(recovered) if recovered else None,
+    }
+
+
+def _evidence_summary(row: dict[str, Any], meta: dict[str, Any], *, title: str, path: str, content_type: str) -> str:
+    times = _evidence_times(row, meta)
+    size = row.get("size_bytes")
+    try:
+        size_text = f"{int(size):,} bytes" if size is not None else "unknown"
+    except (TypeError, ValueError):
+        size_text = "unknown"
+    lines = [
+        f"File: {title}",
+        f"Type: {content_type}",
+        f"Size: {size_text}",
+    ]
+    if times.get("file_created"):
+        lines.append(f"Created: {times['file_created']}")
+    if times.get("file_modified"):
+        lines.append(f"Modified: {times['file_modified']}")
+    if times.get("recovered_at"):
+        lines.append(f"Recovered: {times['recovered_at']}")
+    if path:
+        lines.append(f"Path: {path}")
+    lines.append("Use Download or Open in new tab for the original file.")
+    return "\n".join(lines)
 
 
 def _load_artifact_row(db: Session, job_id: str, artifact_id: str) -> dict[str, Any] | None:
@@ -486,6 +544,46 @@ def _decode_text(data: bytes) -> str:
     if printable / len(probe) < 0.85:
         return data.decode("utf-8", errors="replace")
     return text
+
+
+def _printable_ratio(text: str, *, sample: int = 4000) -> float:
+    """Fraction of readable characters. Low on carved binary mistaken for text."""
+    probe = text[:sample]
+    if not probe:
+        return 0.0
+    good = sum(1 for c in probe if c.isprintable() or c in "\r\n\t")
+    return good / len(probe)
+
+
+def _looks_like_readable_email(text: str) -> bool:
+    """True only when the decoded fallback is actually a readable message.
+
+    Carved fragments from pagefile.sys / unallocated often carry an EML-like
+    signature but are arbitrary binary; decoding them yields replacement
+    characters and latin-1 mojibake. Those must not be presented as text.
+
+    A real message is mostly ASCII letters/digits/whitespace/punctuation. Random
+    bytes decoded as latin-1 pass a naive ``isprintable`` check (many byte values
+    map to printable accented glyphs), so we also require that the body is
+    dominated by plain ASCII and carries real word structure, not a soup of
+    high-range symbols and control bytes.
+    """
+    probe = (text or "")[:4000]
+    if not probe.strip():
+        return False
+    if "\ufffd" in probe:  # Unicode replacement char -> undecodable bytes
+        return False
+    n = len(probe)
+    ascii_text = sum(1 for c in probe if 32 <= ord(c) <= 126 or c in "\r\n\t")
+    control = sum(1 for c in probe if ord(c) < 32 and c not in "\r\n\t")
+    letters_spaces = sum(1 for c in probe if c.isalpha() or c.isspace())
+    # Real text: overwhelmingly ASCII, very few stray control bytes, and a
+    # substantial share of actual letters/whitespace (word structure).
+    return (
+        ascii_text / n >= 0.90
+        and control / n <= 0.02
+        and letters_spaces / n >= 0.55
+    )
 
 
 def _parse_eml_attachments(body: str) -> list[dict[str, Any]]:
@@ -544,6 +642,112 @@ def _link_attachment_artifacts(
     return linked
 
 
+def _fragment_payload(data: bytes, *, path: str, reason: str, base_offset: int = 0) -> dict[str, Any]:
+    """Strings / indicators / hex for bytes that must not be shown as a text body."""
+    from app.parsers.binary_fragment import build_fragment_view
+
+    view = build_fragment_view(data, base_offset=base_offset, source=path, reason=reason)
+    view.pop("text", None)
+    return view
+
+
+def _fast_source_bytes(
+    db: Session, job_id: str, row: dict[str, Any], *, max_bytes: int | None
+) -> bytes | None:
+    """MinIO object or verified original-evidence read only — never a shard scan.
+
+    Used where the preview previously returned a summary to avoid scanning the
+    tar shard on click; reading from the image costs only the file size.
+    """
+    hint = _size_hint_bytes(row)
+    if max_bytes is not None and hint is not None and hint > max_bytes:
+        return None
+    if row.get("minio_uri"):
+        try:
+            data = get_bytes(str(row["minio_uri"]))
+        except Exception:
+            data = None
+        if data:
+            return data if max_bytes is None else data[:max_bytes]
+    from app.services.artifact_locator import read_from_source
+
+    data = read_from_source(db, job_id, row, max_bytes=max_bytes)
+    if data and len(data) <= _STORE_MAX_BYTES and row.get("id"):
+        _persist_artifact_bytes(db, job_id, str(row["id"]), row, data)
+    return data
+
+
+def _apply_structured_records(
+    db: Session, job_id: str, preview: dict[str, Any], row: dict[str, Any], *, title: str
+) -> bool:
+    """Registry / EVTX / Prefetch / LNK / Jump List / SetupAPI / $I / PST records as a table."""
+    from app.services.artifact_parsed_view import (
+        ONDEMAND_MAX_BYTES,
+        apply_parsed_records,
+        is_strong_parse,
+        latest_parse_meta,
+        parsed_records_payload,
+        run_and_store_parse,
+        structured_parser_for,
+    )
+
+    family = structured_parser_for(row)
+    if not family:
+        return False
+    artifact_id = str(row.get("id") or "")
+    meta = latest_parse_meta(db, artifact_id)
+    if is_strong_parse(meta):
+        apply_parsed_records(preview, parsed_records_payload(db, meta, family=family), title=title)
+        return True
+    # Mailbox stores and $MFT are multi-GB: never parse inline on a click.
+    if family in {"pst", "mft"}:
+        return False
+    hint = _size_hint_bytes(row)
+    if hint is not None and hint > ONDEMAND_MAX_BYTES:
+        return False
+    try:
+        data = resolve_artifact_bytes(db, job_id, row, persist=True, max_bytes=ONDEMAND_MAX_BYTES)
+    except ArtifactContentTooLargeError:
+        return False
+    if not data:
+        return False
+    meta = run_and_store_parse(db, row, data)
+    if is_strong_parse(meta):
+        apply_parsed_records(
+            preview, parsed_records_payload(db, meta, family=family, source="on_demand_parse"), title=title
+        )
+        return True
+    path = str(row.get("file_path") or "")
+    preview["fragment"] = _fragment_payload(
+        data, path=path, reason=f"{family} parser returned no records (file damaged, partial or empty)"
+    )
+    preview["content_type"] = "application/octet-stream"
+    preview["encoding"] = "url"
+    preview["artifact_type"] = f"unparsed_{family}"
+    preview["body"] = (
+        f"{title}: the {family} parser found no records in {len(data):,} bytes. "
+        "Strings and a hex view of the original bytes are shown instead."
+    )
+    return True
+
+
+def artifact_records_page(
+    db: Session, job_id: str, artifact_id: str, *, offset: int = 0, limit: int = 100
+) -> dict[str, Any]:
+    """Next page of parsed records for the preview table."""
+    from app.services.artifact_parsed_view import latest_parse_meta, parsed_records_payload, structured_parser_for
+
+    row = _load_artifact_row(db, job_id, artifact_id)
+    if not row:
+        raise LookupError("Artifact not found")
+    meta = latest_parse_meta(db, artifact_id)
+    if not meta:
+        raise LookupError("No parsed records for this artifact")
+    payload = parsed_records_payload(db, meta, family=structured_parser_for(row) or "default", offset=offset, limit=limit)
+    payload.pop("_records", None)
+    return payload
+
+
 def _apply_email_preview(
     db: Session,
     job_id: str,
@@ -562,8 +766,33 @@ def _apply_email_preview(
     if ext and not ext.startswith("."):
         ext = f".{ext}"
 
-    if ext == ".msg":
-        # OLE .msg needs a dedicated parser; surface a clear message instead of a raw dump.
+    if ext == ".msg" or data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" and ext not in {".pst", ".ost"}:
+        from app.parsers.outlook_msg_parser import build_msg_preview_details
+
+        details = build_msg_preview_details(data, path) if data else {"parse_ok": False}
+        if details.get("parse_ok"):
+            headers = details.get("headers") or {}
+            preview["email"] = {
+                "from": headers.get("from") or "",
+                "to": headers.get("to") or "",
+                "cc": headers.get("cc") or "",
+                "bcc": headers.get("bcc") or "",
+                "subject": headers.get("subject") or (row.get("file_name") or "Outlook message"),
+                "date": headers.get("date") or "",
+                "message_id": headers.get("message_id") or "",
+            }
+            preview["body_text"] = details.get("body_text") or ""
+            preview["body_html"] = details.get("body_html") or ""
+            preview["body"] = preview["body_text"] or preview["body_html"] or ""
+            atts = details.get("attachments") or []
+            preview["attachments"] = _link_attachment_artifacts(db, job_id, path, atts) if atts else None
+            preview["attachment_count"] = len(atts)
+            preview["content_type"] = "application/vnd.ms-outlook"
+            preview["artifact_type"] = "msg"
+            if details.get("transport_headers"):
+                preview["transport_headers"] = details["transport_headers"]
+            return
+        # OLE .msg could not be parsed; surface a clear message instead of a raw dump.
         preview["email"] = {
             "from": "",
             "to": "",
@@ -571,8 +800,9 @@ def _apply_email_preview(
             "date": "",
         }
         preview["body_text"] = (
-            "This is an Outlook .msg (OLE) file. Inline MIME preview is not available yet — "
-            "use Open in new tab to download the original message, or convert to .eml for full body/attachments."
+            "This Outlook .msg (OLE) file could not be decoded "
+            f"({details.get('error') or 'no MAPI message properties found'}). "
+            "Use Download to export the original message."
         )
         preview["body"] = preview["body_text"]
         preview["content_type"] = "application/vnd.ms-outlook"
@@ -617,17 +847,42 @@ def _apply_email_preview(
                 "subject": row.get("file_name") or "Email message",
                 "date": "",
             }
-            preview["body"] = text
-            preview["body_text"] = text
-            # Re-parse for real part_index values when possible.
-            retry = build_email_preview_details(data, path)
-            atts = retry.get("attachments") or []
-            if atts:
-                preview["attachments"] = _link_attachment_artifacts(db, job_id, path, atts)
-                preview["attachment_count"] = len(preview["attachments"])
+            is_carved = bool(
+                (row.get("metadata") or {}).get("carved")
+                or "carved" in str(row.get("artifact_type") or "").lower()
+                or "pagefile.sys" in str(path).lower()
+                or "unalloc" in str(path).lower()
+            )
+            if _looks_like_readable_email(text):
+                # A real RFC822 message the strict parser merely tripped on.
+                preview["body"] = text
+                preview["body_text"] = text
+                # Re-parse for real part_index values when possible.
+                retry = build_email_preview_details(data, path)
+                atts = retry.get("attachments") or []
+                if atts:
+                    preview["attachments"] = _link_attachment_artifacts(db, job_id, path, atts)
+                    preview["attachment_count"] = len(preview["attachments"])
+                else:
+                    preview["attachments"] = None
+                    preview["attachment_count"] = 0
             else:
+                # Carved/undecodable fragment: do NOT dump binary as a text body.
+                size_n = len(data)
+                where = "unallocated space / a page file" if is_carved else "this file"
+                preview["body_text"] = (
+                    "This EML was recovered by signature carving from "
+                    f"{where} and is not a decodable RFC822 email "
+                    f"({size_n:,} bytes). The surrounding bytes are binary, so there is no "
+                    "readable message body. Use Raw source to inspect the bytes, or Download "
+                    "to export the fragment for manual analysis."
+                )
+                preview["body"] = preview["body_text"]
+                preview["body_html"] = ""
                 preview["attachments"] = None
                 preview["attachment_count"] = 0
+                preview["carved_unparsed"] = True
+                preview["fragment"] = _fragment_payload(data, path=path, reason="no RFC 5322 header block / unreadable body")
             preview["content_type"] = "message/rfc822"
         return
 
@@ -642,13 +897,39 @@ def _apply_email_preview(
         "date": headers.get("date") or "",
         "message_id": headers.get("message_id") or "",
     }
-    preview["body_text"] = details.get("body_text") or ""
-    preview["body_html"] = details.get("body_html") or ""
-    preview["body"] = preview["body_text"] or preview["body_html"] or preview.get("body") or ""
+    parsed_text = details.get("body_text") or ""
+    parsed_html = details.get("body_html") or ""
+    # Even when the MIME parser "succeeds" on a carved fragment, the body it
+    # recovers can be binary. If there is no HTML part and the text body is not
+    # actually readable, show an honest notice instead of a mojibake dump.
+    if parsed_html or _looks_like_readable_email(parsed_text) or not parsed_text:
+        preview["body_text"] = parsed_text
+        preview["body_html"] = parsed_html
+        preview["body"] = preview["body_text"] or preview["body_html"] or preview.get("body") or ""
+        attachments = _link_attachment_artifacts(db, job_id, path, details.get("attachments") or [])
+        preview["attachments"] = attachments or None
+        preview["attachment_count"] = len(attachments)
+    else:
+        size_n = len(data)
+        is_carved = bool(
+            (row.get("metadata") or {}).get("carved")
+            or "carved" in str(row.get("artifact_type") or "").lower()
+            or "pagefile.sys" in str(path).lower()
+            or "unalloc" in str(path).lower()
+        )
+        where = "unallocated space / a page file" if is_carved else "this file"
+        preview["body_text"] = (
+            "This EML was recovered by signature carving from "
+            f"{where} and has no readable message body ({size_n:,} bytes of binary). "
+            "Use Raw source to inspect the bytes, or Download to export the fragment."
+        )
+        preview["body_html"] = ""
+        preview["body"] = preview["body_text"]
+        preview["attachments"] = None
+        preview["attachment_count"] = 0
+        preview["carved_unparsed"] = True
+        preview["fragment"] = _fragment_payload(data, path=path, reason="decoded body is binary, not text")
     preview["content_type"] = "message/rfc822"
-    attachments = _link_attachment_artifacts(db, job_id, path, details.get("attachments") or [])
-    preview["attachments"] = attachments or None
-    preview["attachment_count"] = len(attachments)
 
 
 def _read_bytes_from_extraction(
@@ -657,6 +938,7 @@ def _read_bytes_from_extraction(
     row: dict[str, Any],
     *,
     max_bytes: int | None = None,
+    prefer_source: bool = True,
 ) -> bytes | None:
     from app.services.artifact_live_counts import _read_job_files
 
@@ -666,10 +948,26 @@ def _read_bytes_from_extraction(
     hint = _size_hint_bytes(row)
     if max_bytes is not None and hint is not None and hint > max_bytes:
         raise ArtifactContentTooLargeError(hint, max_bytes)
-    contents = _read_job_files(db, job_id, [row], max_bytes=max_bytes)
-    data = contents.get(path)
+    from app.services.artifact_locator import SOURCE_FIRST, read_from_located_shard, read_from_source
+
+    # 1) Original evidence (cost = file size; verified against the extraction record).
+    if prefer_source:
+        data = read_from_source(db, job_id, row, max_bytes=max_bytes)
+        if data:
+            return data
+    # 2) Shard located through job_artifact_locations (no full-index download).
+    located, data = read_from_located_shard(db, job_id, row, max_bytes=max_bytes)
     if data:
         return data
+    # 3) Legacy: whole-index map (only when the location index could not place it).
+    if not located:
+        contents = _read_job_files(db, job_id, [row], max_bytes=max_bytes)
+        data = contents.get(path)
+        if data:
+            return data
+    if prefer_source and SOURCE_FIRST:
+        # The verified source read above already covered the original image.
+        return None
 
     try:
         from app.services.virtual_disk import open_virtual_disk_cached, read_full_file_from_disk
@@ -725,8 +1023,9 @@ def resolve_artifact_bytes(
     *,
     persist: bool = True,
     max_bytes: int | None = _PREVIEW_READ_MAX_BYTES,
+    prefer_source: bool = True,
 ) -> bytes | None:
-    """Load artifact bytes from MinIO, extracted tar shards, or virtual disk."""
+    """Load artifact bytes: MinIO object, original evidence (verified), located shard."""
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -744,12 +1043,116 @@ def resolve_artifact_bytes(
                 data = data[:max_bytes]
             return data
 
-    data = _read_bytes_from_extraction(db, job_id, row, max_bytes=max_bytes)
+    if prefer_source:
+        data = _read_bytes_from_extraction(db, job_id, row, max_bytes=max_bytes)
+    else:
+        data = _read_bytes_from_extraction(db, job_id, row, max_bytes=max_bytes, prefer_source=False)
     if data and persist and len(data) <= _STORE_MAX_BYTES:
         artifact_id = str(row.get("id") or "")
         if artifact_id:
             _persist_artifact_bytes(db, job_id, artifact_id, row, data)
     return data
+
+
+def _stored_parse_text(db: Session, artifact_id: str) -> str:
+    try:
+        row = fetchone(
+            db,
+            """SELECT normalized FROM artifact_parse_results
+               WHERE job_artifact_id=:id ORDER BY created_at DESC LIMIT 1""",
+            {"id": artifact_id},
+        )
+    except Exception:
+        log.debug("Stored parse text lookup failed artifact=%s", artifact_id, exc_info=True)
+        return ""
+    if not row:
+        return ""
+    norm = row.get("normalized")
+    if isinstance(norm, str):
+        try:
+            norm = json.loads(norm)
+        except json.JSONDecodeError:
+            return norm[:_PREVIEW_TEXT_LIMIT]
+    parts: list[str] = []
+    records = norm if isinstance(norm, list) else [norm] if isinstance(norm, dict) else []
+    for rec in records:
+        if isinstance(rec, str) and rec.strip():
+            parts.append(rec.strip())
+        elif isinstance(rec, dict):
+            text = rec.get("text") or rec.get("body") or rec.get("content")
+            if text:
+                parts.append(str(text).strip())
+    return "\n\n".join(part for part in parts if part)[:_PREVIEW_TEXT_LIMIT]
+
+
+def _complete_stored_text_bytes(db: Session, row: dict[str, Any]) -> bytes | None:
+    """Return parsed text when it is the whole file, so a click does not open the archive."""
+    ext = str(row.get("extension") or "").lower()
+    if ext and not ext.startswith("."):
+        ext = f".{ext}"
+    if ext not in _TEXT_EXTENSIONS or ext in _MAIL_EXTENSIONS:
+        return None
+    stored = _stored_parse_text(db, str(row.get("id") or ""))
+    if not stored:
+        return None
+    raw = stored.encode("utf-8", errors="replace")
+    hint = _size_hint_bytes(row)
+    if hint is None or abs(len(raw) - int(hint)) > 16 or len(raw) > _INLINE_FILE_MAX_BYTES:
+        return None
+    return raw
+
+
+def _ensure_parsed_text(db: Session, row: dict[str, Any], text: str) -> None:
+    """Store examiner-visible text when this file was never parsed."""
+    if not text or str(row.get("parse_status") or "") == "parsed":
+        return
+    artifact_id = str(row.get("id") or "")
+    if not artifact_id:
+        return
+    existing = fetchone(
+        db,
+        "SELECT 1 AS ok FROM artifact_parse_results WHERE job_artifact_id=:id LIMIT 1",
+        {"id": artifact_id},
+    )
+    if existing:
+        return
+    ext = str(row.get("extension") or "document")
+    execute(
+        db,
+        """INSERT INTO artifact_parse_results
+           (job_artifact_id, parser_name, parser_version, record_count, byte_offset, normalized)
+           VALUES (:aid, :pname, 'preview', 1, 0, CAST(:norm AS jsonb))""",
+        {
+            "aid": artifact_id,
+            "pname": ext if ext.startswith(".") else f".{ext}",
+            "norm": json.dumps([{
+                "path": row.get("file_path") or "",
+                "text": text[:_PREVIEW_TEXT_LIMIT],
+            }]),
+        },
+    )
+    execute(
+        db,
+        """UPDATE job_artifacts SET parse_status='parsed', updated_at=NOW()
+           WHERE id=:id AND job_id=:jid AND parse_status IS DISTINCT FROM 'parsed'""",
+        {"id": artifact_id, "jid": row.get("job_id")},
+    )
+    db.commit()
+
+
+def _attach_original_file(preview: dict[str, Any], data: bytes | None, content_type: str) -> None:
+    """Embed the original file so preview and download do not wait on a second request."""
+    if not data or len(data) > _INLINE_FILE_MAX_BYTES:
+        return
+    if not (
+        content_type == "application/pdf"
+        or content_type == "message/rfc822"
+        or content_type.startswith("image/")
+        or content_type.startswith("audio/")
+        or content_type.startswith("video/")
+    ):
+        return
+    preview["file_base64"] = base64.b64encode(data).decode("ascii")
 
 
 def _extract_document_preview_text(data: bytes, *, ext: str, path: str) -> str | None:
@@ -1007,6 +1410,19 @@ def build_artifact_preview(db: Session, job_id: str, artifact_id: str) -> dict[s
         "attachments": None,
         "device_name": meta.get("device_name"),
     }
+    preview.update(_evidence_times(row, meta))
+
+    # Registry hives, EVTX, Prefetch, LNK, Jump Lists, SetupAPI, $I, PST: show the
+    # parsed records (stored by stage 5, or parsed once now and stored).
+    try:
+        if _apply_structured_records(db, job_id, preview, row, title=title):
+            return preview
+    except Exception:
+        log.warning("structured preview failed job=%s artifact=%s", job_id, artifact_id, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     is_mail = ext in _MAIL_EXTENSIONS or content_type == "message/rfc822"
     is_media = (
@@ -1018,6 +1434,73 @@ def build_artifact_preview(db: Session, job_id: str, artifact_id: str) -> dict[s
     # Large browser-native media/PDFs stream via content URL (size-independent).
     # HEIC/HEIF always attempt conversion so the UI can show JPEG.
     hint = _size_hint_bytes(row)
+    # Video, audio, and files that are still inside the disk archive must not be
+    # opened on this request. Reading a tar shard here blocks every other click.
+    if content_type.startswith(("video/", "audio/")) or ext in {
+        ".mkv", ".wmv", ".avi", ".mov", ".mp4", ".webm", ".mp3", ".wav", ".m4a", ".flac",
+    }:
+        preview["encoding"] = None if hint is not None and hint < 4096 else "url"
+        preview["size_bytes"] = hint
+        preview["body"] = _evidence_summary(row, meta, title=title, path=path, content_type=content_type)
+        preview["body_text"] = preview["body"]
+        return preview
+    # Parsed text is already in the database. Opening the tar shard to show a
+    # CSV or document walks every preceding member and is what freezes the click.
+    text_like = (
+        (ext in _TEXT_EXTENSIONS and ext not in _MAIL_EXTENSIONS)
+        or (content_type.startswith("text/") and not is_mail)
+        or content_type in {"application/json", "text/csv"}
+    )
+    prefetched: bytes | None = None
+    if text_like:
+        stored = _stored_parse_text(db, str(row["id"]))
+        if not stored and not row.get("minio_uri"):
+            prefetched = _fast_source_bytes(db, job_id, row, max_bytes=_PREVIEW_READ_MAX_BYTES)
+        if (stored or not row.get("minio_uri")) and prefetched is None:
+            summary = _evidence_summary(row, meta, title=title, path=path, content_type=content_type)
+            preview["encoding"] = None
+            preview["size_bytes"] = hint
+            preview["body"] = stored or summary
+            preview["body_text"] = preview["body"]
+            if stored and hint is not None:
+                raw = stored.encode("utf-8", errors="replace")
+                if abs(len(raw) - int(hint)) <= 16 and len(raw) <= _INLINE_FILE_MAX_BYTES:
+                    preview["file_base64"] = base64.b64encode(raw).decode("ascii")
+            return preview
+    if prefetched is None and not row.get("minio_uri") and (
+        is_mail
+        or ext in _DOWNLOADABLE_BINARY_EXTENSIONS
+        or content_type == "application/pdf"
+        or content_type.startswith("image/")
+    ):
+        # Reading the original image costs the file size; only a shard scan is
+        # too slow for a click. Without a readable source keep the summary.
+        prefetched = _fast_source_bytes(
+            db, job_id, row, max_bytes=_EMAIL_READ_MAX_BYTES if is_mail else _PREVIEW_READ_MAX_BYTES
+        )
+    if prefetched is None and not row.get("minio_uri") and (
+        is_mail
+        or ext in _DOWNLOADABLE_BINARY_EXTENSIONS
+        or content_type == "application/pdf"
+        or content_type.startswith("image/")
+    ):
+        stored = _stored_parse_text(db, str(row["id"])) if (is_mail or ext in _DOWNLOADABLE_BINARY_EXTENSIONS or content_type == "application/pdf") else ""
+        summary = _evidence_summary(row, meta, title=title, path=path, content_type=content_type)
+        # Do not set encoding to url. The browser would then download the original
+        # by scanning the archive, and the preview spinner stays up until that finishes.
+        preview["encoding"] = None
+        preview["size_bytes"] = hint
+        preview["body"] = f"{stored}\n\n{summary}".strip() if stored else summary
+        preview["body_text"] = preview["body"]
+        if is_mail:
+            preview["content_type"] = "message/rfc822"
+            preview["email"] = {
+                "from": "",
+                "to": "",
+                "subject": title,
+                "date": preview.get("file_created") or preview.get("file_modified") or preview.get("recovered_at") or "",
+            }
+        return preview
     needs_convert = ext in {".heic", ".heif"} or "heic" in content_type or "heif" in content_type
     if (
         is_media
@@ -1032,7 +1515,7 @@ def build_artifact_preview(db: Session, job_id: str, artifact_id: str) -> dict[s
 
     read_limit = _EMAIL_READ_MAX_BYTES if is_mail else _PREVIEW_READ_MAX_BYTES
     try:
-        data = resolve_artifact_bytes(
+        data = prefetched if prefetched is not None else resolve_artifact_bytes(
             db,
             job_id,
             row,
@@ -1117,11 +1600,15 @@ def build_artifact_preview(db: Session, job_id: str, artifact_id: str) -> dict[s
     if content_type.startswith("video/") or content_type.startswith("audio/") or content_type == "application/pdf":
         preview["encoding"] = "url"
         preview["body"] = ""
+        _attach_original_file(preview, data, content_type)
         if content_type == "application/pdf":
             extracted = _extract_document_preview_text(data, ext=ext or ".pdf", path=path)
+            if not extracted:
+                extracted = _stored_parse_text(db, str(row["id"]))
             if extracted:
                 preview["body"] = extracted
                 preview["body_text"] = extracted
+                _ensure_parsed_text(db, row, extracted)
         return preview
 
     low_path = (path or "").replace("\\", "/").lower()
@@ -1142,6 +1629,7 @@ def build_artifact_preview(db: Session, job_id: str, artifact_id: str) -> dict[s
         if is_mail or content_type == "message/rfc822":
             _apply_email_preview(db, job_id, preview, row, data)
             if preview.get("email"):
+                _attach_original_file(preview, data, "message/rfc822")
                 return preview
         return preview
 
@@ -1305,12 +1793,19 @@ def build_artifact_preview(db: Session, job_id: str, artifact_id: str) -> dict[s
             )
         return preview
 
-    # Truly opaque binary — CTA with preserved MIME (never text/plain hex dump).
+    # Truly opaque binary — keep the MIME for Open/Download, and give the examiner
+    # a readable view: structured strings with offsets, indicators and hex.
     preview["encoding"] = "url"
     if content_type == "text/plain":
         content_type = _guess_content_type(path, ext) or "application/octet-stream"
     preview["content_type"] = content_type or "application/octet-stream"
     preview["body"] = _binary_preview_text(data, path=path)
+    try:
+        preview["fragment"] = _fragment_payload(
+            data, path=path, reason="no structured parser for this file type"
+        )
+    except Exception:
+        log.debug("fragment view failed path=%s", path, exc_info=True)
     return preview
 
 
@@ -1385,8 +1880,14 @@ def iter_artifact_content(
     *,
     max_bytes: int | None = _CONTENT_READ_MAX_BYTES,
     allow_disk: bool = True,
+    prefer_source: bool = False,
 ) -> Iterator[bytes]:
-    """Stream artifact bytes in chunks for large forensic downloads."""
+    """Stream artifact bytes in chunks for large forensic downloads.
+
+    ``prefer_source`` (API content endpoint only) streams live files straight from
+    the original image instead of decompressing a shard from its start. Workers
+    keep the shard-first order so they do not contend on the evidence image.
+    """
     storage_uri = row.get("minio_uri")
     if storage_uri:
         stream = open_object_stream(str(storage_uri))
@@ -1412,10 +1913,43 @@ def iter_artifact_content(
             yield data if max_bytes is None else data[:max_bytes]
             return
 
-    # Opening the evidence image is a separate mount. Media review must be
-    # able to skip a file that is not already in object storage instead of
-    # blocking the whole stage on that mount.
+    # Parsed CSV/text is already stored. Do not scan the tar shard to serve it again.
+    if not storage_uri:
+        stored_text = _complete_stored_text_bytes(db, row)
+        if stored_text:
+            yield stored_text if max_bytes is None else stored_text[:max_bytes]
+            return
+
     path = (row.get("file_path") or "").replace("\\", "/")
+    if path and allow_disk and prefer_source:
+        from app.services.artifact_locator import iter_from_source
+
+        streamed = iter_from_source(db, job_id, row, max_bytes=max_bytes, chunk_size=_CONTENT_STREAM_CHUNK)
+        if streamed is not None:
+            yield from streamed
+            return
+
+    # Extracted MinIO shard, located through job_artifact_locations.
+    if path:
+        try:
+            from app.services.artifact_locator import read_from_located_shard
+
+            located, data = read_from_located_shard(db, job_id, row, max_bytes=max_bytes)
+            if data is not None:
+                yield data
+                return
+            if not located:
+                from app.services.artifact_live_counts import _read_job_files
+
+                extracted = _read_job_files(db, job_id, [row], max_bytes=max_bytes)
+                data = extracted.get(path)
+                if data is not None:
+                    yield data
+                    return
+        except Exception as exc:
+            log.warning("Shard evidence read failed job=%s path=%s: %s", job_id, path, exc)
+
+    # Only then attempt a read from the original image, if still available.
     if path and allow_disk:
         try:
             from app.services.virtual_disk import iter_file_from_disk, open_virtual_disk_cached
@@ -1432,13 +1966,13 @@ def iter_artifact_content(
         except Exception as exc:
             log.debug("Stream from disk failed job=%s path=%s: %s", job_id, path, exc)
 
-    # Last resort: buffered resolve (still capped).
-    data = resolve_artifact_bytes(
-        db, job_id, row, persist=False, max_bytes=max_bytes
+    # All storage paths have already been checked.  Do not call the generic
+    # resolver here: it repeats the MinIO/shard scan and can remount the image
+    # a second time, causing multi-minute waits for deleted entries.
+    raise FileNotFoundError(
+        "No recovered bytes are available for this artifact. The deleted "
+        "directory entry may be present even when its content is not recoverable."
     )
-    if not data:
-        raise FileNotFoundError("No stored content for artifact")
-    yield data
 
 
 def load_artifact_content(db: Session, job_id: str, artifact_id: str) -> tuple[bytes, str, str]:
@@ -1459,7 +1993,7 @@ def load_artifact_content(db: Session, job_id: str, artifact_id: str) -> tuple[b
         )
     except ArtifactContentTooLargeError as exc:
         raise ArtifactContentTooLargeError(exc.size_bytes, exc.limit_bytes) from exc
-    if not data:
+    if data is None:
         raise FileNotFoundError("No stored content for artifact")
     filename, content_type = _artifact_filename_and_type(row, head=data[:64])
     return data, content_type, filename
@@ -1483,4 +2017,14 @@ def load_email_attachment_content(
     if not data:
         raise FileNotFoundError("No stored content for artifact")
     path = row.get("file_path") or row.get("file_name") or ""
+    if str(path).lower().endswith(".msg") or data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        from app.parsers.outlook_msg_parser import load_msg_attachment_bytes
+        from app.services.artifact_type_resolver import resolve_artifact_type
+
+        payload, declared, name = load_msg_attachment_bytes(data, part_index)
+        resolved = resolve_artifact_type(
+            {"file_name": name, "file_path": name, "metadata": {"content_type": declared or ""}},
+            data=payload[:256 * 1024] or None,
+        )
+        return payload, resolved.content_type, resolved.normalized_filename
     return load_mime_part_bytes(data, path, part_index)

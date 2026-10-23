@@ -2988,11 +2988,13 @@ def parse_shard_sidecar_task(self, schema_name: str, job_id: str, task_id: str |
                     details = {"parsed": parsed, "skipped": skipped, "rounds": rounds, "pending_left": left,
                                "bucket": int(bucket), "buckets": int(buckets)}
                     if left > 0 or registering:
-                        # More of this share exists, or registration may still add rows.
+                        # When registration remains active, new rows can still arrive.
+                        # Poll only while the producer is active; once it closes and
+                        # the bucket is empty, finish without creating another task.
                         parse_shard_sidecar_task.apply_async(
                             args=(schema_name, job_id, task_id, int(bucket), int(buckets)),
                             queue=parse_shard_queue(),
-                            countdown=2 if left > 0 else 10,
+                            countdown=2 if left > 0 else 45,
                         )
                         return {"status": "requeued", **details}
                     finish_sidecar(db, job_id, name, task_id, status="done", details=details)

@@ -16,6 +16,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
+from app.parsers.rfc822_validate import find_header_block_start, validate_rfc822
 from app.db.sql_helpers import execute, fetchall, fetchone
 
 log = logging.getLogger("signature_carve_inventory")
@@ -194,6 +195,8 @@ def scan_buffer_for_signatures(
         return []
     hits: list[dict[str, Any]] = []
     seen_local: set[str] = set()
+    seen_eml_starts: set[int] = set()
+    eml_header_ranges: list[tuple[int, int]] = []
     n = len(data)
     for sig in _SIGNATURES:
         magic = sig.magic
@@ -255,10 +258,28 @@ def scan_buffer_for_signatures(
                 kind = "tiff"
             elif kind in {"eml_mime", "eml_from"}:
                 kind = "eml"
-                # Require another email header nearby
-                window = data[idx : idx + min(2048, n - idx)].lower()
-                if b"subject:" not in window and b"to:" not in window and b"date:" not in window:
+                # The hit must belong to a valid RFC 5322 header block.  The old check ("to:" anywhere in 2 KiB)
+                # matched proto:/photo:/JSON in pagefile memory.  "\nFrom: " and
+                # "From: " (and MIME-Version: in the same block) collapse to one hit at
+                # the block start, removing the off-by-one duplicate rows.
+                hdr = idx + 1 if magic.startswith(b"\n") else idx
+                if any(a <= hdr < b for a, b in eml_header_ranges):
+                    continue  # inside a message already accepted (e.g. "X-Original-From:")
+                # Candidates: the start of the header block containing the hit, and the
+                # hit itself (a message carved from unallocated space is often preceded
+                # by slack bytes with no line break).
+                accepted = None
+                for cand in dict.fromkeys((find_header_block_start(data, hdr), hdr)):
+                    check = validate_rfc822(data[cand : cand + 65536])
+                    if check.valid:
+                        accepted = (cand + check.start, cand + check.header_end)
+                        break
+                if accepted is None or accepted[0] in seen_eml_starts:
                     continue
+                idx = accepted[0]
+                head = data[idx : idx + min(4096, n - idx)]
+                seen_eml_starts.add(idx)
+                eml_header_ranges.append(accepted)
 
             abs_off = base_offset + idx
             hid = _hit_id(kind, source_path, abs_off, head)
@@ -275,6 +296,7 @@ def scan_buffer_for_signatures(
                     "offset": abs_off,
                     "max_size": sig.max_size,
                     "head_sha1": hashlib.sha1(head).hexdigest()[:16],
+                    **({"rfc822_validated": True} if kind == "eml" else {}),
                 }
             )
             if len(hits) >= 20_000:
@@ -939,6 +961,37 @@ _AXIOM_NAME_TO_KINDS: dict[str, set[str]] = {
 }
 
 
+def dedupe_adjacent_eml_hits(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the off-by-one twin produced by the old "From: " / "\\nFrom: " signatures.
+
+    Inventories built before 2026-10-22 hold both hits for one header (offsets
+    N and N+1).  Validation needs the bytes, so it happens at preview time; the
+    duplicate can be removed here without I/O.
+    """
+    out: list[dict[str, Any]] = []
+    last: dict[str, int] = {}
+    ordered = sorted(
+        enumerate(rows),
+        key=lambda t: (str(t[1].get("source_path") or ""), int(t[1].get("offset") or 0)),
+    )
+    keep_idx: set[int] = set()
+    for i, r in ordered:
+        if r.get("kind") != "eml":
+            keep_idx.add(i)
+            continue
+        src = str(r.get("source_path") or "")
+        off = int(r.get("offset") or 0)
+        prev = last.get(src)
+        last[src] = off
+        if prev is not None and 0 <= off - prev <= 1:
+            continue
+        keep_idx.add(i)
+    for i, r in enumerate(rows):
+        if i in keep_idx:
+            out.append(r)
+    return out
+
+
 def list_carve_evidence(
     db,
     job_id: str,
@@ -968,6 +1021,7 @@ def list_carve_evidence(
         # file that is already present in the canonical browse set.
         if norm_name == "eml(x) files":
             rows = [r for r in rows if not _is_direct_eml_source(str(r.get("source_path") or ""))]
+    rows = dedupe_adjacent_eml_hits(rows)
     total = len(rows)
     page = max(int(page or 1), 1)
     page_size = max(min(int(page_size or 50), 200), 1)

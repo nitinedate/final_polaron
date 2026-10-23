@@ -315,6 +315,8 @@ def _column_weights(header: list[str], rows: list[list[str]]) -> list[float]:
             weight = 1.6
         else:
             weight = min(2.2, max(0.9, max_len / 18.0))
+        longest = max((len(part) for value in values for part in re.split(r"[\s\\/]+", value or "")), default=4)
+        weight = max(weight, min(3.4, longest / 9.0))
         weights.append(weight)
     return weights
 
@@ -387,11 +389,21 @@ def _set_table_borders(table, color: str = _NAVY, sz: str = "12") -> None:
         node.set(qn("w:color"), color)
 
 
+def _is_source_coverage_table(table: dict[str, Any]) -> bool:
+    title = str(table.get("title") or "").strip().lower()
+    if "source limitations" in title:
+        return True
+    columns = [str(col or "").strip().lower() for col in (table.get("columns") or [])]
+    return "source" in columns and "limitation" in columns and "follow-up" in columns
+
+
 def _tables_from_section(section: dict) -> list[dict[str, Any]]:
+    from app.services.source_coverage import strip_source_coverage_from_report
+
     structured = section.get("structured_json") if isinstance(section.get("structured_json"), dict) else {}
-    existing = list((structured or {}).get("tables") or [])
+    existing = [table for table in list((structured or {}).get("tables") or []) if not _is_source_coverage_table(table)]
     parsed: list[dict[str, Any]] = []
-    content = str(section.get("content_md") or "")
+    content = strip_source_coverage_from_report(str(section.get("content_md") or ""))
     lines = content.replace("\r\n", "\n").split("\n")
     i = 0
     pending_title = ""
@@ -426,33 +438,31 @@ def _tables_from_section(section: dict) -> list[dict[str, Any]]:
     ]
 
 
-def _add_packed_tables(doc: Document, tables: list[dict[str, Any]], *, section_title_text: str) -> None:
-    from app.services.report_formation_agent import pack_annexure_tables
+def _prose_without_tables(content: str) -> str:
+    kept = [line for line in (content or "").splitlines() if not line.strip().startswith("|")]
+    return "\n".join(kept).strip()
 
-    pages = pack_annexure_tables(tables)
-    for pi, page in enumerate(pages):
-        if pi:
-            doc.add_page_break()
-            _add_section_heading(doc, f"{section_title_text} (continued)")
-        for chunk in page:
-            title = str(chunk.get("title") or "").strip()
-            if title:
-                p = doc.add_paragraph(style="Heading 3")
-                _set_keep_with_next(p)
-                label = f"{title} (continued)" if chunk.get("continued") else title
-                run = p.add_run(label.upper())
-                run.font.name = "Times New Roman"
-                run.font.size = Pt(14)
-                run.bold = True
-                run.font.color.rgb = RGBColor.from_string("103B63")
-            note = chunk.get("note")
-            if note and not chunk.get("continued"):
-                np = doc.add_paragraph()
-                nr = np.add_run(str(note))
-                nr.italic = True
-                nr.font.name = "Times New Roman"
-                nr.font.size = Pt(11)
-            _add_table(doc, list(chunk.get("columns") or []), [list(row or []) for row in (chunk.get("rows") or [])])
+
+def _add_packed_tables(doc: Document, tables: list[dict[str, Any]], *, section_title_text: str) -> None:
+    del section_title_text
+    for table in tables:
+        title = str(table.get("title") or "").strip()
+        if title:
+            p = doc.add_paragraph(style="Heading 3")
+            _set_keep_with_next(p)
+            run = p.add_run(title.upper())
+            run.font.name = "Times New Roman"
+            run.font.size = Pt(14)
+            run.bold = True
+            run.font.color.rgb = RGBColor.from_string("103B63")
+        note = table.get("note")
+        if note:
+            np = doc.add_paragraph()
+            nr = np.add_run(str(note))
+            nr.italic = True
+            nr.font.name = "Times New Roman"
+            nr.font.size = Pt(11)
+        _add_table(doc, list(table.get("columns") or []), [list(row or []) for row in (table.get("rows") or [])])
 
 
 def _opo_cards_from_markdown(content: str) -> list[list[str]]:
@@ -927,17 +937,16 @@ def build_report_docx(
         if not sec:
             continue
         title = section_title(key, mobile=mobile)
-        content = sec.get("content_md") or ""
-        content = strip_redundant_section_heading(content, title)
+        from app.services.source_coverage import strip_source_coverage_from_report
+        content = strip_source_coverage_from_report(strip_redundant_section_heading(sec.get("content_md") or "", title))
 
         if key == "cover_page":
             _add_cover(doc, content, mobile=mobile)
+            doc.add_page_break()
             first_content = False
             continue
 
-        # UI / TOC contract: every listed description starts on a fresh A4 page.
-        if not first_content:
-            doc.add_page_break()
+        # Later sections stay on the open page when it still has room.
         first_content = False
 
         # Use the report's formal section labels, not internal key names.  Introduction
@@ -997,6 +1006,9 @@ def build_report_docx(
             if key in {"annexure", "final_analysis_summary", "os_information", "user_profile_information", "forensic_imaging"}:
                 packed = _tables_from_section(sec)
                 if packed:
+                    prose = _prose_without_tables(content)
+                    if prose:
+                        _add_markdown(doc, prose)
                     _add_packed_tables(doc, packed, section_title_text=title)
                     continue
             _add_markdown(doc, content)

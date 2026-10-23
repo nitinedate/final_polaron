@@ -67,6 +67,10 @@ type AuthorityForm = {
   cloud_mail_provider: string;
   cloud_mail_address: string;
   cloud_mail_secret: string;
+  // Android WhatsApp decrypt agent (device-modifying; off by default).
+  wa_generate_backup: boolean;
+  wa_allow_device_modification: boolean;
+  wa_64_digit_key: string;
 };
 
 function deviceMatchesPlatform(osFamily: string | undefined, platform: "android" | "ios" | null): boolean {
@@ -519,6 +523,9 @@ export function MobileAcquisitionPage() {
     cloud_mail_provider: "gmail",
     cloud_mail_address: "",
     cloud_mail_secret: "",
+    wa_generate_backup: false,
+    wa_allow_device_modification: false,
+    wa_64_digit_key: "",
   });
 
   const [running, setRunning] = useState(false);
@@ -1726,6 +1733,11 @@ export function MobileAcquisitionPage() {
       device_condition: form.device_condition,
       network_isolated: form.network_isolated,
       create_working_copy: true,
+      authorized_actions:
+        form.wa_generate_backup && form.wa_allow_device_modification
+          ? ["whatsapp_generate_key_and_backup", "allow_device_modification"]
+          : [],
+      whatsapp_64_digit_key: form.wa_64_digit_key.trim(),
       cloud_mailboxes: form.cloud_mail_address.trim() && form.cloud_mail_secret
         ? [
             {
@@ -2462,6 +2474,94 @@ export function MobileAcquisitionPage() {
                   </Notice>
                 </div>
               )}
+            </div>
+          )}
+
+          {preview.device_profile.os_family === "android" && (
+            <div className="mb-5 rounded-lg border border-ink-100 bg-ink-50/50 p-3">
+              <h4 className="mb-2 text-sm font-semibold text-ink-800">WhatsApp decryption</h4>
+              <p className="mb-3 text-xs text-ink-500">
+                The decrypt agent recovers the WhatsApp database <span className="font-semibold">without
+                altering the device</span>, trying these in order: (1) an existing encrypted backup
+                with the 64-digit key below; (2) an existing backup with the device key file
+                (files/key) captured by a rooted/full-file-system extraction; (3) the live
+                msgstore.db read directly when root is already present. No key is ever generated or
+                guessed.
+              </p>
+              <Field
+                label="64-digit WhatsApp key (optional)"
+                hint="The key WhatsApp shows under the 64-digit backup option, or an already-known root key. Decrypts an existing crypt15 backup. Stored with Intake; never shown in reports or logs."
+              >
+                <Input
+                  type="password"
+                  value={form.wa_64_digit_key}
+                  onChange={(e) => setForm({ ...form, wa_64_digit_key: e.target.value })}
+                  placeholder="64 hexadecimal characters"
+                />
+              </Field>
+              {form.wa_64_digit_key.trim() &&
+                !/^[0-9a-fA-F]{64}$/.test(form.wa_64_digit_key.replace(/[\s:-]/g, "")) && (
+                  <p className="mt-1 text-xs text-amber-700">
+                    Expected 64 hexadecimal characters (spaces and dashes are ignored).
+                  </p>
+                )}
+
+              <div className="mt-4 rounded-md border border-amber-300 bg-amber-50/60 p-3">
+                <p className="mb-2 text-xs font-semibold text-amber-900">
+                  Last resort — modifies the evidence device
+                </p>
+                <p className="mb-2 text-xs text-amber-800">
+                  If no backup, key or root access exists, the only remaining option is to create a
+                  new encrypted backup on the device. This <span className="font-semibold">writes to
+                  the evidence device</span> and is recorded in the chain of custody. Use only when
+                  authorized and when the read-only options above cannot succeed.
+                </p>
+                <label className="flex items-start gap-2 text-xs text-amber-900">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={form.wa_generate_backup}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        wa_generate_backup: e.target.checked,
+                        wa_allow_device_modification: e.target.checked
+                          ? form.wa_allow_device_modification
+                          : false,
+                      })
+                    }
+                  />
+                  <span>Create a new end-to-end encrypted backup on the device (if needed).</span>
+                </label>
+                {form.wa_generate_backup && (
+                  <label className="mt-2 flex items-start gap-2 text-xs text-amber-900">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={form.wa_allow_device_modification}
+                      onChange={(e) =>
+                        setForm({ ...form, wa_allow_device_modification: e.target.checked })
+                      }
+                    />
+                    <span className="font-semibold">
+                      I confirm I am authorized to modify this evidence device and accept this will be
+                      recorded in the chain of custody.
+                    </span>
+                  </label>
+                )}
+                {form.wa_generate_backup && form.wa_allow_device_modification && (
+                  <div className="mt-2">
+                    <Notice tone="warn" title="On-device steps are manual">
+                      <p>
+                        Perform the steps in WhatsApp (Settings &gt; Chats &gt; Chat Backup &gt;
+                        End-to-end encrypted backup &gt; 64-digit key &gt; Generate &gt; Create), then
+                        enter the 64-digit key above. The agent cannot tap these screens; it records
+                        each step and the before/after device state.
+                      </p>
+                    </Notice>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 

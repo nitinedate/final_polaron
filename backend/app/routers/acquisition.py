@@ -110,6 +110,11 @@ class StartRequest(BaseModel):
     network_isolated: bool | None = None
     create_working_copy: bool = True
     cloud_mailboxes: list[dict[str, Any]] = Field(default_factory=list)
+    # Explicit on-device authorizations (Android only). The WhatsApp decrypt
+    # agent's backup creation ("whatsapp_generate_key_and_backup") WRITES to the
+    # evidence device and only runs when present here.
+    authorized_actions: list[str] = Field(default_factory=list)
+    whatsapp_64_digit_key: str = ""
 
 
 class ValidationRecordRequest(BaseModel):
@@ -335,6 +340,32 @@ def preview_device(
     )
 
 
+def _intake_whatsapp_keys(db, case_id: str) -> list[str]:
+    """Return any WhatsApp key hex already captured in Intake for this case.
+
+    Lets the decrypt agent try the existing key without re-reading the device.
+    Never returns raw key bytes to the client; this is server-internal only.
+    """
+    try:
+        from app.db.sql_helpers import fetchone
+
+        row = fetchone(
+            db,
+            """SELECT disk_source FROM jobs
+               WHERE (disk_source->>'case_id' = :cid OR id::text = :cid)
+               ORDER BY created_at DESC LIMIT 1""",
+            {"cid": str(case_id)},
+        )
+        ds = (row or {}).get("disk_source") or {}
+        if isinstance(ds, str):
+            import json as _json
+            ds = _json.loads(ds or "{}")
+        key = str((ds or {}).get("whatsapp_key_hex") or "").strip()
+        return [key] if key else []
+    except Exception:
+        return []
+
+
 @router.post("/start")
 def start_acquisition(
     payload: StartRequest,
@@ -377,6 +408,9 @@ def start_acquisition(
         network_isolated=payload.network_isolated,
         create_working_copy=payload.create_working_copy,
         cloud_mailboxes=list(payload.cloud_mailboxes or []),
+        authorized_actions=list(payload.authorized_actions or []),
+        whatsapp_64_digit_key=(payload.whatsapp_64_digit_key or ""),
+        intake_key_candidates=_intake_whatsapp_keys(db, payload.case_id),
     )
 
     try:

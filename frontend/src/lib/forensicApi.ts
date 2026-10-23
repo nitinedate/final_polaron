@@ -61,6 +61,7 @@ import type {
   AxiomArtifactsByGroupResponse,
   CaseTypeOption,
   UploadResult,
+  ArtifactParsedRecords,
   ArtifactPreview,
   ArtifactGraph,
   JobFileTree,
@@ -580,6 +581,7 @@ export const forensicApi = {
       drive?: string;
       browse_path?: string;
       skip_folder_list?: boolean;
+      processing_profile?: "standard" | "deep";
     }
   ) =>
     api.post<{
@@ -729,6 +731,14 @@ export const forensicApi = {
       notes: string[];
     }>(`/api/jobs/${jobId}/artifacts/evidence-coverage`, undefined, { timeoutMs: 60_000 }),
 
+  getArtifactTaxonomy: (jobId: string) =>
+    api.get<{
+      job_id: string;
+      source: string;
+      notice: string;
+      sections: { key: string; title: string; count?: number; items: { key: string; title: string; count?: number }[] }[];
+    }>(`/api/jobs/${jobId}/artifact-taxonomy`, undefined, { timeoutMs: 20_000 }),
+
   getArtifactCategories: (jobId: string) =>
     api.get<CategoryTree>(`/api/jobs/${jobId}/artifacts/categories`, undefined, { timeoutMs: 60_000 }),
 
@@ -769,6 +779,21 @@ export const forensicApi = {
   updateArtifact: (jobId: string, artifactId: string, payload: ArtifactUpdate) =>
     api.patch<Artifact>(`/api/jobs/${jobId}/artifacts/${artifactId}`, payload),
 
+  /** Page of parsed forensic records (registry, EVTX, Prefetch, LNK, Jump List…). */
+  getArtifactRecords: (jobId: string, artifactId: string, offset = 0, limit = 100) =>
+    api.get<ArtifactParsedRecords>(
+      `/api/jobs/${jobId}/artifacts/${artifactId}/records`,
+      { offset: String(offset), limit: String(limit) },
+      { timeoutMs: 60_000 }
+    ),
+
+  /** Persist the examiner's Standard / Deep choice on the job immediately. */
+  setProcessingProfile: (jobId: string, processing_profile: "standard" | "deep") =>
+    api.put<{ job_id: string; processing_profile: string; changed: boolean; locked: boolean }>(
+      `/api/jobs/${jobId}/processing-profile`,
+      { processing_profile }
+    ),
+
   getArtifactPreview: (jobId: string, artifactId: string) =>
     api.get<ArtifactPreview>(`/api/jobs/${jobId}/artifacts/${artifactId}/preview`, undefined, {
       timeoutMs: 120_000,
@@ -782,10 +807,12 @@ export const forensicApi = {
   fetchArtifactContent: async (
     jobId: string,
     artifactId: string,
-    opts?: { download?: boolean }
+    opts?: { download?: boolean; signal?: AbortSignal }
   ): Promise<Blob> => {
     const qs = opts?.download ? "?download=1" : "";
-    const res = await authFetch(`/api/jobs/${jobId}/artifacts/${artifactId}/content${qs}`);
+    const res = await authFetch(`/api/jobs/${jobId}/artifacts/${artifactId}/content${qs}`, {
+      signal: opts?.signal,
+    });
     return res.blob();
   },
 

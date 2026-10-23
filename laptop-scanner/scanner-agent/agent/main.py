@@ -270,6 +270,22 @@ def _result_payload(
         if unreachable:
             log.error("Job result marked failed: %s", unreachable)
             status, error, partial, partial_reason = "failed", unreachable, False, None
+        else:
+            # V1.10.2: IPs that answered nothing were not assessed; find out why
+            # (ping + which IPs answered) so the result does not read as clean.
+            try:
+                from agent.reachability_diagnosis import diagnose_silent_hosts
+
+                reach = diagnose_silent_hosts(evidence, lan_fp)
+                if reach:
+                    log.warning(
+                        "Not assessed (no port answered): %d IP(s) %s; answered: %s; ping replies: %d; "
+                        "gateway-only: %s",
+                        len(reach["silent_hosts"]), reach["silent_hosts"][:20], reach["answered_hosts"][:20],
+                        reach["ping_replies"], reach["gateway_only"],
+                    )
+            except Exception:
+                log.warning("Silent-host diagnosis failed; result kept as is", exc_info=True)
     raw_task = str(
         evidence.get("task_status") or details.get("gmp_status") or ""
     ).strip().lower()
@@ -296,6 +312,7 @@ def _result_payload(
         "plugin_error_count": int(evidence.get("plugin_error_count") or 0),
         "plugin_error_details": evidence.get("plugin_error_details") or [],
         "host_coverage": evidence.get("host_coverage") or {},
+        "reachability": evidence.get("reachability") or None,
         "service_coverage": evidence.get("service_coverage") or {},
         "policy_snapshots": evidence.get("policy_snapshots") or {},
         "degraded_hosts": evidence.get("degraded_hosts") or [],
@@ -968,6 +985,20 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
 
     _policy_req = job.get("scan_policy_request") if isinstance(job.get("scan_policy_request"), dict) else None
     job_profile = resolve_profile(_policy_req)
+    # V1.10.2: probe the job policy's own TCP ports (e.g. Polaron policy: 262), not
+    # the laptop's PORT_PROFILE default list, so "no port answered" means exactly that.
+    _job_probe_range: str | None = None
+    try:
+        if _policy_req:
+            from agent.service_policy import effective_policy as _effective_policy
+
+            _eff = _effective_policy(_policy_req)
+            if _eff.get("port_profile") != "full" and 0 < int(_eff.get("tcp_port_count") or 0) <= 4096:
+                _job_probe_range = ",".join(
+                    t for t in str(_eff.get("port_range") or "").split(",") if t.upper().startswith("T:")
+                ) or None
+    except Exception:
+        log.warning("Job %s: policy port list for the pre-probe could not be resolved", job_id, exc_info=True)
     # V1.9.3: each IP has its own clock, started when its OpenVAS task starts.
     # MAX_SCAN_RUNTIME_SEC used to be ONE clock for the whole job (job 3c4f45e0:
     # the 2nd IP got what the 1st IP left of 3600 s, and IPs still waiting got 0).
@@ -1094,7 +1125,10 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
             try:
                 from agent.port_discovery import discovery_plan
 
-                port_plan = discovery_plan(chunk)
+                port_plan = (
+                    discovery_plan(chunk, port_range=_job_probe_range) if _job_probe_range
+                    else discovery_plan(chunk)
+                )
                 # A fast probe only reports observations; it never changes GMP scope.
                 observed_port_range = str(port_plan.get("observed_port_range") or "").strip()
                 discovered_range = None

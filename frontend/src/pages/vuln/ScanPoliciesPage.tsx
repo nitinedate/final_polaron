@@ -15,14 +15,16 @@ const CATEGORY_LABEL: Record<string, string> = {
 
 /** V1.8.0: which scanner's built-in template a policy mirrors. */
 const VENDOR_LABEL: Record<string, string> = {
+  polaron: "Polaron",
   nexpose: "Nexpose / InsightVM",
   nessus: "Nessus",
   aetheris: "Aetheris",
 };
-const VENDOR_ORDER = ["nexpose", "nessus", "aetheris"];
+const VENDOR_ORDER = ["polaron", "nexpose", "nessus", "aetheris"];
 
 function templateEquivalent(t: ScanPolicyTemplate | undefined): string {
   if (!t) return "";
+  if (t.vendor === "polaron") return `Polaron default: Nessus ${t.nessus_template || "Basic Network Scan"} + report ports`;
   if (t.vendor === "nexpose" && t.nexpose_template) return `Nexpose: ${t.nexpose_template}`;
   if (t.nessus_template) return `Nessus: ${t.nessus_template}`;
   return "Aetheris threat check";
@@ -106,7 +108,7 @@ export function ScanPoliciesPage() {
     <div>
       <PageHeader
         title="Scan policies"
-        subtitle="Reusable scan settings. Built-in Nexpose and Nessus equivalents are ready to launch; create your own from a template to change ports, UDP, and credentials."
+        subtitle="Reusable scan settings. The Polaron policy (default) and the built-in Nexpose and Nessus equivalents are ready to launch; create your own from a template to change ports, UDP, and credentials."
         actions={
           canManage && (
             <Button variant="brand" onClick={() => setCreateOpen(true)} disabled={templates.length === 0 && !loading}>
@@ -150,6 +152,7 @@ export function ScanPoliciesPage() {
                           <Shield className="h-4 w-4 text-brand-600" />
                           <span className="font-semibold text-ink-800">{p.name}</span>
                           {p.is_builtin ? <Badge tone="neutral">Built-in</Badge> : null}
+                          {p.is_default ? <Badge tone="green">Default</Badge> : null}
                         </div>
                       </td>
                       <td className="px-5 py-3">
@@ -224,7 +227,10 @@ function PolicyModal({
   const toast = useToast();
   const [loading, setLoading] = useState(false);
   const initial =
-    templates.find((t) => t.key === "nx_full_audit") || templates.find((t) => t.key === "basic_network") || templates[0];
+    templates.find((t) => t.is_default) ||
+    templates.find((t) => t.key === "polaron") ||
+    templates.find((t) => t.key === "basic_network") ||
+    templates[0];
   const [templateKey, setTemplateKey] = useState(initial?.key || "");
   const template = templates.find((t) => t.key === templateKey);
   const [name, setName] = useState(initial?.name || "");
@@ -421,7 +427,14 @@ function PolicyModal({
             </dl>
             <details className="mt-3">
               <summary className="cursor-pointer text-xs font-semibold text-brand-700">
-                How this differs from {template.vendor === "nexpose" ? "Nexpose" : template.vendor === "aetheris" ? "a vendor template" : "Nessus"}
+                How this differs from{" "}
+                {template.vendor === "nexpose"
+                  ? "Nexpose"
+                  : template.vendor === "aetheris"
+                    ? "a vendor template"
+                    : template.vendor === "polaron"
+                      ? "Nessus Basic Network Scan"
+                      : "Nessus"}
               </summary>
               {template.reference ? <p className="mt-1 text-xs text-ink-500">Reference: {template.reference}</p> : null}
               <p className="mt-1 text-xs text-ink-600">{template.deviations}</p>

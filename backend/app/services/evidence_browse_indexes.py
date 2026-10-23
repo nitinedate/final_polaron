@@ -76,6 +76,30 @@ _BROWSE_INDEX_SQL = (
     CREATE INDEX IF NOT EXISTS ix_job_artifacts_job_ext_id
         ON job_artifacts (job_id, lower(coalesce(extension,'')), id)
     """,
+    # Category / subcategory file lists filter and sort by extension + path.
+    """
+    CREATE INDEX IF NOT EXISTS ix_job_artifacts_job_ext_path
+        ON job_artifacts (job_id, lower(coalesce(extension,'')), file_path)
+    """,
+    # EML(X) and other RFC822 rows that have no .eml extension.
+    """
+    CREATE INDEX IF NOT EXISTS ix_job_artifacts_rfc822
+        ON job_artifacts (job_id, file_path)
+        WHERE lower(coalesce(metadata->>'content_type','')) = 'message/rfc822'
+           OR lower(coalesce(metadata->>'resolved_content_type','')) = 'message/rfc822'
+           OR coalesce(metadata->>'email_mime_validated','') IN ('true','1','t')
+           OR lower(coalesce(metadata->>'detected_extension','')) IN ('.eml', '.emlx')
+    """,
+    # Examiner review flags. Avoids casting metadata to text on every refresh.
+    """
+    CREATE INDEX IF NOT EXISTS ix_job_artifacts_review_flags
+        ON job_artifacts (job_id, created_at DESC)
+        WHERE metadata->>'is_deleted' IN ('true','1','t')
+           OR metadata->>'extension_mismatch' IN ('true','1','t')
+           OR metadata->>'double_extension' IN ('true','1','t')
+           OR metadata->>'suspicious_activity' = 'true'
+           OR metadata->>'is_modified' IN ('true','1','t')
+    """,
     """
     CREATE INDEX IF NOT EXISTS ix_job_artifacts_job_ocr_status_id
         ON job_artifacts (job_id, ocr_status, id)
@@ -234,7 +258,15 @@ def ensure_evidence_browse_indexes(db: Session) -> None:
             db.rollback()
         except Exception:
             pass
-    for sql in (*_BROWSE_INDEX_SQL, *_family_page_index_sql(), *_PRIORITY_PAGE_INDEXES):
+    # Mobile records are created by the mobile ingestion subsystem. A disk-only
+    # tenant can legitimately have no such relation: do not attempt mobile DDL.
+    from app.db.sql_helpers import fetchone
+    try:
+        mobile_table_exists = bool((fetchone(db, "SELECT to_regclass('mobile_normalized_artifacts') AS t") or {}).get("t"))
+    except Exception:
+        mobile_table_exists = False
+    mobile_index_sql = _PRIORITY_PAGE_INDEXES if mobile_table_exists else ()
+    for sql in (*_BROWSE_INDEX_SQL, *_family_page_index_sql(), *mobile_index_sql):
         if index_already_present(db, sql):
             continue
         nested = None
