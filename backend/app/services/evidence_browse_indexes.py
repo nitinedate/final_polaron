@@ -313,6 +313,7 @@ def ensure_evidence_browse_indexes(db: Session) -> None:
 def ensure_v68_hot_indexes(db):
     for sql in [
       "CREATE INDEX IF NOT EXISTS ix_job_artifacts_job_parse_status_id ON job_artifacts(job_id,parse_status,id)",
+      "CREATE INDEX IF NOT EXISTS ix_job_artifacts_parsing_claim ON job_artifacts(job_id, updated_at, id) WHERE parse_status='parsing'",
       "CREATE INDEX IF NOT EXISTS ix_job_artifacts_job_stage_status_id ON job_artifacts(job_id,stage_status,id)",
       "CREATE INDEX IF NOT EXISTS ix_job_artifacts_rag_ready ON job_artifacts(job_id,id) WHERE parse_status='done'",
       "CREATE INDEX IF NOT EXISTS ix_job_artifacts_ocr_bucket_pending ON job_artifacts(job_id,id) WHERE ocr_status='pending' AND coalesce(metadata->>'ocr_quality_bucket','false')='true'",

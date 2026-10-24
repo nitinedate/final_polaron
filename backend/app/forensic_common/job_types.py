@@ -29,6 +29,10 @@ def is_mobile_job(db, job_id: str) -> bool:
     row = fetchone(db, "SELECT type, disk_source FROM jobs WHERE id=:jid", {"jid": job_id})
     if not row:
         return False
+    # A job opened as a disk stays a disk. Phone files copied onto that image
+    # are evidence; they do not move the job to Android or iOS.
+    if str(row.get("type") or "") in DISK_JOB_TYPES:
+        return False
     if str(row.get("type") or "") in MOBILE_JOB_TYPES:
         return True
     ds = _as_dict(row.get("disk_source"))

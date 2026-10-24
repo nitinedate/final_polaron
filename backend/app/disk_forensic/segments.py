@@ -6,7 +6,7 @@ import re
 
 # Host-disk images only — mobile packages (.pas/.ufd/.zip) belong in mobile_forensic.
 DISK_IMAGE_EXT_RE = re.compile(
-    r"\.(?:E\d{2}|e\d{2}|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx)$",
+    r"\.(?:E(?:\d{2}|(?!xe|wf)[A-Za-z]{2})|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx)$",
     re.IGNORECASE,
 )
 

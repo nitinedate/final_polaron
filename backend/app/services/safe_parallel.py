@@ -81,6 +81,37 @@ def reap_stale_sidecars(db, *, stale_seconds: int | None = None) -> int:
     return int((row or {}).get("c") or 0)
 
 
+def ensure_parse_shards(db, job_id: str, *, schema_name: str) -> list[str]:
+    """Start parse shards that were reaped or never left 'pending'.
+
+    A shard that dies mid-scan used to stay pending until the serial loop
+    finished its current multi-GB part and looked at the scheduler again.
+    """
+    from app.tasks import parse_shard_queue, parse_shard_sidecar_task
+
+    n = parse_shard_count()
+    if n <= 1:
+        return []
+    started: list[str] = []
+    for bucket in range(n):
+        name = f"parse_shard_{bucket}"
+        tid = claim_sidecar(
+            db,
+            job_id,
+            name,
+            details={"parallel_with": "parse", "bucket": bucket, "buckets": n},
+        )
+        if not tid:
+            continue
+        parse_shard_sidecar_task.apply_async(
+            args=(schema_name, job_id, tid, bucket, n),
+            queue=parse_shard_queue(),
+            task_id=tid,
+        )
+        started.append(name)
+    return started
+
+
 def finish_sidecar(db,job_id,sidecar,task_id,*,status='done',details=None):
     execute(db,"""UPDATE pipeline_sidecar_runs SET status=:st,heartbeat_at=NOW(),updated_at=NOW(),details=coalesce(details,'{}'::jsonb)||CAST(:d AS jsonb)
       WHERE job_id=:jid AND sidecar=:s AND task_id=:tid""",{'st':status,'jid':job_id,'s':sidecar,'tid':task_id,'d':json.dumps(details or {})});db.commit()

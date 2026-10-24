@@ -447,6 +447,66 @@ def reconcile_count_complete_stage(db, job_id: str, stage: dict) -> dict | None:
         WHERE id=:id""", {"id": stage["id"], "patch": details_patch})
     return {"completed": False, "summary": summary, **state}
 
+def _queue_pending_directory(db, job, *, schema_name: str) -> None:
+    """Start a saved directory that the first extract left behind.
+
+    Later stages may already be running. The directory extract uses its own
+    claim and does not restart those stages.
+    """
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return
+    try:
+        from app.services.next_evidence_directory import unfinished_directory_reason
+
+        reason = unfinished_directory_reason(db, job_id, job)
+        if not reason or "starts after" not in reason:
+            return
+        source = job.get("disk_source") or {}
+        if isinstance(source, str):
+            source = json.loads(source)
+        if not isinstance(source, dict):
+            source = {}
+        append = source.get("directory_append") if isinstance(source.get("directory_append"), dict) else {}
+        try:
+            heartbeat = float(append.get("heartbeat_at") or 0)
+        except (TypeError, ValueError):
+            heartbeat = 0.0
+        try:
+            queued_at = float(source.get("directory_append_queued_at") or 0)
+        except (TypeError, ValueError):
+            queued_at = 0.0
+        now = time.time()
+        if now - heartbeat < 180 or now - queued_at < 180:
+            return
+        execute(
+            db,
+            """UPDATE jobs
+                  SET disk_source = jsonb_set(
+                        COALESCE(disk_source, '{}'::jsonb),
+                        '{directory_append_queued_at}',
+                        CAST(:payload AS jsonb),
+                        true
+                      ),
+                      updated_at = NOW()
+                WHERE id = :id""",
+            {"id": job_id, "payload": json.dumps(now)},
+        )
+        from app.services.disk_build_log import write_disk_log
+
+        write_disk_log(db, job_id, reason, stage="extract")
+        db.commit()
+        from app.tasks import phase3_pipeline_task
+
+        phase3_pipeline_task.delay(schema_name, job_id)
+    except Exception:
+        log.exception("pending directory was not queued job=%s", job_id)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 def monitor_job(db, job_id, *, schema_name):
     from app.services.forensic_serial_pipeline import (STAGES, stage_rows, first_open_stage,
         pipeline_execution_lock, start_serial_pipeline, dispatch_current_stage, persist_snapshot)
@@ -464,6 +524,17 @@ def monitor_job(db, job_id, *, schema_name):
             except Exception: pass
     if not current_service_owns_job(db, job_id):
         return {"status": "held", "reason": "missing_or_other_product", "job_id": job_id}
+    _queue_pending_directory(db, job, schema_name=schema_name)
+    try:
+        from app.services.safe_parallel import ensure_parse_shards
+
+        ensure_parse_shards(db, job_id, schema_name=schema_name)
+    except Exception:
+        log.debug("parse shards were not requeued job=%s", job_id, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
     # An extraction barrier always outranks leftover serial stage rows. A
     # partially processed historical case must not evade acquisition watchdogs.
     if (str(job.get("status") or "") in {"processing", "building_disk", "extracting"}
@@ -779,6 +850,7 @@ def release_blocking_index_waits(db) -> int:
              AND state = 'active'
              AND wait_event_type = 'Lock'
              AND now() - query_start > interval '45 seconds'
+             AND query NOT ILIKE '%CONCURRENTLY%'
              AND (ltrim(query) ILIKE 'CREATE INDEX%'
                   OR ltrim(query) ILIKE 'ALTER TABLE%')""",
     )

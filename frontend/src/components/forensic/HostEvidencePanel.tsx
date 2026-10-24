@@ -288,7 +288,7 @@ function isAbsoluteEvidencePath(raw: string | null | undefined): boolean {
 }
 
 const SEGMENT_FILE_RE =
-  /\.(?:E\d{2}|e\d{2}|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx|pas(?:\d+)?|ufd|ufdt|ufdx|zip)$/i;
+  /\.(?:E(?:\d{2}|(?!xe|wf)[A-Za-z]{2})|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx|pas(?:\d+)?|ufd|ufdt|ufdx|zip)$/i;
 
 function isHostSegmentSource(sourceType: HostSourceType): boolean {
   return sourceType === "disk" || sourceType === "mobile";
@@ -355,7 +355,9 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     }
   }, [onEvidenceOriginChange, onSourceModeChange, onSourceTransportChanged]);
   const panelRef = useRef<HTMLDivElement>(null);
-  const registerPickedFolderRef = useRef<(folder: StagedEvidenceFolder) => Promise<void>>(async () => undefined);
+  const registerPickedFolderRef = useRef<
+    (folder: StagedEvidenceFolder, options?: { deferProcessing?: boolean }) => Promise<void>
+  >(async () => undefined);
   const browserRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(false);
   const [registering, setRegistering] = useState(false);
@@ -1100,27 +1102,34 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     async (folders: StagedEvidenceFolder[]) => {
       setBrowseDialogOpen(false);
       if (!folders.length) return;
-      // A job must receive the entire source list as one atomic registration.
-      // The current backend still owns a single disk_source per job; invoking
-      // registerPickedFolder repeatedly overwrites that ownership and may
-      // start competing extraction attempts. Never silently discard a source.
-      if (folders.length > 1) {
-        setBrowseDialogOpen(true);
-        toastRef.current.error(
-          "Multiple folders are selected, but this server does not yet support one-job multi-source extraction. " +
-          "Selection is retained; extraction has not started. Apply the backend multi-source coordinator first."
-        );
-        return;
+      // Register every directory first. Extraction starts only after the last
+      // one is registered, and each image is then opened on its own.
+      const multiple = folders.length > 1;
+      for (let index = 0; index < folders.length; index += 1) {
+        const folder = folders[index];
+        if (multiple) {
+          toastRef.current.info(
+            `Directory ${index + 1} of ${folders.length}: ${folder.name}. Only this directory is registered now.`
+          );
+        }
+        await registerPickedFolderRef.current(folder, { deferProcessing: multiple });
       }
-      // Only one source can be registered safely with the current backend.
-      // Call the latest registerPickedFolder (this callback is memoised once).
-      await registerPickedFolderRef.current(folders[0]);
+      if (multiple && autoProcess) {
+        toastRef.current.info(
+          "All directories are registered. Extracting the first directory, then the next, then combining the files."
+        );
+        await forensicApi.processJob(jobId);
+        onProcessingStarted?.();
+      }
     },
-    []
+    [autoProcess, jobId, onProcessingStarted]
   );
 
 
-  async function resolveServerLocalDiskSelection(folder: StagedEvidenceFolder): Promise<boolean> {
+  async function resolveServerLocalDiskSelection(
+    folder: StagedEvidenceFolder,
+    options?: { deferProcessing?: boolean },
+  ): Promise<boolean> {
     if (!isHostSegmentSource(sourceType)) return false;
     const segmentFiles = folder.files.filter((f) => isSegmentFilename(f.name));
     if (!segmentFiles.length) return false;
@@ -1160,7 +1169,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       toastRef.current.success(
         `Evidence matched by filename and exact size. Processing directly from the selected drive: ${resolved.path}`
       );
-      await ingestAtResolvedPath(resolved.path, true);
+      await ingestAtResolvedPath(resolved.path, true, options);
       return true;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Server disk lookup failed";
@@ -1169,7 +1178,10 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     }
   }
 
-  async function registerPickedFolder(folder: StagedEvidenceFolder) {
+  async function registerPickedFolder(
+    folder: StagedEvidenceFolder,
+    options?: { deferProcessing?: boolean },
+  ) {
     // Mode is read from processingProfileRef inside ingestAtResolvedPath.
     if (folder.intake === "office" && folder.hostPath) setManualPath(folder.hostPath);
     else if (folder.name) setManualPath(folder.name);
@@ -1179,7 +1191,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       // Disk-image picker can be running on the forensic server itself. Before
       // opening Download Agent, prove whether this exact filename+size set is
       // already present on a server-visible HDD/SSD/USB and process it in place.
-      if (isHostSegmentSource(sourceType) && await resolveServerLocalDiskSelection(folder)) return;
+      if (isHostSegmentSource(sourceType) && await resolveServerLocalDiskSelection(folder, options)) return;
 
       const hostName = typeof window !== "undefined" ? window.location.hostname.toLowerCase() : "";
       const consoleIsOnForensicServer = ["localhost", "127.0.0.1", "::1"].includes(hostName);
@@ -1246,7 +1258,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       setManualPath(resolvedPath);
       toastRef.current.info(`Registering in place from ${resolvedPath} — no copy.`);
       try {
-        await ingestAtResolvedPath(resolvedPath, true);
+        await ingestAtResolvedPath(resolvedPath, true, options);
       } catch {
         // ingestAtResolvedPath remounts and retries. Never copy E01s through the browser.
       }
@@ -1264,7 +1276,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       const apiResolved = await forensicApi.resolveHostFolder(jobId, retryPayload);
       if (apiResolved.path && isAbsoluteEvidencePath(apiResolved.path)) {
         setManualPath(apiResolved.path);
-        await ingestAtResolvedPath(apiResolved.path, true);
+        await ingestAtResolvedPath(apiResolved.path, true, options);
         return;
       }
     } catch {
@@ -1275,7 +1287,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       setManualPath(retryHost.path);
       toastRef.current.info(`Registering in place from ${retryHost.path} — no copy.`);
       try {
-        await ingestAtResolvedPath(retryHost.path, true);
+        await ingestAtResolvedPath(retryHost.path, true, options);
       } catch {
         /* already surfaced */
       }
@@ -1328,7 +1340,11 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
     },
   }), [openEvidenceFolderBrowse, manualPath, jobId]);
 
-  async function ingestAtResolvedPath(hostPath: string, allowMountRetry = true) {
+  async function ingestAtResolvedPath(
+    hostPath: string,
+    allowMountRetry = true,
+    options?: { deferProcessing?: boolean },
+  ) {
     const normalized = normalizeEvidencePath(hostPath);
     lastRegisteredPathRef.current = normalized;
     rememberEvidenceFolder(jobId, normalized);
@@ -1473,10 +1489,11 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
       });
       // Step 2: register segments (listing already written to extraction log).
       toastRef.current.info(`Registering segments in place from ${normalized} — no copy.`);
+      const shouldStartProcessing = autoProcess && !options?.deferProcessing;
       const ingest = await forensicApi.ingestHostPath(jobId, {
         path: normalized,
         source_type: sourceType,
-        auto_process: autoProcess,
+        auto_process: shouldStartProcessing,
         skip_folder_list: true,
         processing_profile: processingProfileRef.current,
       });
@@ -1486,10 +1503,20 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
         fileName: normalized,
         phase: "registering",
       });
+      if (options?.deferProcessing && ingest.accepted?.length) {
+        toast.success(
+          `Registered ${ingest.accepted.length} segment(s) from this directory. The next directory is extracted after this one.`
+        );
+        if (ingest.accepted?.length) {
+          setSelectionLabel(`${normalized} — ${ingest.accepted.length} segments`);
+        }
+        onRegistered?.();
+        return;
+      }
       if (ingest.processing_queued) {
         toast.success("Disk folder selected — pipeline started automatically");
         onProcessingStarted?.();
-      } else if (autoProcess && ingest.accepted?.length) {
+      } else if (shouldStartProcessing && ingest.accepted?.length) {
         try {
           await forensicApi.processJob(jobId);
           toast.success("Disk folder selected — pipeline started automatically");
@@ -1507,7 +1534,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
               requiredPath: normalized,
             });
             if (remounted) {
-              await ingestAtResolvedPath(normalized, false);
+              await ingestAtResolvedPath(normalized, false, options);
               return;
             }
           }
@@ -1538,7 +1565,7 @@ export const HostEvidencePanel = forwardRef<HostEvidencePanelHandle, HostEvidenc
           { light: true, requiredPath: normalized }
         );
         if (remounted) {
-          await ingestAtResolvedPath(normalized, false);
+          await ingestAtResolvedPath(normalized, false, options);
           return;
         }
       }

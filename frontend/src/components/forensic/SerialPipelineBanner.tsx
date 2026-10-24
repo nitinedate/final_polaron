@@ -73,6 +73,24 @@ export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
     <p className="mb-3 text-xs text-ink-700">{pipeline.complete ? "Processing completed — review evidence coverage" : paused ? "Processing paused"
       : pipeline.upgrade_required ? "Reprocess this case to apply the updated evidence stages"
       : active ? `${paused ? "Paused" : active.process_status || stateLabel(active.status)}: ${active.label}` : "Waiting for the next stage"}</p>
+    {(pipeline.evidence_directories?.length ?? 0) > 1 ? (
+      <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+        <p className="text-xs font-semibold text-ink-900">Evidence directories ({pipeline.evidence_directories?.length})</p>
+        <ul className="mt-2 space-y-1.5">
+          {pipeline.evidence_directories?.map((directory) => (
+            <li key={`${directory.index}-${directory.label}`} className="flex items-start justify-between gap-3 text-[11px]">
+              <span className="min-w-0">
+                <span className="font-semibold text-ink-900">{directory.index}. {directory.label}</span>
+                <span className="mt-0.5 block text-ink-600">{directory.detail} · {Number(directory.segments || 0).toLocaleString()} segment file(s)</span>
+              </span>
+              <span className={`shrink-0 font-semibold ${directory.state === "saved" ? "text-emerald-700" : directory.state === "extracting" ? "text-amber-700" : "text-ink-500"}`}>
+                {directory.state === "saved" ? "Saved" : directory.state === "extracting" ? "Extracting" : "Waiting"}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    ) : null}
     <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
       {pipeline.stages.map((stage, index) => <li key={stage.id}
         className={`min-w-0 rounded-lg border p-3 text-xs ${stage.status === "running" ? "border-amber-200 bg-amber-50"
@@ -102,7 +120,9 @@ export function SerialPipelineBanner({ pipeline, paused, compact, elapsed }: {
         {stage.id === "extract" && stage.details?.files_uploaded !== undefined && stage.status === "running" ? (
           <p className="mt-2 text-[11px] text-ink-700">
             {stage.details.enumerating ? `Filesystem inventory: ${Number(stage.details.files_found || 0).toLocaleString()} discovered (growing)`
-              : `${Number(stage.details.files_uploaded || 0).toLocaleString()} uploaded to MinIO${stage.total > 0 ? ` · ${Math.max(0, stage.total - Number(stage.details.files_uploaded || 0)).toLocaleString()} remaining` : ""}`}
+              : Number(stage.details.files_packed || 0) > Number(stage.details.files_uploaded || 0)
+                ? `${Number(stage.details.files_uploaded || 0).toLocaleString()} saved to storage · ${Math.max(0, Number(stage.details.files_packed || 0) - Number(stage.details.files_uploaded || 0)).toLocaleString()} packed in the open shard and saved when that shard finishes`
+                : `${Number(stage.details.files_uploaded || 0).toLocaleString()} uploaded to MinIO${stage.total > 0 ? ` · ${Math.max(0, stage.total - Number(stage.details.files_uploaded || 0)).toLocaleString()} remaining` : ""}`}
           </p>
         ) : null}
         {stage.status !== "done" && stage.status !== "skipped" && typeof stage.details?.progress_agent_reconciliation === "object" && stage.details?.progress_agent_reconciliation ? (

@@ -35,7 +35,7 @@ from app.services.mobile_segments import (
 
 # Host-disk images only — mobile packages (.pas/.ufd/.zip) use is_mobile_segment_filename.
 DISK_EXT_RE = re.compile(
-    r"\.(?:E\d{2}|e\d{2}|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx)$",
+    r"\.(?:E(?:\d{2}|(?!xe|wf)[A-Za-z]{2})|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx)$",
     re.I,
 )
 IOS_BACKUP_MARKERS = {"manifest.plist", "info.plist", "status.plist"}
@@ -2670,11 +2670,21 @@ def persist_job_evidence_folder(db: Session, job_id: str, folder_path: str) -> N
         display = str(mapped)
     row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:job_id", {"job_id": job_id}) or {}
     ds = load_job_disk_source(row)
-    if ds.get("evidence_folder") == display and ds.get("last_host_path") == display:
+    folders = [str(item).strip() for item in (ds.get("evidence_folders") or []) if str(item).strip()]
+    primary = str(ds.get("evidence_folder") or "").strip()
+    if primary and primary not in folders:
+        folders.insert(0, primary)
+    changed = display not in folders or ds.get("last_host_path") != display
+    if display not in folders:
+        folders.append(display)
+    ds["evidence_folders"] = folders
+    if not primary:
+        ds["evidence_folder"] = display
+        changed = True
+    ds["last_host_path"] = display
+    if not changed:
         _commit_register_progress(db)
         return
-    ds["evidence_folder"] = display
-    ds["last_host_path"] = display
     execute(
         db,
         "UPDATE jobs SET disk_source=CAST(:ds AS jsonb), updated_at=NOW() WHERE id=:job_id",
@@ -2741,19 +2751,33 @@ def reregister_job_evidence_from_saved_folder(
     *,
     source_type: str = "disk",
 ) -> dict:
-    """Re-register from the last saved folder when evidence_files is empty."""
-    folder = load_job_evidence_folder(db, job_id)
-    if not folder:
+    """Re-register every saved directory when evidence_files is empty."""
+    from app.services.mobile_os import load_job_disk_source
+
+    row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:job_id", {"job_id": job_id}) or {}
+    source = load_job_disk_source(row)
+    folders = [str(item).strip() for item in (source.get("evidence_folders") or []) if str(item).strip()]
+    primary = str(source.get("evidence_folder") or source.get("last_host_path") or "").strip()
+    if primary and primary not in folders:
+        folders.insert(0, primary)
+    if not folders:
+        folder = load_job_evidence_folder(db, job_id)
+        folders = [folder] if folder else []
+    if not folders:
         return {"accepted": [], "recovered": False, "path": ""}
-    result = register_segments(
-        db,
-        job_id,
-        path=folder,
-        source_type=source_type,
-        skip_folder_list=True,
-    )
+    accepted = []
+    result: dict = {}
+    for folder in folders:
+        result = register_segments(
+            db,
+            job_id,
+            path=folder,
+            source_type=source_type,
+            skip_folder_list=True,
+        )
+        accepted.extend(result.get("accepted") or [])
     _commit_register_progress(db)
-    return {**result, "recovered": True, "path": folder}
+    return {**result, "accepted": accepted, "recovered": True, "path": folders[0], "paths": folders}
 
 
 def list_folder_contents(
@@ -3002,6 +3026,37 @@ def register_segments(
 
     for idx, fp in enumerate(readable, start=1):
         try:
+            rel = str(fp.relative_to(folder)).replace("\\", "/")
+        except ValueError:
+            rel = fp.name
+        try:
+            host = str(fp.resolve())
+        except OSError as exc:
+            write_disk_log(
+                db,
+                job_id,
+                f"Could not read {fp.name}: {exc}",
+                stage="evidence_register",
+            )
+            skipped += 1
+            patch_segment_registration_orchestration(
+                db, job_id, processed=idx, total=total, current_name=fp.name, skipped=skipped
+            )
+            _commit_register_progress(db)
+            continue
+        existing = fetchone(
+            db,
+            "SELECT * FROM evidence_files WHERE job_id=:job_id AND host_path=:host_path",
+            {"job_id": job_id, "host_path": host},
+        )
+        if existing:
+            accepted.append(_evidence_row(existing))
+            patch_segment_registration_orchestration(
+                db, job_id, processed=idx, total=total, current_name=fp.name, skipped=skipped
+            )
+            _commit_register_progress(db)
+            continue
+        try:
             sha256, size = fingerprint_host_segment(fp)
         except OSError as exc:
             write_disk_log(
@@ -3018,23 +3073,6 @@ def register_segments(
             continue
         seg = _segment_info(fp.name)
         try:
-            rel = str(fp.relative_to(folder)).replace("\\", "/")
-        except ValueError:
-            rel = fp.name
-        host = str(fp.resolve())
-        try:
-            existing = fetchone(
-                db,
-                "SELECT * FROM evidence_files WHERE job_id=:job_id AND host_path=:host_path",
-                {"job_id": job_id, "host_path": host},
-            )
-            if existing:
-                accepted.append(_evidence_row(existing))
-                patch_segment_registration_orchestration(
-                    db, job_id, processed=idx, total=total, current_name=fp.name, skipped=skipped
-                )
-                _commit_register_progress(db)
-                continue
             row = fetchone(
                 db,
                 """INSERT INTO evidence_files(

@@ -148,29 +148,69 @@ def _exec_locked(db, sql: str, params: dict | None = None) -> None:
     retry_on_deadlock(db, lambda: execute(db, sql, params))
 
 
+_STALE_RECOVER_AT: dict[str, float] = {}
+
+
 def recover_stale_parsing_claims(db, job_id: str, *, stale_sec: int = _PARSE_CLAIM_STALE_SEC) -> int:
-    """Return crashed-worker 'parsing' rows to pending so drain can claim them again."""
+    """Return crashed-worker 'parsing' rows to pending so drain can claim them again.
+
+    One statement used to lock every stale row. On a large image that scan held
+    the artifact table for the better part of an hour, so live parse commits
+    waited and the stage looked stalled. Callers also hit this on every batch,
+    so a second scan inside two minutes is skipped.
+    """
+    now = time.monotonic()
+    last = _STALE_RECOVER_AT.get(job_id, 0.0)
+    if last and now - last < 120:
+        return 0
+    _STALE_RECOVER_AT[job_id] = now
+    limit = 400
+    total = 0
 
     def _go() -> list[dict]:
-        return fetchall(
-            db,
-            """WITH stale AS (
-                    SELECT id FROM job_artifacts
-                    WHERE job_id=:jid
-                      AND parse_status='parsing'
-                      AND updated_at < NOW() - make_interval(secs => :sec)
-                    ORDER BY id
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE job_artifacts AS ja
-                SET parse_status='pending', updated_at=NOW()
-                FROM stale
-                WHERE ja.id = stale.id
-                RETURNING ja.id""",
-            {"jid": job_id, "sec": max(60, int(stale_sec))},
-        )
+        try:
+            execute(db, "SET LOCAL statement_timeout = '15s'")
+        except Exception:
+            pass
+        try:
+            return fetchall(
+                db,
+                """WITH stale AS (
+                        SELECT id FROM job_artifacts
+                        WHERE job_id=:jid
+                          AND parse_status='parsing'
+                          AND updated_at < NOW() - make_interval(secs => :sec)
+                        ORDER BY id
+                        LIMIT :lim
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE job_artifacts AS ja
+                    SET parse_status='pending', updated_at=NOW()
+                    FROM stale
+                    WHERE ja.id = stale.id
+                    RETURNING ja.id""",
+                {"jid": job_id, "sec": max(60, int(stale_sec)), "lim": limit},
+            )
+        except Exception as exc:
+            text = str(exc).lower()
+            if "statement timeout" in text or "canceling statement" in text or "cancelled" in text:
+                log.warning("stale parse-claim recovery timed out job=%s", job_id)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                return []
+            raise
 
-    return len(retry_on_deadlock(db, _go))
+    while True:
+        rows = retry_on_deadlock(db, _go)
+        total += len(rows)
+        try:
+            db.commit()
+        except Exception:
+            pass
+        if len(rows) < limit:
+            return total
 
 
 def _claim_pending_rows(
@@ -201,27 +241,42 @@ def _claim_pending_rows(
 
 
 def _claim_artifacts_by_id(db, ids: list[Any]) -> list[dict]:
-    """Claim a preselected id set in id order so lock acquisition cannot cycle."""
+    """Claim a preselected id set in id order so lock acquisition cannot cycle.
+
+    A whole extracted part can be thousands of rows. Locking that set in one
+    statement blocks every other parse and OCR update until the scan finishes.
+    """
     if not ids:
         return []
-    return retry_on_deadlock(
-        db,
-        lambda: fetchall(
-            db,
-            """WITH candidates AS (
-                    SELECT id FROM job_artifacts
-                    WHERE id = ANY(:ids) AND parse_status='pending'
-                    ORDER BY id
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE job_artifacts AS ja
-                SET parse_status='parsing', updated_at=NOW()
-                FROM candidates c
-                WHERE ja.id = c.id
-                RETURNING ja.id, ja.file_path, ja.minio_uri, ja.size_bytes, ja.sha256, ja.metadata""",
-            {"ids": list(ids)},
-        ),
-    )
+    claimed: list[dict] = []
+    step = 200
+    ordered = list(ids)
+    for start in range(0, len(ordered), step):
+        chunk = ordered[start : start + step]
+
+        def _go(chunk: list[Any] = chunk) -> list[dict]:
+            return fetchall(
+                db,
+                """WITH candidates AS (
+                        SELECT id FROM job_artifacts
+                        WHERE id = ANY(:ids) AND parse_status='pending'
+                        ORDER BY id
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE job_artifacts AS ja
+                    SET parse_status='parsing', updated_at=NOW()
+                    FROM candidates c
+                    WHERE ja.id = c.id
+                    RETURNING ja.id, ja.file_path, ja.minio_uri, ja.size_bytes, ja.sha256, ja.metadata""",
+                {"ids": chunk},
+            )
+
+        claimed.extend(retry_on_deadlock(db, _go))
+        try:
+            db.commit()
+        except Exception:
+            pass
+    return claimed
 
 
 def _release_parsing_claims(db, ids: list[Any]) -> None:
@@ -1029,6 +1084,7 @@ def parse_job_artifacts_for_paths(
     parse_buckets: int | None = None,
     queue_prepared: bool = False,
     bucket_by_part: bool = False,
+    defer_part_buckets: int = 0,
 ) -> dict:
     settings = get_settings()
     limit = int(batch_limit if batch_limit is not None else getattr(settings, "parse_batch_limit", 5000) or 5000)
@@ -1041,6 +1097,10 @@ def parse_job_artifacts_for_paths(
             "coalesce(metadata->>'extracted_part_uri', file_path)" if bucket_by_part else "file_path"
         )
         bucket_filter = f" AND mod(abs(hashtext({bucket_key})), {int(parse_buckets)}) = {int(parse_bucket)}"
+    elif int(defer_part_buckets or 0) > 1:
+        # Parallel shards own every extracted part. The serial loop must not
+        # open those same multi-GB archives a second time.
+        bucket_filter = " AND coalesce(metadata->>'extracted_part_uri','') = ''"
     forensic_filter = (
         f" AND {forensic_parse_keep_sql()}"
         if forensic_only

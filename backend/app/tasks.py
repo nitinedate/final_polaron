@@ -186,6 +186,12 @@ def build_extracted_disk_sync(schema_name: str, job_id: str) -> dict:
 
 
 def phase3_pipeline_sync(schema_name: str, job_id: str) -> dict:
+    from app.services.next_evidence_directory import extract_pending_directories
+
+    with firm_session(schema_name) as db:
+        pending = extract_pending_directories(db, job_id, schema_name=schema_name)
+    if pending.get("status") in {"busy", "waiting"}:
+        return pending
     serial = _serial_handoff(schema_name, job_id, retry_failed=True)
     if serial is not None:
         return serial
@@ -3034,21 +3040,33 @@ def early_ocr_sidecar_task(schema_name: str, job_id: str, task_id: str | None = 
                     return {"status": "paused"}
                 quality_ocr_triage_task.delay(schema_name, job_id)
                 pending = int(count_pending_ocr(db, job_id) or 0)
+                done = int((fetchone(
+                    db,
+                    "SELECT count(*)::int AS c FROM job_artifacts WHERE job_id=:jid AND ocr_status='done'",
+                    {"jid": job_id},
+                ) or {}).get("c") or 0)
                 buckets = dispatch_ocr_agent(schema_name, job_id) if pending > 0 else 0
                 # Report early OCR as a parallel lane, not a second serial stage.
                 # Keep the authoritative OCR stage pending until its own claim.
-                if pending > 0:
+                # Counts are the real done/pending totals. Writing completed=0 here
+                # froze the card at the previous batch.
+                if pending > 0 or done > 0:
                     import json
                     from app.db.sql_helpers import execute
                     execute(db, """UPDATE pipeline_stage_runs SET
                         details=coalesce(details,'{}'::jsonb) || CAST(:d AS jsonb),
-                        updated_at=NOW() WHERE job_id=:jid AND stage='ocr'
+                        heartbeat_at=NOW(), updated_at=NOW()
+                        WHERE job_id=:jid AND stage='ocr'
                         AND status='pending'""", {
                         'jid': job_id,
-                        'd': json.dumps({'parallel_active': bool(buckets),
+                        'd': json.dumps({'parallel_active': pending > 0 and bool(buckets),
                                          'parallel_with': 'early_ocr',
-                                         'parallel_label': 'OCR running alongside parsing' if buckets else 'OCR awaiting worker',
-                                         'parallel_total': pending, 'parallel_completed': 0})
+                                         'parallel_label': (
+                                             f"OCR — {done:,} done, {pending:,} pending"
+                                             if pending else "OCR bucket currently empty"
+                                         ),
+                                         'parallel_total': done + pending,
+                                         'parallel_completed': done})
                     })
                     db.commit()
                 details = {"ocr_pending": pending, "ocr_buckets": int(buckets or 0)}

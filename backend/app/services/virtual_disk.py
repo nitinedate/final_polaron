@@ -26,7 +26,25 @@ log = logging.getLogger("virtual_disk")
 MOBILE_FOLDER_FORMATS = frozenset({"pas", "ufd", "ufdx", "zip", "mobile"})
 PORTABLE_ZIP_SUFFIXES = frozenset({".zip", ".pas", ".ufd"})
 
-SEGMENT_NAME_RE = re.compile(r"\.(?:e\d{2}|E\d{2}|\d{3})$", re.I)
+SEGMENT_NAME_RE = re.compile(r"\.(?:e(?:\d{2}|(?!xe|wf)[a-z]{2})|\d{3})$", re.I)
+
+
+def ewf_segment_number(name: str) -> int | None:
+    """EnCase segment number. E01–E99 are 1–99. EAA–EZZ continue at 100.
+
+    A 1TB image often uses EAA–EAM after E99. Leaving those out makes pyewf
+    report a missing segment near the end of the disk.
+    """
+    suffix = Path(name).suffix.lower()
+    if len(suffix) != 4 or not suffix.startswith(".e"):
+        return None
+    tail = suffix[2:]
+    if tail.isdigit():
+        number = int(tail)
+        return number or None
+    if tail.isalpha() and tail not in {"xe", "wf", "rr", "ml", "ps"}:
+        return 100 + (ord(tail[0]) - ord("a")) * 26 + (ord(tail[1]) - ord("a"))
+    return None
 
 ProgressCb = Callable[[str, dict[str, Any] | None], None]
 
@@ -55,6 +73,7 @@ class VirtualDisk:
     base_name: str = ""
     format: str = ""
     root_folder: str | None = None
+    members: list["VirtualDisk"] = field(default_factory=list)
     _img_info: object | None = field(default=None, repr=False)
     _fs_info: object | None = field(default=None, repr=False)
     # Reuse ZipFile handles — reopening a 130k-entry UFED dump for every member is ~100× slower.
@@ -95,6 +114,11 @@ class VirtualDisk:
             return self._sealed_roots.get(name)
 
     def close(self) -> None:
+        for member in list(self.members):
+            try:
+                member.close()
+            except Exception:
+                pass
         with self._zip_lock:
             for zf in self._zip_handles.values():
                 try:
@@ -275,9 +299,9 @@ def require_visible_evidence_paths(raw_paths: list[str], *, attempts: int = 4) -
 
 def _segment_sort_key(path: Path) -> tuple:
     name = path.name
-    m = re.match(r"^(?P<base>.+)\.(?P<part>e\d{2})$", name, re.I)
-    if m:
-        return (m.group("base").lower(), int(m.group("part")[1:]))
+    number = ewf_segment_number(name)
+    if number is not None:
+        return (Path(name).stem.lower(), number)
     m = re.match(r"^(?P<base>.+)\.(?P<part>\d{3})$", name)
     if m:
         return (m.group("base").lower(), int(m.group("part")))
@@ -654,8 +678,10 @@ def _open_img_info(paths: list[Path]):
     if _pyewf and _pytsk3 and any(_is_ewf_segment(p) for p in sorted_paths):
         try:
             filenames = [str(p) for p in sorted_paths]
+            log.info("Opening EWF image %s (%s segment file(s))", filenames[0], len(filenames))
             ewf_handle = _pyewf.handle()
             ewf_handle.open(filenames)
+            log.info("Opened EWF image %s", filenames[0])
             return EwfImgInfo(ewf_handle), "ewf"
         except Exception as e:
             log.warning("pyewf open failed, falling back to folder mode: %s", e)
@@ -668,6 +694,197 @@ def _open_img_info(paths: list[Path]):
             log.warning("pytsk3 raw open failed: %s", e)
             return None, "folder"
     return None, "folder"
+
+
+_IMAGE_SEGMENT_RE = re.compile(r"\.(?:e(?:\d{2}|(?!xe|wf)[a-z]{2})|\d{3}|dd|raw|vmdk|vhdx|aff4?)$", re.I)
+_IMAGE_BASE_RE = re.compile(r"^(?P<base>.*)\.(?:e(?:\d{2}|(?!xe|wf)[a-z]{2})|\d{3})$", re.I)
+
+
+def _image_group_key(path: Path) -> str:
+    match = _IMAGE_BASE_RE.match(path.name)
+    base = match.group("base") if match else path.stem
+    return f"{str(path.parent).lower()}|{base.lower()}"
+
+
+def _image_group_label(path: Path) -> str:
+    match = _IMAGE_BASE_RE.match(path.name)
+    base = match.group("base") if match else path.stem
+    label = re.sub(r'[<>:"/\\|?*]+', "_", base).strip(" .")
+    return label or "disk"
+
+
+def split_image_sets(
+    paths: list[Path],
+    hashes: list[str] | None = None,
+) -> list[tuple[list[Path], list[str]]] | None:
+    """Split a registration into separate disk images.
+
+    One image, with or without sidecar files, stays on the normal opener.
+    Directories that each contain their own .E01/.001 set are opened one by
+    one and then presented as a single disk.
+    """
+    hashes = list(hashes or [])
+    groups: dict[str, list[Path]] = {}
+    grouped_hashes: dict[str, list[str]] = {}
+    order: list[str] = []
+    for index, path in enumerate(paths):
+        if not _IMAGE_SEGMENT_RE.search(path.name):
+            continue
+        key = _image_group_key(path)
+        if key not in groups:
+            groups[key] = []
+            grouped_hashes[key] = []
+            order.append(key)
+        groups[key].append(path)
+        grouped_hashes[key].append(hashes[index] if index < len(hashes) else "")
+    if len(order) <= 1:
+        return None
+    return [(groups[key], grouped_hashes[key]) for key in order]
+
+
+def open_compound_disk(
+    job_id: str,
+    groups: list[tuple[list[Path], list[str]]],
+    *,
+    all_paths: list[str],
+    all_hashes: list[str],
+) -> VirtualDisk:
+    used: dict[str, int] = {}
+    members: list[VirtualDisk] = []
+    labels: list[str] = []
+    for group_paths, group_hashes in groups:
+        raw = _image_group_label(group_paths[0])
+        used[raw] = used.get(raw, 0) + 1
+        label = raw if used[raw] == 1 else f"{raw}_{used[raw]}"
+        labels.append(label)
+        member = open_virtual_disk_from_paths(
+            job_id,
+            [str(path) for path in group_paths],
+            hashes=group_hashes,
+            base_name=label,
+            combine_image_sets=False,
+        )
+        member.base_name = label
+        members.append(member)
+    title = labels[0] if len(labels) == 1 else f"{labels[0]}+{len(labels) - 1}"
+    return VirtualDisk(
+        job_id=job_id,
+        mode="compound",
+        segment_paths=list(all_paths),
+        segment_hashes=list(all_hashes),
+        base_name=title,
+        format="multi",
+        members=members,
+    )
+
+
+def _evidence_host_path(row: dict) -> str:
+    host = str(row.get("host_path") or "").strip()
+    if host:
+        return host
+    uri = str(row.get("storage_uri") or "")
+    if uri.startswith("file://"):
+        return uri[7:]
+    return ""
+
+
+def list_image_directories(files: list[dict]) -> list[dict]:
+    """Image segments grouped by parent directory, in first-seen order.
+
+    A single directory is included. Callers that must keep the one-image
+    opener use ``evidence_directory_groups``, which returns None in that case.
+    """
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for row in files:
+        host = _evidence_host_path(row)
+        if not host:
+            continue
+        path = Path(host)
+        if not _IMAGE_SEGMENT_RE.search(path.name):
+            continue
+        parent = str(path.parent)
+        key = parent.lower()
+        if key not in groups:
+            groups[key] = {
+                "directory": parent,
+                "label": path.parent.name or _image_group_label(path),
+                "paths": [],
+                "hashes": [],
+            }
+            order.append(key)
+        groups[key]["paths"].append(host)
+        groups[key]["hashes"].append(str(row.get("sha256") or ""))
+    return [groups[key] for key in order]
+
+
+def evidence_directory_groups(files: list[dict]) -> list[dict] | None:
+    """Group image segments by parent directory.
+
+    One directory stays on the normal single-image opener. Two or more
+    directories are separate images and must be extracted one after another.
+    """
+    groups = list_image_directories(files)
+    if len(groups) <= 1:
+        return None
+    return groups
+
+
+def open_directory_images(job_id: str, groups: list[dict]) -> VirtualDisk:
+    """Mount each evidence directory on its own, in order.
+
+    A directory whose image cannot be mounted is not walked as a folder of
+    segment files. Callers combine the mounted images, then filter once.
+    """
+    used: dict[str, int] = {}
+    members: list[VirtualDisk] = []
+    warnings: list[str] = []
+    all_paths: list[str] = []
+    all_hashes: list[str] = []
+    for group in groups:
+        path_objs = [Path(path) for path in group["paths"]]
+        hashes = list(group["hashes"])
+        subsets = split_image_sets(path_objs, hashes)
+        if subsets is None:
+            subsets = [(path_objs, hashes)]
+        for subset_paths, subset_hashes in subsets:
+            raw = _image_group_label(subset_paths[0])
+            used[raw] = used.get(raw, 0) + 1
+            label = raw if used[raw] == 1 else f"{raw}_{used[raw]}"
+            member = open_virtual_disk_from_paths(
+                job_id,
+                [str(path) for path in subset_paths],
+                hashes=subset_hashes,
+                base_name=label,
+                combine_image_sets=False,
+            )
+            mounted = member._fs_info is not None and member.mode in {"ewf", "raw"}
+            if not mounted:
+                warnings.append(
+                    f"Could not mount {label} ({len(subset_paths)} segment file(s) in "
+                    f"{group['directory']}). Its segment files were not used as extracted files."
+                )
+                member.close()
+                continue
+            member.base_name = label
+            members.append(member)
+            all_paths.extend(str(path) for path in subset_paths)
+            all_hashes.extend(subset_hashes)
+    if not members:
+        detail = " ".join(warnings) or "No evidence directory could be mounted."
+        raise ValueError(detail)
+    title = members[0].base_name if len(members) == 1 else f"{members[0].base_name}+{len(members) - 1}"
+    vd = VirtualDisk(
+        job_id=job_id,
+        mode="compound",
+        segment_paths=all_paths,
+        segment_hashes=all_hashes,
+        base_name=title,
+        format="multi",
+        members=members,
+    )
+    vd.mount_warnings = warnings  # type: ignore[attr-defined]
+    return vd
 
 
 def open_virtual_disk(
@@ -703,6 +920,21 @@ def open_virtual_disk(
     # Prefer resolved container paths for subsequent open/walk
     paths = [str(p) for p in path_objs]
     first = path_objs[0]
+
+    if all(p.is_file() for p in path_objs):
+        image_groups = split_image_sets(path_objs, hashes)
+        if image_groups is not None:
+            _emit(
+                on_progress,
+                f"Opening {len(image_groups)} disk image(s) one by one as one disk…",
+                {"disks": len(image_groups)},
+            )
+            return open_compound_disk(
+                job_id,
+                image_groups,
+                all_paths=paths,
+                all_hashes=hashes,
+            )
 
     if first.is_dir():
         _emit(on_progress, "Using folder-mode virtual disk (directory evidence)", {"mode": "folder"})
@@ -780,6 +1012,7 @@ def open_virtual_disk_from_paths(
     base_name: str = "",
     fmt: str = "",
     root_folder: str | None = None,
+    combine_image_sets: bool = True,
 ) -> VirtualDisk:
     """V45: open a VirtualDisk from an already-resolved plan — no DB session.
 
@@ -802,6 +1035,15 @@ def open_virtual_disk_from_paths(
             format=fmt or "backup",
             root_folder=root_folder or str(first),
         )
+    if combine_image_sets:
+        image_groups = split_image_sets(path_objs, hashes)
+        if image_groups is not None:
+            return open_compound_disk(
+                job_id,
+                image_groups,
+                all_paths=resolved,
+                all_hashes=hashes,
+            )
     vd = VirtualDisk(
         job_id=job_id,
         mode="folder",
@@ -960,6 +1202,28 @@ def enumerate_all_files(
     parent process may retry with the alternate path-based strategy; never
     switch strategies inside a potentially blocked native call.
     """
+    if vd.mode == "compound" and vd.members:
+        nodes: list[dict] = []
+        for member in vd.members:
+            part = enumerate_all_files(
+                member,
+                on_progress=on_progress,
+                progress_every=progress_every,
+                progress_interval_sec=progress_interval_sec,
+                root_open_strategy=root_open_strategy,
+            )
+            label = member.base_name or "disk"
+            for node in part:
+                copied = dict(node)
+                rel = str(copied.get("path") or "").replace("\\", "/").lstrip("/")
+                copied["path"] = f"{label}/{rel}" if rel else label
+                nodes.append(copied)
+        _emit(
+            on_progress,
+            f"Combined {len(vd.members)} disk image(s) — {len(nodes):,} files",
+            {"files_found": len(nodes), "disks": len(vd.members)},
+        )
+        return nodes
     # EWF/RAW directory enumeration can be parallelized safely only with
     # independent handles. The isolated watchdog still owns termination.
     if (vd._fs_info and _pytsk3 and vd.mode in ("ewf", "raw")
@@ -1533,6 +1797,20 @@ def iter_file_from_disk(
 ) -> Iterator[bytes]:
     """Yield file bytes in chunks (UFED zip members, folders, or disk FS)."""
     rel_path = rel_path.replace("\\", "/").lstrip("/")
+    if vd.mode == "compound" and vd.members:
+        prefix, sep, rest = rel_path.partition("/")
+        if sep:
+            for member in vd.members:
+                if member.base_name == prefix:
+                    yield from iter_file_from_disk(
+                        member,
+                        rest,
+                        inode=inode,
+                        max_bytes=max_bytes,
+                        chunk_size=chunk_size,
+                    )
+                    return
+        return
     remaining = max_bytes
 
     def _bounded_read(handle, n: int) -> bytes:

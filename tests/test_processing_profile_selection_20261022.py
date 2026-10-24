@@ -26,7 +26,8 @@ def test_ingest_payloads_read_profile_from_ref_not_closure():
 def test_browse_dialog_calls_latest_register_function():
     body = PANEL[PANEL.index("const confirmStagedBrowseFolders = useCallback("):]
     body = body[: body.index("\n  );") + 4]
-    assert "registerPickedFolderRef.current(folders[0])" in body
+    assert "registerPickedFolderRef.current(folder, { deferProcessing: !last })" in body
+    assert "does not yet support one-job multi-source extraction" not in body
     assert "await registerPickedFolder(folders[0])" not in body
     assert "registerPickedFolderRef.current = registerPickedFolder;" in PANEL
 

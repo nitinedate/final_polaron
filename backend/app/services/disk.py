@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.db.sql_helpers import execute, fetchall, fetchone
 from app.services.disk_build_log import disk_log_heartbeat, make_session_progress, write_disk_log
 from app.services.mobile_segments import mobile_segment_key
-from app.services.virtual_disk import open_virtual_disk
+from app.services.virtual_disk import evidence_directory_groups, open_directory_images, open_virtual_disk
 
 log = logging.getLogger("disk")
 
@@ -36,11 +36,13 @@ def segment_key(name: str) -> tuple[str, int, str] | None:
         if ext.startswith(".e") and len(ext) == 4:
             return f"{base}.ewf", part, "ewf"
         return f"{base}{ext}", part, ext.lstrip(".")
-    ewf = re.match(r"^(?P<base>.+)\.(?P<seg>E\d{2})$", name, re.I)
+    ewf = re.match(r"^(?P<base>.+)\.(?P<seg>E(?:\d{2}|(?!xe|wf)[A-Z]{2}))$", name, re.I)
     if ewf:
-        part = int(ewf.group("seg")[1:])
-        base = ewf.group("base")
-        return f"{base}.ewf", part, "ewf"
+        from app.services.virtual_disk import ewf_segment_number
+
+        part = ewf_segment_number(name)
+        if part:
+            return f"{ewf.group('base')}.ewf", part, "ewf"
     pas_suffix = re.match(r"^(?P<base>.+)\.pas(?P<part>\d+)$", name, re.I)
     if pas_suffix:
         base = pas_suffix.group("base")
@@ -120,6 +122,106 @@ def segment_readiness(files: list[dict]) -> dict:
         "gaps": gaps,
         "message": None if ready else (gaps[0]["message"] if gaps else "No disk image files registered"),
     }
+
+
+def _evidence_parent(row: dict) -> str:
+    host = str(row.get("host_path") or "").strip()
+    if not host:
+        uri = str(row.get("storage_uri") or "")
+        if uri.startswith("file://"):
+            host = uri[7:]
+    if not host:
+        return ""
+    return str(Path(host).parent)
+
+
+def _path_is_under(parent: str, folder: str) -> bool:
+    parent_key = parent.lower().rstrip("\\/")
+    folder_key = folder.lower().rstrip("\\/")
+    if not parent_key or not folder_key:
+        return False
+    return parent_key == folder_key or parent_key.startswith(folder_key + "/") or parent_key.startswith(folder_key + "\\")
+
+
+def _ensure_saved_directories_registered(db: Session, job_id: str, files: list[dict]) -> list[dict]:
+    """Register every saved evidence directory before a multi-directory extract.
+
+    A second directory selected in the same job must be present as its own
+    segment set. Directories that already have every segment file are left
+    untouched.
+    """
+    from app.services.host_evidence import _folder_segments, register_segments, resolve_host_path
+    from app.services.mobile_os import load_job_disk_source
+
+    row = fetchone(db, "SELECT disk_source FROM jobs WHERE id=:job_id", {"job_id": job_id}) or {}
+    source = load_job_disk_source(row)
+    folders = [str(item).strip() for item in (source.get("evidence_folders") or []) if str(item).strip()]
+    if not folders:
+        seen: list[str] = []
+        for item in files:
+            parent = _evidence_parent(item)
+            if parent and parent not in seen:
+                seen.append(parent)
+        folders = seen
+    if not folders:
+        return files
+    added = False
+    for folder in folders:
+        try:
+            resolved = resolve_host_path(folder, strict=True, job_id=job_id)
+        except Exception as exc:
+            write_disk_log(
+                db,
+                job_id,
+                f"Could not resolve evidence directory {folder}: {exc}",
+                stage="evidence_register",
+                level="warning",
+            )
+            db.commit()
+            continue
+        resolved_text = str(resolved)
+        registered_here = [item for item in files if _path_is_under(_evidence_parent(item), resolved_text)]
+        try:
+            on_disk = _folder_segments(resolved)
+        except OSError:
+            on_disk = []
+        if on_disk and len(registered_here) >= len(on_disk):
+            continue
+        if not on_disk and registered_here:
+            continue
+        write_disk_log(
+            db,
+            job_id,
+            f"Registering segments from evidence directory {folder}",
+            stage="evidence_register",
+        )
+        db.commit()
+        try:
+            register_segments(
+                db,
+                job_id,
+                path=folder,
+                source_type=str(source.get("source_type") or "disk"),
+                skip_folder_list=True,
+            )
+        except ValueError as exc:
+            write_disk_log(
+                db,
+                job_id,
+                f"Could not register {folder}: {exc}",
+                stage="evidence_register",
+                level="warning",
+            )
+            db.commit()
+            continue
+        added = True
+    if not added:
+        return files
+    return fetchall(
+        db,
+        "SELECT * FROM evidence_files WHERE job_id=:job_id ORDER BY original_name",
+        {"job_id": job_id},
+    )
 
 
 def build_extracted_image(db: Session, job_id: str, *, schema_name: str) -> dict:
@@ -233,6 +335,7 @@ def _build_extracted_image_locked(db: Session, job_id: str, *, schema_name: str)
         return {"status": "already_complete"}
 
     files = fetchall(db, "SELECT * FROM evidence_files WHERE job_id=:job_id ORDER BY original_name", {"job_id": job_id})
+    files = _ensure_saved_directories_registered(db, job_id, files)
     readiness = segment_readiness(files)
     if not readiness["ready"]:
         try:
@@ -342,7 +445,51 @@ def _build_extracted_image_locked(db: Session, job_id: str, *, schema_name: str)
                 stage="virtual_disk",
                 interval_sec=15.0,
             ):
-                vd = open_virtual_disk(db, job_id, on_progress=on_progress)
+                from app.services.next_evidence_directory import restrict_to_next_directory
+                from app.services.virtual_disk import _evidence_host_path, open_virtual_disk_from_paths
+
+                files, directory_note = restrict_to_next_directory(files)
+                if directory_note:
+                    write_disk_log(db, job_id, directory_note, stage="virtual_disk")
+                    db.commit()
+                    paths = []
+                    hashes = []
+                    for row in files:
+                        host = _evidence_host_path(row)
+                        if host:
+                            paths.append(host)
+                            hashes.append(str(row.get("sha256") or ""))
+                    label = Path(paths[0]).parent.name if paths else "evidence"
+                    vd = open_virtual_disk_from_paths(
+                        job_id,
+                        paths,
+                        hashes=hashes,
+                        base_name=label,
+                        combine_image_sets=False,
+                    )
+                    if vd._fs_info is None or vd.mode not in {"ewf", "raw"}:
+                        vd.close()
+                        raise ValueError(
+                            f"Could not mount {label}. Its segment files were not used as extracted files."
+                        )
+                else:
+                    directory_groups = evidence_directory_groups(files)
+                    if directory_groups:
+                        write_disk_log(
+                            db,
+                            job_id,
+                            f"Opening {len(directory_groups)} evidence directories one at a time. "
+                            "Each image is extracted, the file lists are combined, then the filter runs once.",
+                            stage="virtual_disk",
+                            metadata={"directories": [group["directory"] for group in directory_groups]},
+                        )
+                        db.commit()
+                        vd = open_directory_images(job_id, directory_groups)
+                        for warning in getattr(vd, "mount_warnings", []) or []:
+                            write_disk_log(db, job_id, warning, stage="virtual_disk", level="error")
+                        db.commit()
+                    else:
+                        vd = open_virtual_disk(db, job_id, on_progress=on_progress)
             write_disk_log(
                 db,
                 job_id,

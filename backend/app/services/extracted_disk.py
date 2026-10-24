@@ -1347,6 +1347,18 @@ def _on_shard_complete(
     return checkpoint
 
 
+def _enumerate_mounted_image(vd: VirtualDisk, *, on_progress, schema_name: str) -> list[dict]:
+    """Read one mounted image the same way a single-directory extract does."""
+    if vd._fs_info is not None and vd.mode in {"ewf", "raw"} and (
+        os.environ.get("EXTRACT_TSK_ISOLATED_WALK", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        from app.services.tsk_walk_isolated import enumerate_tsk_isolated
+
+        return enumerate_tsk_isolated(vd, on_progress=on_progress, schema_name=schema_name)
+    return enumerate_all_files(vd, on_progress=on_progress)
+
+
 def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_name: str) -> dict:
     settings = get_settings()
     existing_cp = load_extraction_checkpoint(db, job_id)
@@ -1565,7 +1577,96 @@ def build_extracted_disk_to_minio(db, job_id: str, vd: VirtualDisk, *, schema_na
             stage="extract",
             interval_sec=15.0,
         ):
-            if vd._fs_info is not None and vd.mode in {"ewf", "raw"} and (
+            if vd.mode == "compound" and vd.members:
+                # One directory at a time. The other directory is not open and
+                # its segment files are not in this image handle. After every
+                # directory is extracted, the file lists are combined and the
+                # filter below runs once, before the next pipeline stage.
+                from app.services.virtual_disk import open_directory_images, open_virtual_disk_from_paths
+
+                plans = [
+                    (
+                        member.base_name or f"disk{index}",
+                        list(member.segment_paths),
+                        list(member.segment_hashes),
+                    )
+                    for index, member in enumerate(vd.members, start=1)
+                ]
+                vd.close()
+                all_nodes = []
+                directory_count = len(plans)
+                for index, (label, paths, hashes) in enumerate(plans, start=1):
+                    write_disk_log(
+                        db,
+                        job_id,
+                        f"Directory {index} of {directory_count}: extracting only {label} "
+                        f"({len(paths)} segment file(s)). Other directories are not open.",
+                        stage="extract",
+                        metadata={"directory_index": index, "directories": directory_count, "image": label},
+                    )
+                    db.commit()
+                    one = open_virtual_disk_from_paths(
+                        job_id,
+                        paths,
+                        hashes=hashes,
+                        base_name=label,
+                        combine_image_sets=False,
+                    )
+                    if one._fs_info is None or one.mode not in {"ewf", "raw"}:
+                        one.close()
+                        write_disk_log(
+                            db,
+                            job_id,
+                            f"Could not mount {label}. Its segment files were not used as extracted files.",
+                            stage="extract",
+                            level="error",
+                        )
+                        db.commit()
+                        continue
+                    try:
+                        part = _enumerate_mounted_image(
+                            one, on_progress=on_enum_progress, schema_name=schema_name,
+                        )
+                    except JobStopRequested:
+                        one.close()
+                        mark_job_paused(db, job_id, message="Stopped during TSK filesystem inventory; safe to resume")
+                        write_disk_log(
+                            db, job_id,
+                            "Examiner stopped read-only TSK inventory; no partial file plan committed",
+                            stage="extract", level="info",
+                        )
+                        db.commit()
+                        return {"status": "paused", "checkpoint": existing_cp or {}}
+                    one.close()
+                    for node in part:
+                        copied = dict(node)
+                        rel = str(copied.get("path") or "").replace("\\", "/").lstrip("/")
+                        copied["path"] = f"{label}/{rel}" if rel else label
+                        all_nodes.append(copied)
+                    write_disk_log(
+                        db,
+                        job_id,
+                        f"Directory {index} of {directory_count} extracted — {len(part):,} files from {label}",
+                        stage="extract",
+                        metadata={"directory_index": index, "files_enumerated": len(part), "image": label},
+                    )
+                    db.commit()
+                write_disk_log(
+                    db,
+                    job_id,
+                    f"Combined {directory_count} directories — {len(all_nodes):,} files. Applying the filter once.",
+                    stage="extract",
+                    metadata={"directories": directory_count, "files_enumerated": len(all_nodes)},
+                )
+                db.commit()
+                vd = open_directory_images(
+                    job_id,
+                    [
+                        {"directory": label, "label": label, "paths": paths, "hashes": hashes}
+                        for label, paths, hashes in plans
+                    ],
+                )
+            elif vd._fs_info is not None and vd.mode in {"ewf", "raw"} and (
                 os.environ.get("EXTRACT_TSK_ISOLATED_WALK", "true").strip().lower()
                 in {"1", "true", "yes", "on"}
             ):

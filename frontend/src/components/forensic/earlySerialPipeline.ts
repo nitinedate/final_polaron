@@ -12,8 +12,10 @@ export function earlySerialPipeline(job: Job): Serial {
   const pp = job.pipeline_progress;
   const agents = pp?.orchestration?.agents || {};
   const extracting = extractStillRunning(job);
-  const extractionCommitted = Boolean(job.extracted_disk_uri);
+  const nextDirectory = Boolean(pp?.extraction_activity?.next_directory);
+  const extractionCommitted = Boolean(job.extracted_disk_uri) && !nextDirectory;
   const uploaded = Math.max(0, Number(pp?.extraction_activity?.files_uploaded ?? job.files_extracted ?? 0));
+  const packed = Math.max(uploaded, Number(pp?.extraction_activity?.files_packed ?? pp?.extraction_activity?.files_extracted ?? job.files_extracted ?? uploaded));
   const total = Math.max(0, Number(job.files_total ?? pp?.extraction_activity?.files_total ?? 0));
   const found = Math.max(0, Number(pp?.extraction_activity?.files_found ?? 0));
   const enumeration = pp?.extraction_activity?.subphase === "enumerating";
@@ -52,6 +54,7 @@ export function earlySerialPipeline(job: Job): Serial {
       details.extraction_label = pp?.extraction_activity?.label || "";
       details.files_found = found;
       details.files_uploaded = uploaded;
+      details.files_packed = packed;
       details.files_remaining = total > 0 ? Math.max(total - uploaded, 0) : null;
       details.enumerating = enumeration;
       details.bytes_remaining = pp?.extraction_activity?.bytes_remaining ?? null;

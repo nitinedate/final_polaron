@@ -330,6 +330,7 @@ def _parse(db, job_id, schema_name):
     db.commit()
 
     index_map = _index_map(db, job_id)
+    index_stamp = ""
     total = int(
         fetchone(
             db,
@@ -350,6 +351,15 @@ def _parse(db, job_id, schema_name):
             {"jid": job_id},
         )
         total = int(row["total"])
+        stamp_row = fetchone(
+            db,
+            "SELECT COALESCE(disk_source->>'index_uri','') AS index_uri FROM jobs WHERE id=:jid",
+            {"jid": job_id},
+        ) or {}
+        stamp = str(stamp_row.get("index_uri") or "")
+        if stamp and stamp != index_stamp:
+            index_map = _index_map(db, job_id)
+            index_stamp = stamp
         report_progress(
             db,
             job_id,
@@ -386,6 +396,14 @@ def _parse(db, job_id, schema_name):
 
         if pipeline_should_stop(db, job_id):
             raise StageWaiting("Parsing paused by user")
+        shard_n = 0
+        try:
+            from app.services.safe_parallel import parse_shard_count
+
+            shard_n = parse_shard_count()
+        except Exception:
+            shard_n = 0
+        leave_parts = shard_n > 1 and _parse_shards_active(db, job_id)
         batch = parse_job_artifacts_for_paths(
             db,
             job_id,
@@ -395,6 +413,7 @@ def _parse(db, job_id, schema_name):
             update_status=False,
             forensic_only=True,
             queue_prepared=True,
+            defer_part_buckets=shard_n if leave_parts else 0,
         ) or {}
         db.commit()
         if not int(batch.get("parsed") or 0) and not int(batch.get("skipped") or 0):

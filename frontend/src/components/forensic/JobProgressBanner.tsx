@@ -81,6 +81,20 @@ export function JobProgressBanner({
         <div className="min-w-0 flex-1">
           <p className="text-sm font-semibold text-ink-900">{view.title}</p>
           <p className="mt-1 text-sm leading-snug text-ink-700">{view.message}</p>
+          {(job.pipeline_progress?.serial_pipeline?.evidence_directories?.length ?? 0) > 1 ? (
+            <ul className="mt-2 space-y-1">
+              {job.pipeline_progress?.serial_pipeline?.evidence_directories?.map((directory) => (
+                <li key={`${directory.index}-${directory.label}`} className="text-xs text-ink-800">
+                  <span className="font-semibold">Directory {directory.index} of {directory.total}:</span>{" "}
+                  {directory.label}
+                  {" · "}
+                  {directory.state === "saved" ? "Saved" : directory.state === "extracting" ? "Extracting" : "Waiting"}
+                  {" · "}
+                  {Number(directory.segments || 0).toLocaleString()} segment file(s)
+                </li>
+              ))}
+            </ul>
+          ) : null}
           {view.pathProgress && view.message !== view.pathProgress ? (
             <p className="mt-1.5 text-sm font-semibold tabular-nums text-brand-800">{view.pathProgress}</p>
           ) : null}

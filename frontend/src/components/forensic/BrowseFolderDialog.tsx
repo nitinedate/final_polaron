@@ -14,7 +14,7 @@ const HIDDEN_DIR_RE = /^(?:\$recycle\.bin|system volume information|recovery|con
 const EMPTY_RECOMMENDED: string[] = [];
 
 const SEGMENT_FILE_RE =
-  /\.(?:E\d{2}|e\d{2}|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx|pas(?:\d+)?|ufd|ufdt|ufdx|zip)$/i;
+  /\.(?:E(?:\d{2}|(?!xe|wf)[A-Za-z]{2})|001|002|003|004|005|006|007|008|009|dd|raw|aff|aff4|vmdk|vhdx|pas(?:\d+)?|ufd|ufdt|ufdx|zip)$/i;
 
 const FILE_ROW_VISIBLE = 5;
 const FILE_LIST_MAX_H = "11.25rem";

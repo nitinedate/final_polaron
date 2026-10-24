@@ -190,7 +190,99 @@ class _ObjectStream:
         self.close()
 
 
-def open_object_stream(storage_uri: str) -> _ObjectStream | None:
+class _ResumableObjectStream:
+    """S3 body that continues from the last byte after a dropped connection.
+
+    A multi-GB extract part was being read again from byte 0 every time MinIO
+    reset the socket, so parse and OCR never moved past the first few megabytes.
+    """
+
+    def __init__(self, client, bucket: str, key: str):
+        self._client = client
+        self._bucket = bucket
+        self._key = key
+        self._size = 0
+        try:
+            stat = client.stat_object(bucket, key)
+            self._size = int(getattr(stat, "size", 0) or 0)
+        except Exception:
+            log.debug("object size unknown for %s/%s", bucket, key, exc_info=True)
+        self._pos = 0
+        self._resp = None
+        self._open(0)
+
+    def _close_resp(self) -> None:
+        resp = self._resp
+        self._resp = None
+        if resp is None:
+            return
+        try:
+            resp.close()
+        except Exception:
+            pass
+        release = getattr(resp, "release_conn", None)
+        if release:
+            try:
+                release()
+            except Exception:
+                pass
+
+    def _open(self, pos: int) -> None:
+        self._close_resp()
+        if pos > 0:
+            self._resp = self._client.get_object(self._bucket, self._key, offset=pos)
+        else:
+            self._resp = self._client.get_object(self._bucket, self._key)
+        self._pos = pos
+
+    def read(self, size: int = -1) -> bytes:
+        if self._size and self._pos >= self._size:
+            return b""
+        remaining = (self._size - self._pos) if self._size else (size if size and size > 0 else 8 * 1024 * 1024)
+        want = remaining if size is None or int(size) < 0 else min(int(size), remaining)
+        if want <= 0:
+            return b""
+        buf = bytearray()
+        stalls = 0
+        while len(buf) < want:
+            try:
+                chunk = self._resp.read(min(1024 * 1024, want - len(buf))) if self._resp is not None else b""
+            except Exception as exc:
+                chunk = b""
+                log.warning(
+                    "object stream interrupted at %s/%s %s: %s",
+                    self._pos, self._size or "?", self._key, exc,
+                )
+            if chunk:
+                buf.extend(chunk)
+                self._pos += len(chunk)
+                stalls = 0
+                continue
+            if self._size and self._pos >= self._size:
+                break
+            if not self._size and not chunk and stalls:
+                break
+            stalls += 1
+            if stalls > 6:
+                raise OSError(f"object stream stalled at {self._pos}/{self._size or '?'}")
+            time.sleep(min(8, stalls))
+            self._open(self._pos)
+        return bytes(buf)
+
+    def readable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self._close_resp()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def open_object_stream(storage_uri: str) -> _ObjectStream | _ResumableObjectStream | None:
     """Open a streaming read for an object without buffering the whole blob in RAM.
 
     Critical for multi-GB ``.tar.zst`` extract shards — ``get_bytes`` would OOM workers.
@@ -211,18 +303,7 @@ def open_object_stream(storage_uri: str) -> _ObjectStream | None:
             if not path.is_file():
                 return None
             return _ObjectStream(path.open("rb"))
-        resp = client.get_object(bucket, key)
-
-        def _closer() -> None:
-            try:
-                resp.close()
-            finally:
-                try:
-                    resp.release_conn()
-                except Exception:
-                    pass
-
-        return _ObjectStream(resp, closer=_closer)
+        return _ResumableObjectStream(client, bucket, key)
     return None
 
 

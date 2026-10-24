@@ -397,7 +397,10 @@ def serial_progress_snapshot(db, job_id: str, *, row=None) -> dict | None:
                 active_row["completed_items"] = work_done
                 active_row["failed_items"] = int(work["failed"] or 0)
     serial = snapshot_from_rows(rows, pp)
+    from app.services.next_evidence_directory import directory_roster
     from app.services.source_coverage import collect_source_coverage
+
+    serial["evidence_directories"] = directory_roster(db, job_id, row)
     validation = next((_obj(r.get("details")) for r in rows if r["stage"] == "validation"), {})
     serial["source_coverage"] = collect_source_coverage(db, job_id, row=row,
         validation=validation, processing_complete=serial["complete"])
@@ -485,6 +488,31 @@ def start_serial_pipeline(
     row = fetchone(db, "SELECT * FROM jobs WHERE id=:id", {"id": job_id})
     if not row or row.get("stop_requested") or row.get("status") == "paused":
         return {"status": "stopped", "reason": "stop_requested"}
+    from app.services.next_evidence_directory import unfinished_directory_reason
+
+    directory_reason = unfinished_directory_reason(db, job_id, row)
+    if directory_reason:
+        if "starts after" in directory_reason:
+            source = row.get("disk_source") or {}
+            if isinstance(source, str):
+                try:
+                    source = json.loads(source)
+                except (TypeError, ValueError):
+                    source = {}
+            append = source.get("directory_append") if isinstance(source, dict) else None
+            heartbeat = 0.0
+            if isinstance(append, dict):
+                try:
+                    heartbeat = float(append.get("heartbeat_at") or 0)
+                except (TypeError, ValueError):
+                    heartbeat = 0.0
+            import time
+
+            if time.time() - heartbeat >= 180:
+                from app.tasks import phase3_pipeline_task
+
+                phase3_pipeline_task.delay(schema_name, job_id)
+        return {"status": "held", "reason": "next_evidence_directory", "detail": directory_reason}
     ready, reason = extraction_barrier(row)
     if not ready:
         return {"status": "held", "reason": "extraction_barrier", "detail": reason}

@@ -76,6 +76,14 @@ export interface PipelineProgress {
     current_stage: string | null;
     complete: boolean;
     overall_pct: number;
+    evidence_directories?: Array<{
+      index: number;
+      total: number;
+      label: string;
+      segments: number;
+      state: "saved" | "extracting" | "waiting" | string;
+      detail: string;
+    }>;
     stages: Array<{
       id: string;
       agent_id: string;
@@ -113,6 +121,7 @@ export interface PipelineProgress {
     bytes_uploaded?: number;
     bytes_total?: number | null;
     bytes_remaining?: number | null;
+    next_directory?: boolean;
     shards_done?: number;
     shards_total?: number;
     mib_per_s?: number;

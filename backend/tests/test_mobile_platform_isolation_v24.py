@@ -2,6 +2,7 @@ from pathlib import Path
 
 import yaml
 
+from app.services.mobile_platform_agents import is_physical_disk_image, mobile_os_family_from_job_row
 from app.service_identity import (
     MOBILE_ANDROID,
     MOBILE_IOS,
@@ -13,6 +14,38 @@ from app.service_identity import (
 from app.forensic_common.pipeline_routing import domain_pipeline_agents, phase3_queue
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_desktop_ewf_image_is_not_a_phone_acquisition():
+    desktop = {
+        "source_type": "disk",
+        "format": "e01",
+        "mode": "ewf",
+        "base_name": "Ex-1 Desktop 1TB",
+    }
+    assert is_physical_disk_image(desktop)
+    assert mobile_os_family_from_job_row({
+        "type": "android_mobile",
+        "disk_source": {
+            **desktop,
+            "evidence_platform": "Android",
+            "axiom_platform": "Android",
+            "mobile_os": "android",
+            "detected_os": {"family": "android"},
+        },
+    }) is None
+    assert mobile_os_family_from_job_row({
+        "type": "host_disk",
+        "disk_source": {
+            "source_type": "disk",
+            "format": "zip",
+            "evidence_platform": "Android",
+            "detected_os": {"family": "android"},
+        },
+    }) is None
+    assert not is_physical_disk_image({"source_type": "mobile", "format": "e01", "mode": "ewf"})
+    assert not is_physical_disk_image({"source_type": "android_backup"})
+    assert not is_physical_disk_image({"source_type": "disk", "format": "zip", "mode": "logical"})
 
 
 def test_android_ios_admission_is_hard_separated():

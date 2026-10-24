@@ -53,6 +53,7 @@ export function drivesAlreadyMounted(job: Job): boolean {
 }
 
 export function extractStillRunning(job: Job): boolean {
+  if (job.pipeline_progress?.extraction_activity?.next_directory) return true;
   // A finalized extracted_disk_uri is the hard phase barrier. Older jobs can
   // temporarily carry status=indexing while the disk walk is still active, so
   // status alone is not enough to declare Phase 1 finished.

@@ -208,6 +208,10 @@ def mobile_os_family_from_job_row(row: dict[str, Any] | None) -> MobilePlatform 
     if not row:
         return None
     ds = _as_dict(row.get("disk_source"))
+    # A job opened on Disk Forensics stays there. A desktop image stays there
+    # even when phone files copied onto that disk make a detector say Android or iOS.
+    if str(row.get("type") or "") in {"host_disk", "forensic", "disk"} or is_physical_disk_image(ds):
+        return None
     # Evidence owner wins over jobs.type. An android_mobile row whose package
     # was identified as iOS must be supervised by iOS, or Android will resume
     # a task that dies before it can heartbeat.
@@ -268,18 +272,99 @@ def detect_mobile_platform_from_evidence_paths(paths: list[str]) -> MobilePlatfo
     return None
 
 
+_DISK_IMAGE_FORMATS = frozenset({"e01", "ewf", "ex01", "s01", "raw", "dd", "aff", "vmdk", "vhd", "vhdx"})
+_DISK_IMAGE_MODES = frozenset({"ewf", "raw"})
+
+
+def is_physical_disk_image(disk_source: dict | None) -> bool:
+    """True for a desktop/server image. Phone backups are not disk images.
+
+    A Windows PC image often contains copies of Android files. Those copies must
+    not move the job onto the Android product.
+    """
+    ds = disk_source if isinstance(disk_source, dict) else {}
+    source = str(ds.get("source_type") or "").strip().lower()
+    if source in {"mobile", "android_backup", "ios_backup"}:
+        return False
+    image_format = str(ds.get("format") or "").strip().lower()
+    mode = str(ds.get("mode") or "").strip().lower()
+    return source == "disk" and (image_format in _DISK_IMAGE_FORMATS or mode in _DISK_IMAGE_MODES)
+
+
+def _release_disk_image_from_mobile(db, job_id: str, row: dict, ds: dict) -> None:
+    """Put a desktop image back on Disk Forensics after a phone detector claimed it."""
+    from app.db.sql_helpers import execute
+    from app.forensic_common.job_types import MOBILE_JOB_TYPES
+
+    jtype = str(row.get("type") or "")
+    platform = str(ds.get("evidence_platform") or ds.get("axiom_platform") or "").strip().lower()
+    if (
+        jtype not in MOBILE_JOB_TYPES
+        and platform not in {"android", "ios"}
+        and not ds.get("mobile_os")
+        and not ds.get("owner_agent")
+    ):
+        return
+    cleaned = dict(ds)
+    for key in (
+        "mobile_os",
+        "owner_agent",
+        "owner_agent_label",
+        "os_selection_source",
+        "os_mismatch_warning",
+    ):
+        cleaned.pop(key, None)
+    cleaned["source_type"] = "disk"
+    cleaned["evidence_platform"] = "Windows"
+    cleaned["axiom_platform"] = "Windows"
+    detected = cleaned.get("detected_os")
+    if isinstance(detected, dict) and str(detected.get("family") or "").strip().lower() == "android":
+        detected = dict(detected)
+        detected["family"] = "windows"
+        cleaned["detected_os"] = detected
+    import json
+
+    execute(
+        db,
+        "UPDATE jobs SET type='host_disk', disk_source=CAST(:ds AS jsonb), updated_at=NOW() WHERE id=:jid",
+        {"ds": json.dumps(cleaned), "jid": job_id},
+    )
+    try:
+        from app.services.disk_build_log import write_disk_log
+
+        write_disk_log(
+            db,
+            job_id,
+            "Desktop disk image stays on Disk Forensics. Phone-file copies inside the image do not move the job to Android or iOS.",
+            stage="evidence_register",
+            level="warning",
+        )
+    except Exception:
+        pass
+    try:
+        db.commit()
+    except Exception:
+        pass
+
+
 def reconcile_mobile_platform_from_registered_evidence(db, job_id: str) -> MobilePlatform | None:
     """Verify Android/iPhone ownership from registered evidence before agents run.
 
     The function only changes ownership when the evidence markers are strong. It
     records a mismatch warning, corrects the canonical job type, and stamps the
     evidence/AXIOM platform so the wrong mobile agent cannot continue processing.
+    A physical disk image is never reclassified: Android files on a PC are evidence,
+    not a phone acquisition.
     """
     from app.db.sql_helpers import execute, fetchall, fetchone
     from app.forensic_common.job_types import _as_dict
 
     row = fetchone(db, 'SELECT type, disk_source FROM jobs WHERE id=:jid', {'jid': job_id})
     if not row:
+        return None
+    disk_source = _as_dict(row.get("disk_source"))
+    if str(row.get("type") or "") in {"host_disk", "forensic", "disk"} or is_physical_disk_image(disk_source):
+        _release_disk_image_from_mobile(db, job_id, row, disk_source)
         return None
     samples = fetchall(
         db,
