@@ -2046,7 +2046,18 @@ def _coverage_includes_parsed_results(evidence: dict[str, Any], vulns: list[dict
         cov["nvts_launched"] = nvts  # compatibility alias: evidenced, not an execution inventory
         cov["results_evidenced"] = len(rows)
 
-        scanner_errors = [e for e in (cov.get("port_scanner_errors") or []) if isinstance(e, dict)]
+        from agent.scan_coverage import is_port_scanner_error
+
+        # V1.10.3: "Nmap OS Identification" and the nmap service-detection
+        # wrappers are not port scanners. Their timeouts are check warnings;
+        # only a real port-scanner failure makes the network scan incomplete.
+        scanner_errors = [
+            e for e in (cov.get("port_scanner_errors") or [])
+            if isinstance(e, dict)
+            and is_port_scanner_error(str(e.get("nvt_oid") or ""), str(e.get("nvt_name") or ""),
+                                      str(e.get("description") or ""))
+        ]
+        cov["port_scanner_errors"] = scanner_errors
         scanner_keys = {(str(e.get("nvt_oid") or ""), str(e.get("nvt_name") or "")) for e in scanner_errors}
         host_errors = [
             e for e in error_details
@@ -2639,6 +2650,11 @@ class LocalOpenVAS:
             # scales with CPU count. capacity.py still limits how many IPs run at
             # once under thermal/memory pressure.
             lane_checks = max(lane_checks, min(cap, int(perf_cfg["max_checks"])))
+        if (os.environ.get("SCAN_PORT_SEMAPHORE") or "").strip():
+            # V1.10.3: the per-IP port semaphore is a hard upper bound.
+            from agent.scan_performance import port_semaphore
+
+            lane_checks = min(lane_checks, port_semaphore())
         snapshot["requested_port_range"] = snapshot["port_range"]
         for transport, key in (("T", "tcp_port_count"), ("U", "udp_port_count")):
             snapshot[key] = len({p for token in port_range.split(",") if token.startswith(transport + ":")
@@ -2826,7 +2842,7 @@ class LocalOpenVAS:
                 # optimize/thorough behavior and produce a misleadingly shallow
                 # report that still reaches 100%.
                 minimal_prefs = {
-                    "max_checks": str(self.max_checks),
+                    "max_checks": str(lane_checks),
                     "max_hosts": str(self.max_hosts),
                     "optimize_test": prefs["optimize_test"],
                     "safe_checks": safe_checks,

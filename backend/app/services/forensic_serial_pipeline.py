@@ -222,6 +222,14 @@ def extraction_barrier(row: dict) -> tuple[bool, str]:
 
     if is_client_upload_pending(ds):
         return False, "Waiting for complete client intake"
+    append = ds.get("directory_append") if isinstance(ds.get("directory_append"), dict) else None
+    if (append and append.get("owner") and int(ds.get("files_extracted") or 0) > 0
+            and (ds.get("index_uri") or ds.get("parts_map"))):
+        # V1.10.3: the next evidence directory is being extracted beside the
+        # pipeline. Its live counters (raised files_total, checkpoint) belong to
+        # that pass. The saved directories' manifest is final, so their stages
+        # continue; the new files are registered and parsed when it is saved.
+        return True, "Finalized evidence for the saved directories; the next directory joins when it is saved"
     total = int(row.get("files_total") or 0)
     done = int(row.get("files_extracted") or 0)
     # The extractor explicitly records unreadable/skipped files in its manifest.

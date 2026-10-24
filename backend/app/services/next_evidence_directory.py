@@ -379,11 +379,35 @@ def _register_appended_files(db, job_id: str, extracted: list[str]) -> None:
         stage="materialize",
         metadata={"added": added, "directories": extracted},
     )
+    # V1.10.3: reopen parse also when it is waiting or failed after its stage
+    # process was cancelled, and reopen every finished stage after parse, so the
+    # new directory's files also go through recovery, OCR, inventory, RAG chunking,
+    # enrichment, graph and validation. Parse resumes from parse_status rows.
     execute(
         db,
         """UPDATE pipeline_stage_runs
-              SET status='waiting', task_id=NULL, completed_at=NULL, updated_at=NOW()
-            WHERE job_id=:jid AND stage='parse' AND status IN ('done','skipped')""",
+              SET status='waiting', task_id=NULL, completed_at=NULL, error=NULL,
+                  cancel_requested_at=NULL, recovery_dispatches=0, updated_at=NOW()
+            WHERE job_id=:jid AND stage='parse'
+              AND (status IN ('done','skipped')
+                   OR (status IN ('failed','waiting')
+                       AND (lower(COALESCE(error,'')) LIKE '%progressagent%'
+                            OR lower(COALESCE(error,'')) LIKE '%stage process%')))""",
+        {"jid": job_id},
+    )
+    execute(
+        db,
+        """UPDATE pipeline_stage_runs
+              SET status='pending', task_id=NULL, completed_at=NULL, updated_at=NOW()
+            WHERE job_id=:jid AND status IN ('done','skipped')
+              AND sequence_no > (SELECT sequence_no FROM pipeline_stage_runs
+                                  WHERE job_id=:jid AND stage='parse')""",
+        {"jid": job_id},
+    )
+    execute(
+        db,
+        """UPDATE jobs SET status='indexing', updated_at=NOW()
+            WHERE id=:jid AND status IN ('ready','report_ready','parsed','indexed')""",
         {"jid": job_id},
     )
     db.commit()
@@ -512,7 +536,10 @@ def _extract_one_directory(
                 },
             },
             writer="extract",
-            extra_sets="status='processing', files_total=:ft",
+            # V1.10.3: never pull a job whose later stages are running back to
+            # 'processing'; the next directory is extracted beside them.
+            extra_sets=("status=CASE WHEN status IN ('indexing','parsed','ready','report_ready','completed','paused') "
+                        "THEN status ELSE 'processing' END, files_total=:ft"),
             extra_params={"ft": prior_files + len(nodes)},
         )
         db.commit()

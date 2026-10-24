@@ -107,7 +107,8 @@ def test_job_label_is_complete_without_real_warnings():
     assert scan_job_progress(None, job)["progress_label"].startswith("Complete")
     assert "warnings" not in scan_job_progress(None, job)["progress_label"]
     job["orchestration_json"]["completed_with_warnings"] = True
-    assert scan_job_progress(None, job)["progress_label"].startswith("Complete with warnings")
+    label = scan_job_progress(None, job)["progress_label"]
+    assert label.startswith("Complete") and "warnings" not in label  # V1.10.3
 
 
 def test_assessment_notes_explain_unauthenticated_scope():

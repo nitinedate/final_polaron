@@ -1750,8 +1750,11 @@ def get_scan_job_severity_summary(
         verified and skipped_count == 0 and plugin_error_count == 0
         and service_verified and (not is_edge or orch_obj.get("clean_eligible") is True)
     )
-    network_complete_hosts = [str(h) for h in (orch_obj.get("network_complete_hosts") or [])]
-    degraded_hosts = [str(h) for h in (orch_obj.get("degraded_hosts") or [])]
+    from app.services.scanner_coverage_rules import effective_degraded_hosts, effective_network_complete_hosts
+
+    # V1.10.3: re-checked verdicts (Nmap OS Identification is not a port scanner).
+    network_complete_hosts = effective_network_complete_hosts(orch_obj)
+    degraded_hosts = effective_degraded_hosts(orch_obj)
     network_done = bool(is_edge and network_complete_hosts and not degraded_hosts)
     if verified and skipped_count > 0:
         assessment_label = "ENGINE COMPLETE - IP SCOPE EXCEPTION"
@@ -1766,15 +1769,15 @@ def get_scan_job_severity_summary(
         assessment_label = (
             f"NETWORK SCAN COMPLETE - {len(_silent)} OF {len(_silent) + len(_answered)} IP(S) DID NOT ANSWER"
         )
-    elif verified and network_done and plugin_error_count > 0:
-        assessment_label = f"NETWORK SCAN COMPLETE - {plugin_error_count} SCANNER WARNING(S)"
+    # V1.10.3: scanner warnings no longer change the assessment label; they
+    # are listed with the job's warnings.
     elif verified and network_done:
         # V1.8.0: say what limits the result instead of implying a failure.
         assessment_label = (
             "NETWORK SCAN COMPLETE - UNAUTHENTICATED" if not service_verified else "NETWORK SCAN COMPLETE"
         )
     elif verified and plugin_error_count > 0:
-        assessment_label = "ENGINE COMPLETE - SCANNER WARNINGS"
+        assessment_label = "COMPLETED"
     elif verified and is_edge and not service_verified:
         assessment_label = "ENGINE COMPLETE - SERVICE COVERAGE UNVERIFIED"
     elif verified:

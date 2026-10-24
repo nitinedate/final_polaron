@@ -190,7 +190,7 @@ def test_slow_ip_is_stopped_at_its_own_limit_and_reported_honestly(monkeypatch):
 
 # --- 3. service-level parallelism: one number ------------------------------------------------------
 def test_per_ip_check_concurrency_is_one_number(monkeypatch):
-    assert perf.per_ip_check_concurrency("fast") == 5  # FAST_MAX_CHECKS (Nessus default)
+    assert perf.per_ip_check_concurrency("fast") == 6  # V1.10.3 port semaphore 6 > FAST_MAX_CHECKS 5
     monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "8")
     assert perf.per_ip_check_concurrency("fast") == 8  # could not exceed 4 before V1.9.3
     assert perf.per_ip_check_concurrency("standard") == 8

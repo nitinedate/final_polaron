@@ -39,6 +39,28 @@ def reconcile_host_observations(
     native = sorted({int(x) for x in coverage.get("open_tcp_ports") or [] if str(x).isdigit() and 1 <= int(x) <= 65535})
     coverage["greenbone_tcp_ports"] = native
     counts = _merge_port_states(coverage, native, preprobe_states) if isinstance(preprobe_states, dict) else None
+    if (coverage.get("verdict") == "degraded_port_scan_failed" and native and preprobe
+            and set(preprobe) <= set(native) and not coverage.get("time_limited")):
+        # V1.10.3: a port-scanner check reported an error, yet Greenbone reported
+        # every TCP port the agent's connect probe of the policy ports found open,
+        # and results exist for them. The listeners were enumerated and checked:
+        # this is a finished network scan with a warning, not an incomplete one.
+        errs = [e for e in (coverage.get("port_scanner_errors") or []) if isinstance(e, dict)]
+        names = ", ".join(sorted({str(e.get("nvt_name") or e.get("nvt_oid") or "port scanner") for e in errs}))
+        warnings = list(coverage.get("warnings") or [])
+        warnings.append(
+            f"{names or 'A port-scanner check'} reported an error, but Greenbone enumerated every TCP port "
+            f"the agent's probe found open ({preprobe}); the service checks ran on those ports"[:240]
+        )
+        coverage["warnings"] = warnings[-20:]
+        coverage["verdict"] = "observed_unverified"
+        coverage["network_scan_complete"] = True
+        coverage["port_scan_reconciled"] = True
+        coverage["reason"] = (
+            f"Network scan finished: {len(native)} open TCP port(s) {native[:16]}; the port-scanner warning "
+            "was reconciled against the agent's TCP probe of the policy ports"
+        )
+        return details
     if (counts is not None and not preprobe and not native
             and coverage.get("verdict") == "degraded_no_ports"
             and not coverage.get("port_scanner_errors") and not coverage.get("time_limited")

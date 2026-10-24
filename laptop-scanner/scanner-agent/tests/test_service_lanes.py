@@ -29,7 +29,7 @@ def test_service_parallelism_is_the_per_ip_check_concurrency(monkeypatch):
     monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "500")
     assert service_parallelism() == 32
     monkeypatch.setenv("SCAN_SERVICE_PARALLELISM", "junk")
-    assert service_parallelism() == 4
+    assert service_parallelism() == 6  # V1.10.3 port semaphore
 
 def test_full_tcp_range_splits_into_four_lanes_that_cover_every_port():
     lanes = lanes_for_port_range("T:1-65535", lanes=4)

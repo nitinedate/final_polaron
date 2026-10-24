@@ -106,7 +106,9 @@ def profile_settings(profile: str) -> dict[str, Any]:
         timing = (os.environ.get("TURBO_NMAP_TIMING") or "Aggressive").strip()
         return {
             "checks_read_timeout": _int_env("TURBO_CHECKS_READ_TIMEOUT", 5, 2, 30),
-            "max_checks": turbo_max_checks(),
+            # V1.10.3: the port semaphore caps turbo's per-IP checks when it is set.
+            "max_checks": port_semaphore() if (os.environ.get("SCAN_PORT_SEMAPHORE") or "").strip()
+            else turbo_max_checks(),
             "nmap_timing": None if timing.lower() in {"", "off", "none", "normal"} else timing,
             "hang_caps": hang_on,
             # Shorter per-check ceiling so one slow NVT costs ~2 min instead of
@@ -117,8 +119,10 @@ def profile_settings(profile: str) -> dict[str, Any]:
     return {
         # OpenVAS default checks_read_timeout and Nessus "network timeout" are both 5 s.
         "checks_read_timeout": _int_env("FAST_CHECKS_READ_TIMEOUT", 5, 3, 30),
-        # Nessus default "max simultaneous checks per host" is 5.
-        "max_checks": _int_env("FAST_MAX_CHECKS", 5, 1, 10),
+        # Nessus default "max simultaneous checks per host" is 5. V1.10.3: the
+        # port semaphore wins when it is set.
+        "max_checks": port_semaphore() if (os.environ.get("SCAN_PORT_SEMAPHORE") or "").strip()
+        else _int_env("FAST_MAX_CHECKS", 5, 1, 10),
         "nmap_timing": None if timing.lower() in {"", "off", "none", "normal"} else timing,
         "hang_caps": hang_on,
         # Per-check limit for ordinary NVTs: Nessus/OpenVAS default 320 s (V1.6.8:
@@ -188,6 +192,10 @@ def per_ip_check_concurrency(profile: str) -> int:
     larger of SCAN_SERVICE_PARALLELISM and the profile's own value
     (FAST_MAX_CHECKS / turbo), capped at 32.
     """
+    # V1.10.3: an explicit port semaphore is THE per-IP limit, whatever the
+    # profile (turbo used to run 10-40 checks against one IP at once).
+    if (os.environ.get("SCAN_PORT_SEMAPHORE") or "").strip():
+        return port_semaphore()
     from agent.service_lanes import service_parallelism
 
     base = service_parallelism()
@@ -219,8 +227,27 @@ def silent_host_sec() -> int:
 
 
 def fixed_ip_workers() -> int:
-    """Fixed number of IPs scanned at once (default 4). 0 = adaptive capacity sizing."""
-    return _int_env("SCAN_IP_WORKERS_FIXED", 4, 0, 32)
+    """IP semaphore: IPs scanned at once (V1.10.3 default 5). 0 = adaptive capacity sizing.
+
+    SCAN_IP_SEMAPHORE wins. The older SCAN_IP_WORKERS_FIXED is read only when
+    SCAN_IP_SEMAPHORE is unset, so a stale ``.env`` value of 4 cannot override
+    the 5-IP semaphore that docker-compose now passes.
+    """
+    if (os.environ.get("SCAN_IP_SEMAPHORE") or "").strip():
+        return _int_env("SCAN_IP_SEMAPHORE", 5, 0, 32)
+    return _int_env("SCAN_IP_WORKERS_FIXED", 5, 0, 32)
+
+
+def port_semaphore() -> int:
+    """Port semaphore: ports of ONE IP worked on at once (V1.10.3 default 6).
+
+    The same value bounds the agent's TCP pre-probe (6 connects per IP at a
+    time) and OpenVAS max_checks for that IP (6 port/service checks at a time).
+    SCAN_PORT_SEMAPHORE wins over the older SCAN_SERVICE_PARALLELISM.
+    """
+    if (os.environ.get("SCAN_PORT_SEMAPHORE") or "").strip():
+        return _int_env("SCAN_PORT_SEMAPHORE", 6, 1, 32)
+    return _int_env("SCAN_SERVICE_PARALLELISM", 6, 1, 32)
 
 
 def _is_cappable(oid: str, name: str) -> bool:

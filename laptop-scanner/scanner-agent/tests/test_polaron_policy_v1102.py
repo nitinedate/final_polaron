@@ -28,7 +28,7 @@ def test_agent_default_template_and_build():
     from agent.service_policy import default_template_key
 
     assert default_template_key() == "polaron"
-    assert AGENT_BUILD.endswith("v62.0")
+    assert AGENT_BUILD.endswith("v63.0")
 
 
 def test_agent_runs_inlined_request_without_template_key():

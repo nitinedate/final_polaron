@@ -34,7 +34,9 @@ def test_field_host_is_completed_with_warnings_not_incomplete():
     assert degraded == [] and done == [FIELD]
     row = tp[FIELD]
     assert row["status"] == "completed"
-    assert row["activity"].startswith("Completed with warnings - network scan finished, 3 open TCP")
+    # V1.10.3: warnings no longer change the label; the count stays in the activity.
+    assert row["activity"].startswith("Completed - network scan finished, 3 open TCP")
+    assert "check warning(s)" in row["activity"]
     assert "unauthenticated checks" in row["activity"]  # V1.8.0 wording
     assert row["coverage"]["open_tcp_port_list"] == [135, 139, 445]
     assert len(row["warnings"]) == 2
@@ -63,7 +65,8 @@ def test_job_label_says_complete_with_warnings():
     job = {"status": "completed", "orchestration_json": {
         "edge_agent": True, "degraded_hosts": [], "network_complete_hosts": [FIELD],
         "completed_with_warnings": True}}
-    assert scan_job_progress(None, job)["progress_label"].startswith("Complete with warnings")
+    label = scan_job_progress(None, job)["progress_label"]
+    assert label.startswith("Complete") and "warnings" not in label  # V1.10.3
     job["orchestration_json"]["degraded_hosts"] = [FIELD]
     assert "1 host(s) incomplete" in scan_job_progress(None, job)["progress_label"]
 

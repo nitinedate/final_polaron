@@ -900,9 +900,13 @@ def classify_host_coverage(
     tp = dict(target_progress) if isinstance(target_progress, dict) else {}
     degraded_now: list[str] = []
     network_complete: list[str] = []
+    from app.services.scanner_coverage_rules import normalize_host_coverage
+
     for cov_host, cov in host_cov.items():
         if not isinstance(cov, dict):
             continue
+        # V1.10.3: a non-port-scanner timeout is a warning, not an incomplete host.
+        cov = normalize_host_coverage(cov)
         verdict = str(cov.get("verdict") or "unknown")
         entry = dict(tp.get(cov_host) or {})
         warnings = [str(w)[:240] for w in (cov.get("warnings") or []) if str(w).strip()]
@@ -962,7 +966,8 @@ def classify_host_coverage(
             elif purpose == "compliance":
                 prefix = "Compliance audit finished - " + (f"{auth_text}; " if auth_text else "")
             else:
-                prefix = "Completed with warnings - " if warnings else "Completed - "
+                # V1.10.3: check warnings stay in this IP's warning list; the IP reads Completed.
+                prefix = "Completed - "
             scope = (
                 f"scanner laptop scanned through loopback ({self_scan.get('scanned_via')}), "
                 if self_scan else "network scan finished, "
@@ -1867,6 +1872,11 @@ def ingest_agent_results(
         )
     ) or bool(skipped_details)
 
+    # V1.10.3: re-check agent verdicts (agents <= 1.10.2 counted "Nmap OS Identification"
+    # as a port scanner) before any completion or coverage decision is made.
+    from app.services.scanner_coverage_rules import normalize_coverage_map
+
+    host_coverage = normalize_coverage_map(host_coverage)
     verdict = evaluate_edge_ingest_verdict(
         target_list=target_list,
         skipped_details=skipped_details,

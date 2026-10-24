@@ -192,14 +192,11 @@ function jobCoverageIncomplete(job: ScanJob): boolean {
   return job.status === "completed" && /[1-9]\d* host\(s\) incomplete|coverage incomplete/i.test(job.progress_label || "");
 }
 
-/** V1.6.5: network scans finished; warnings or unverified service checks remain. */
-function jobCompletedWithWarnings(job: ScanJob): boolean {
-  return job.status === "completed" && !jobCoverageIncomplete(job) && /complete with warnings|service coverage unverified/i.test(job.progress_label || "");
-}
+/* V1.10.3: "Completed with warnings" is shown as "completed". Warnings stay in the
+   job details (Scan notes); they no longer change the status label or colour. */
 
 function jobStatusText(job: ScanJob): string {
   if (jobCoverageIncomplete(job)) return "Completed · coverage incomplete";
-  if (jobCompletedWithWarnings(job)) return "Completed with warnings";
   return job.status;
 }
 
@@ -732,7 +729,7 @@ export function ScanJobsPage() {
                       </div>
                     </td>
                     <td className="px-5 py-3">
-                      <Badge tone={jobCoverageIncomplete(j) || jobCompletedWithWarnings(j) ? "amber" : (STATUS_TONE[j.status] ?? "neutral")}>
+                      <Badge tone={jobCoverageIncomplete(j) ? "amber" : (STATUS_TONE[j.status] ?? "neutral")}>
                         {jobStatusText(j)}
                       </Badge>
                       {j.status === "failed" && j.error ? (
@@ -933,11 +930,10 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
       : summary.assessment.clean_eligible === false
     : false;
   const assessmentNotes = summary?.assessment?.notes || [];
+  // V1.10.3: warnings no longer change the status; they are listed below as notes.
   const shownStatus = coverageIncomplete
     ? "Completed · coverage incomplete"
-    : completedWithWarnings
-      ? "Completed with warnings"
-      : (summary?.status || job.status);
+    : (summary?.status || job.status);
   const cleanBlockers = summary?.assessment?.clean_blockers || [];
   // V1.7.0: the chart shows Low and above by default; informational rows are evidence, not findings.
   const infoCount = (summary?.severities || []).filter((b) => !LOW_PLUS.includes(b.severity)).reduce((n, b) => n + b.count, 0);
@@ -960,9 +956,9 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
       ) : (
         <div className="space-y-5">
           <div className="flex flex-wrap items-center gap-4">
-            <ProgressCircle pct={pct} status={coverageIncomplete || completedWithWarnings ? "coverage-incomplete" : (summary?.status || job.status)} size={56} title="Engine processing progress; not verified service coverage" />
+            <ProgressCircle pct={pct} status={coverageIncomplete ? "coverage-incomplete" : (summary?.status || job.status)} size={56} title="Engine processing progress; not verified service coverage" />
             <div>
-              <Badge tone={coverageIncomplete || completedWithWarnings ? "amber" : (STATUS_TONE[summary?.status || job.status] ?? "neutral")}>
+              <Badge tone={coverageIncomplete ? "amber" : (STATUS_TONE[summary?.status || job.status] ?? "neutral")}>
                 {shownStatus}
               </Badge>
               {summary?.progress_label ? (
@@ -976,7 +972,7 @@ function JobDetailsModal({ job, onClose }: { job: ScanJob; onClose: () => void }
                 </p>
               ) : null}
               {completedWithWarnings ? (
-                <div className="mt-2 max-w-xl text-sm text-amber-800">
+                <div className="mt-2 max-w-xl text-sm text-ink-600">
                   <p className="font-medium">
                     {summary?.assessment?.not_assessed?.length
                       ? `${(summary?.assessment?.target_count ?? 0) - summary.assessment.not_assessed.length} of ${summary?.assessment?.target_count ?? 0} IPs were assessed and their findings are valid; a clean result is not claimed because:`

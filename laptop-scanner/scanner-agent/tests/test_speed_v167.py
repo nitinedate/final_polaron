@@ -41,7 +41,7 @@ def test_nexus_is_the_service_port_catalog_again(monkeypatch):
 
 # --- settings ---------------------------------------------------------------------
 def test_defaults_fixed_pool_and_deadline(monkeypatch):
-    assert fixed_ip_workers() == 4
+    assert fixed_ip_workers() == 5  # V1.10.3 IP semaphore
     # V1.6.8: no per-IP time limit unless explicitly configured.
     assert ip_deadline_sec("fast") == 0 and ip_deadline_sec("standard") == 0
     monkeypatch.setenv("SCAN_IP_DEADLINE_SEC", "600")
@@ -158,7 +158,7 @@ def test_fixed_pool_never_runs_more_than_four_ips(monkeypatch):
     poll = lambda host, n, stopped: _done(host) if n >= 3 else {
         "status": "running", "gmp_status": "running", "progress": 40 * n, "vulnerabilities": [], "evidence": {}}
     uploaded, _, _, state = _loop(monkeypatch, hosts, poll)
-    assert state["max_active"] == 4
+    assert state["max_active"] == 5  # V1.10.3 IP semaphore
     assert len(state["started"]) == 10
     assert uploaded[-1]["status"] == "completed"
 

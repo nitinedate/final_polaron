@@ -38,7 +38,9 @@ def test_late_completed_event_keeps_the_not_assessed_explanation():
         assert merged[h]["activity"].startswith("No response - not assessed"), merged[h]["activity"]
         assert merged[h]["coverage"]["host_responded"] is False
         assert merged[h]["event_seq"] == 40
-    assert merged[GATEWAY]["activity"].startswith("Completed with warnings - network scan finished, 3 open TCP")
+    # V1.10.3: warnings no longer change the label; the count stays in the activity.
+    assert merged[GATEWAY]["activity"].startswith("Completed - network scan finished, 3 open TCP")
+    assert "check warning(s)" in merged[GATEWAY]["activity"]
     assert merged[GATEWAY]["coverage"]["host_responded"] is True
 
 

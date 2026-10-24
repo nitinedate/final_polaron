@@ -946,6 +946,11 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
     # repeats the same Nmap kill, so the automatic re-run is off unless
     # SCAN_DEGRADED_RETRY is set.
     degraded_retries: dict[int, int] = {}
+    # V1.10.3: a task Greenbone reports "stopped"/"interrupted" although the
+    # agent never stopped it (scanner or agent restart mid-scan; job 7fc54039
+    # was at 94%) is started again instead of failing the IP. Once per IP.
+    interrupted_restarts: dict[int, int] = {}
+    interrupted_restart_budget = max(0, int(os.environ.get("SCAN_INTERRUPTED_RESTARTS") or 1))
     preprobe_by_host: dict[str, list[int]] = {}
     preprobe_states_by_host: dict[str, dict[str, list[int]]] = {}
     # V1.8.0: targets that are the scanner laptop itself (see agent/self_target.py).
@@ -1786,6 +1791,32 @@ def _run_job_body(cfg: dict[str, Any], job: dict[str, Any]) -> None:
                             done_details[idx] = normalized
                             finished_idxs.append(idx)
                             continue
+                    if (
+                        st == "stopped"
+                        and idx not in ip_deadline_hit
+                        and idx not in ip_stalled
+                        and not start_abort.is_set()
+                        and interrupted_restarts.get(idx, 0) < interrupted_restart_budget
+                    ):
+                        interrupted_restarts[idx] = interrupted_restarts.get(idx, 0) + 1
+                        stopped_pct = int(float(details.get("progress") or 0))
+                        log.warning(
+                            "Job %s IP %s: OpenVAS task %s is stopped at %s%% but the agent did not stop it "
+                            "(scanner or agent restart); starting a fresh task (attempt %d of %d)",
+                            job_id, host, tid, stopped_pct, interrupted_restarts[idx], interrupted_restart_budget,
+                        )
+                        emit_ip_event(
+                            job_id, host, "interrupted_restart", task_id=tid, progress=stopped_pct,
+                            attempt=interrupted_restarts[idx], chunk_index=idx,
+                        )
+                        lane_task_ids.pop(idx, None)
+                        task_ids[idx] = None
+                        poll_results.pop(idx, None)
+                        in_flight.pop(idx, None)
+                        ip_progress_since.pop(idx, None)
+                        slot_sem.release()
+                        pending.append(idx)
+                        continue
                     if st in {"failed", "stopped"}:
                         # Do not let one bad IP fail 49 healthy peers. Preserve any
                         # partial findings in the per-IP log, mark the host skipped,

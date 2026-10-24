@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -85,6 +86,16 @@ def _workers(total_probes: int) -> int:
     return max(1, min(max(8, configured), max(1, total_probes), 96))
 
 
+def port_semaphore_limit() -> int:
+    """Connects to ONE IP in flight at once (V1.10.3, SCAN_PORT_SEMAPHORE, default 6)."""
+    try:
+        from agent.scan_performance import port_semaphore
+
+        return port_semaphore()
+    except Exception:
+        return 6
+
+
 def candidate_range() -> str:
     profile = (os.environ.get("PORT_PROFILE") or "").strip().lower()
     if profile in {"nexus", "catalog"}:
@@ -134,9 +145,23 @@ def probe_tcp_port_states(
         except OSError:
             return host, int(port), "filtered"
 
+    # V1.10.3: one port semaphore per IP. At most port_semaphore_limit()
+    # (default 6) connects to the same IP are in flight; several IPs are probed
+    # at once, each under its own semaphore, bounded by PORT_DISCOVERY_WORKERS.
+    per_ip = port_semaphore_limit()
+    semaphores = {host: threading.BoundedSemaphore(per_ip) for host in clean_hosts}
+
+    def _guarded(host: str, port: int) -> tuple[str, int, str]:
+        with semaphores[host]:
+            return _one(host, port)
+
     total = len(clean_hosts) * len(ports)
-    with ThreadPoolExecutor(max_workers=_workers(total), thread_name_prefix="aetheris-port") as pool:
-        futs = [pool.submit(_one, host, port) for host in clean_hosts for port in ports]
+    workers = max(1, min(_workers(total), per_ip * len(clean_hosts)))
+    # Round-robin order so one IP's queued ports cannot hold every worker
+    # thread while they wait on that IP's semaphore.
+    order = [(host, port) for port in ports for host in clean_hosts]
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="aetheris-port") as pool:
+        futs = [pool.submit(_guarded, host, port) for host, port in order]
         for fut in as_completed(futs):
             host, port, state = fut.result()
             result[host][state].append(port)

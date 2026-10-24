@@ -99,17 +99,49 @@ def execute_isolated_stage(db,job_id,stage,*,schema_name,stage_run_id):
             str(job_id),stage,str(stage_run_id),str(output)],start_new_session=os.name=='posix',
             env={**os.environ,'AETHERIS_STAGE_OWNER_PID':str(os.getpid())})
         try:
+            control_failures=0
             while process.poll() is None:
                 table='report_runs' if stage=='__report__' else 'pipeline_stage_runs'
-                control=fetchone(db,f"""SELECT s.cancel_requested_at,j.stop_requested,j.status
-                    FROM {table} s JOIN jobs j ON j.id=s.job_id WHERE s.id=:id""",{'id':stage_run_id})
-                if stage=='__report__':
-                    from app.db.sql_helpers import execute
-                    execute(db,'UPDATE report_runs SET heartbeat_at=NOW() WHERE id=:id',{'id':stage_run_id})
-                db.commit()
+                try:
+                    control=fetchone(db,f"""SELECT s.cancel_requested_at,j.stop_requested,j.status
+                        FROM {table} s JOIN jobs j ON j.id=s.job_id WHERE s.id=:id""",{'id':stage_run_id})
+                    if stage=='__report__':
+                        from app.db.sql_helpers import execute
+                        execute(db,'UPDATE report_runs SET heartbeat_at=NOW() WHERE id=:id',{'id':stage_run_id})
+                    db.commit()
+                    control_failures=0
+                except Exception as exc:
+                    # V1.10.3: this control poll runs every second for the whole
+                    # stage (28,800 times in 8 h). One dropped connection or aborted
+                    # transaction used to unwind this parent, whose finally block
+                    # SIGTERMed the stage process. Keep the stage running and poll
+                    # again; give up only after a sustained outage (~5 min).
+                    from app.services.db_resilience import is_transient_db_error
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    control_failures+=1
+                    if not is_transient_db_error(exc) or control_failures>300:
+                        raise
+                    if control_failures in (1,30,120):
+                        log.warning('Stage %s control poll failed %d time(s); stage process keeps running: %s',
+                                    stage,control_failures,exc)
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    continue
                 if not control or control.get('cancel_requested_at') or control.get('stop_requested') or control.get('status')=='paused':
+                    # V1.10.3: record which control flag stopped the stage, so the UI
+                    # no longer blames progressAgent for an examiner stop or a pause.
+                    why=('stage row missing' if not control
+                         else 'progressAgent cancel request' if control.get('cancel_requested_at')
+                         else 'examiner stop request' if control.get('stop_requested')
+                         else 'job paused (examiner, thermal or capacity protection)')
+                    log.warning('Stage %s run %s stopped by its owner: %s',stage,stage_run_id,why)
                     _stop_owned_process(process)
-                    raise StageWaiting('Stage process interrupted by progressAgent or user pause')
+                    raise StageWaiting(f'Stage process interrupted by progressAgent or user pause ({why})')
                 try:
                     process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
@@ -119,7 +151,15 @@ def execute_isolated_stage(db,job_id,stage,*,schema_name,stage_run_id):
             result=json.loads(output.read_text())
             if result.get('error'):
                 if result.get('kind')=='waiting':
-                    raise StageWaiting(result['error'])
+                    err=str(result['error'])
+                    if err.startswith('Stage process cancelled by SIGTERM'):
+                        # V1.10.3: the owner did not send this signal (it would have
+                        # raised above), and progressAgent never signals stage
+                        # processes. The sender is outside the application.
+                        err=('Stage process stopped by a SIGTERM from outside its owner and progressAgent '
+                             '(worker container stop/restart, Docker Desktop or host shutdown). '+err)
+                        log.warning('Stage %s run %s: %s',stage,stage_run_id,err)
+                    raise StageWaiting(err)
                 failure = RuntimeError(result['error'])
                 failure.remote_traceback = result.get('traceback')
                 raise failure
@@ -129,6 +169,7 @@ def execute_isolated_stage(db,job_id,stage,*,schema_name,stage_run_id):
 
 
 def main(argv=None):
+    owner_pid=os.environ.get('AETHERIS_STAGE_OWNER_PID')
     _guard_owner()
     schema,job_id,stage,stage_id,path=list(argv or sys.argv[1:])
     from app.db.session import firm_session
@@ -138,7 +179,18 @@ def main(argv=None):
     from app.services.progress_agent import note_operation
 
     def interrupted(_signal,_frame):
-        raise StageWaiting('Stage process cancelled by progressAgent')
+        # V1.10.3: progressAgent never signals this process itself (its cancel goes
+        # through the owner, which records "interrupted ..."). Name what is known
+        # so the next occurrence identifies the sender; the stage resumes from its
+        # committed items (parse_status) instead of starting again.
+        try:
+            owner_alive=bool(owner_pid) and os.getppid()==int(owner_pid)
+        except (TypeError,ValueError):
+            owner_alive=False
+        log.warning('Stage %s received SIGTERM (owner %s); stopping at the last committed item',
+                    stage,'alive' if owner_alive else 'gone')
+        raise StageWaiting('Stage process cancelled by SIGTERM (stage owner '
+                           +('alive' if owner_alive else 'gone')+'); resuming from committed items')
     signal.signal(signal.SIGTERM,interrupted)
     try:
         with firm_session(schema) as db,(nullcontext() if stage=='__report__' else stage_context(stage)):

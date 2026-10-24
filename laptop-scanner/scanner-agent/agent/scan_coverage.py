@@ -37,10 +37,40 @@ SCANNER_NVT_OIDS: frozenset[str] = frozenset({
     "1.3.6.1.4.1.25623.1.0.10330",   # Services
     "1.3.6.1.4.1.25623.1.0.900239",  # Open TCP Port (legacy)
     "1.3.6.1.4.1.25623.1.0.108521",  # Nmap UDP
-    "1.3.6.1.4.1.25623.1.0.11219",   # Nmap (NASL wrapper, alt)
+    "1.3.6.1.4.1.25623.1.0.11219",   # SYN Scan
+    "1.3.6.1.4.1.25623.1.0.10335",   # OpenVAS TCP scanner
 })
-_SCANNER_NAME_RE = re.compile(r"nmap|ping host|port ?scan|^services$|open tcp port|openvasd port", re.I)
+# V1.10.3: checks that carry "nmap" in their name but do NOT enumerate ports.
+# Up to 1.10.2 the bare "nmap" pattern made a 90 s timeout of
+# "Nmap OS Identification (NASL wrapper)" read as a failed port scan, and the
+# host as "coverage incomplete", although Greenbone had found 445/8090 and run
+# the SMB/TLS checks (jobs b6b7f60c, ccf22aa0 on 192.168.0.163).
+NOT_PORT_SCANNER_OIDS: frozenset[str] = frozenset({
+    "1.3.6.1.4.1.25623.1.0.108021",  # Nmap OS Identification (NASL wrapper)
+    "1.3.6.1.4.1.25623.1.0.108525",  # Service Detection (wrapped) with nmap
+    "1.3.6.1.4.1.25623.1.0.66286",   # Service Detection (unknown) with nmap
+})
+_NOT_SCANNER_NAME_RE = re.compile(
+    r"\bos (identification|detection|fingerprint)|service detection|\bnse\b|with nmap", re.I
+)
+_SCANNER_NAME_RE = re.compile(
+    r"^nmap \(nasl wrapper\)$|^nmap udp|^ping host$|port ?scan|^services$|open tcp port|"
+    r"openvasd port|tcp scanner|^syn scan", re.I
+)
+_SCANNER_DESC_RE = re.compile(r"nmap \(nasl wrapper\)|port ?scan|ping host|tcp scanner", re.I)
 _TIMEOUT_RE = re.compile(r"time ?out|timed out|killed|exceeded|took too long|was interrupted", re.I)
+
+
+def is_port_scanner_error(oid: str | None, name: str | None, description: str | None = "") -> bool:
+    """True only when the failed check is one that enumerates ports (V1.10.3)."""
+    oid = str(oid or "").strip()
+    name = str(name or "").strip()
+    desc = str(description or "")
+    if oid in NOT_PORT_SCANNER_OIDS or (name and _NOT_SCANNER_NAME_RE.search(name)):
+        return False
+    if oid in SCANNER_NVT_OIDS or (name and _SCANNER_NAME_RE.search(name)):
+        return True
+    return bool(_TIMEOUT_RE.search(desc) and _SCANNER_DESC_RE.search(desc))
 _PORT_RE = re.compile(r"^(\d{1,5})/(tcp|udp)$", re.I)
 _PORT_DETAIL_NAMES = {"ports", "tcp_ports", "udp_ports", "open ports", "open_ports", "tcp ports"}
 
@@ -106,9 +136,7 @@ def coverage_from_report(report: Any, *, host: str | None = None, errors: list[d
         oid = str(e.get("nvt_oid") or "")
         name = str(e.get("nvt_name") or "")
         desc = str(e.get("description") or "")
-        if oid in SCANNER_NVT_OIDS or _SCANNER_NAME_RE.search(name) or (
-            _TIMEOUT_RE.search(desc) and _SCANNER_NAME_RE.search(desc)
-        ):
+        if is_port_scanner_error(oid, name, desc):
             out["port_scanner_errors"].append({"nvt_oid": oid or None, "nvt_name": name or None, "description": desc[:300]})
         else:
             out["other_errors"] += 1

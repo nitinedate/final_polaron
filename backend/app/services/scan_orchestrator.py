@@ -271,12 +271,15 @@ def scan_job_progress(db, job: dict[str, Any]) -> dict[str, Any]:
             orch_done = {}
         if orch_done.get("edge_agent"):
             parts = ["Complete"]
-            degraded = orch_done.get("degraded_hosts") or []
+            from app.services.scanner_coverage_rules import effective_degraded_hosts
+
+            # V1.10.3: stored verdicts are re-checked, so a host whose only
+            # "port scanner" error was Nmap OS Identification is complete.
+            degraded = effective_degraded_hosts(orch_done)
             if degraded:
                 parts[0] = f"Complete - {len(degraded)} host(s) incomplete"
-            elif orch_done.get("completed_with_warnings"):
-                # V1.8.0: finished network scans alone are not warnings.
-                parts[0] = "Complete with warnings"
+            # V1.10.3: check warnings no longer change the job label ("Complete
+            # with warnings"); they stay listed in the job details.
             ver = orch_done.get("edge_agent_version")
             build = orch_done.get("edge_agent_build")
             if ver:

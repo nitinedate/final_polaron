@@ -21,12 +21,10 @@ def service_parallelism() -> int:
     value (FAST_MAX_CHECKS=5) still applies when it is higher, see
     scan_performance.per_ip_check_concurrency().
     """
-    raw = (os.environ.get("SCAN_SERVICE_PARALLELISM") or "4").strip()
-    try:
-        count = int(raw)
-    except (TypeError, ValueError):
-        count = 4
-    return max(1, min(32, count))
+    # V1.10.3: the per-IP port semaphore (SCAN_PORT_SEMAPHORE, default 6).
+    from agent.scan_performance import port_semaphore
+
+    return port_semaphore()
 
 
 def _spans(token: str) -> tuple[str, list[tuple[int, int]]]:

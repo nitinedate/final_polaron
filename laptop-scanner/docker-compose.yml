@@ -316,7 +316,9 @@ services:
       MAX_CONCURRENT_SCAN_JOBS: ${MAX_CONCURRENT_SCAN_JOBS:-1}
       SCAN_IP_PARALLELISM: ${SCAN_IP_PARALLELISM:-auto}
       SCAN_IP_MAX_PARALLELISM: ${SCAN_IP_MAX_PARALLELISM:-8}
-      SCAN_SERVICE_PARALLELISM: ${SCAN_SERVICE_PARALLELISM:-4}
+      SCAN_SERVICE_PARALLELISM: ${SCAN_SERVICE_PARALLELISM:-6}
+      # V1.10.3: per-IP port semaphore (pre-probe connects + OpenVAS max_checks).
+      SCAN_PORT_SEMAPHORE: ${SCAN_PORT_SEMAPHORE:-6}
       SCAN_SLO_MIN_HOSTS_PER_HOUR: ${SCAN_SLO_MIN_HOSTS_PER_HOUR:-15}
       SCAN_SLO_HOSTS_PER_HOUR: ${SCAN_SLO_HOSTS_PER_HOUR:-18}
       SCAN_EXPECTED_HOST_MINUTES: ${SCAN_EXPECTED_HOST_MINUTES:-20}
@@ -395,7 +397,10 @@ services:
       # V1.6.8: no time limits; stop only when OpenVAS shows nothing running (auto).
       SCAN_STALL_ACTION: ${SCAN_STALL_ACTION:-auto}
       SCAN_IP_DEADLINE_SEC: ${SCAN_IP_DEADLINE_SEC:-}
-      SCAN_IP_WORKERS_FIXED: ${SCAN_IP_WORKERS_FIXED:-4}
+      SCAN_IP_WORKERS_FIXED: ${SCAN_IP_WORKERS_FIXED:-5}
+      # V1.10.3: IP semaphore (IPs scanned at once); wins over SCAN_IP_WORKERS_FIXED.
+      SCAN_IP_SEMAPHORE: ${SCAN_IP_SEMAPHORE:-5}
+      SCAN_INTERRUPTED_RESTARTS: ${SCAN_INTERRUPTED_RESTARTS:-1}
       # V1.9.3: checks whose OWN timeout is longer than this (or unlimited) are capped
       # to it; those are what hold a host at 98-99 %. 0 = off. Needs the plugins mount below.
       SCAN_NVT_MAX_SEC: ${SCAN_NVT_MAX_SEC:-900}

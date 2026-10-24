@@ -206,7 +206,7 @@ def classify_stage(job, stage, *, now=None):
         return "valid_wait", "Delivery is within its one-minute queue grace period"
     if state == "waiting" and _age(stage.get("updated_at"), now) < CHECK_AFTER_SECONDS:
         return "valid_wait", str(stage.get("error") or "Waiting for the next dependency check")
-    if state == 'waiting' and any(word in str(stage.get('error') or '').lower() for word in ('gpu','thermal','lease','capacity','model','unavailable','dependency','source key','quality triage','still writing','writing in','interrupted by progressagent','database lock','lock timeout','deadlock','canceling statement')):
+    if state == 'waiting' and any(word in str(stage.get('error') or '').lower() for word in ('gpu','thermal','lease','capacity','model','unavailable','dependency','source key','quality triage','still writing','writing in','interrupted by progressagent','cancelled by progressagent','stage process cancelled','exited without a result','database lock','lock timeout','deadlock','canceling statement')):
         return 'retry_dependency','A bounded dependency wait is ready to be checked again'
     return "recover", "Current stage has no executing claim or its delivery is stale"
 
