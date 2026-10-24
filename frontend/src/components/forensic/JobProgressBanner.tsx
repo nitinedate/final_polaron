@@ -83,16 +83,23 @@ export function JobProgressBanner({
           <p className="mt-1 text-sm leading-snug text-ink-700">{view.message}</p>
           {(job.pipeline_progress?.serial_pipeline?.evidence_directories?.length ?? 0) > 1 ? (
             <ul className="mt-2 space-y-1">
-              {job.pipeline_progress?.serial_pipeline?.evidence_directories?.map((directory) => (
-                <li key={`${directory.index}-${directory.label}`} className="text-xs text-ink-800">
-                  <span className="font-semibold">Directory {directory.index} of {directory.total}:</span>{" "}
-                  {directory.label}
-                  {" · "}
-                  {directory.state === "saved" ? "Saved" : directory.state === "extracting" ? "Extracting" : "Waiting"}
-                  {" · "}
-                  {Number(directory.segments || 0).toLocaleString()} segment file(s)
-                </li>
-              ))}
+              {job.pipeline_progress?.serial_pipeline?.evidence_directories?.map((directory) => {
+                const files = Number(directory.files || 0);
+                const quantity = directory.state === "extracting" && files <= 0
+                  ? "Opening"
+                  : directory.state === "waiting" && files <= 0
+                    ? "0 files"
+                    : `${files.toLocaleString()} files`;
+                return (
+                  <li key={`${directory.index}-${directory.label}`} className="text-xs text-ink-800">
+                    <span className="font-semibold tabular-nums">{quantity}</span>
+                    {" · "}
+                    {directory.label}
+                    {" · "}
+                    {directory.state === "saved" ? "Saved" : directory.state === "extracting" ? "Extracting" : "Waiting"}
+                  </li>
+                );
+              })}
             </ul>
           ) : null}
           {view.pathProgress && view.message !== view.pathProgress ? (

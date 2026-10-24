@@ -100,7 +100,8 @@ def directory_roster(db, job_id: str, row: dict | None = None) -> list[dict]:
 
     row = fetchone(
         db,
-        "SELECT disk_source, extracted_disk_uri FROM jobs WHERE id=:id",
+        """SELECT disk_source, extracted_disk_uri, files_extracted, bytes_extracted, pipeline_progress
+             FROM jobs WHERE id=:id""",
         {"id": job_id},
     ) or row or {}
     manifest = _manifest_from_row(row)
@@ -119,9 +120,28 @@ def directory_roster(db, job_id: str, row: dict | None = None) -> list[dict]:
     append = manifest.get("directory_append") if isinstance(manifest.get("directory_append"), dict) else None
     extracting = bool(append and append.get("owner"))
     first_pending = directory_key(pending[0]["directory"]) if pending else ""
+    stats = manifest.get("directory_stats") if isinstance(manifest.get("directory_stats"), list) else []
+    stats_by_key = {
+        directory_key(str(item.get("directory") or "")): item
+        for item in stats
+        if isinstance(item, dict)
+    }
+    progress = row.get("pipeline_progress") or {}
+    if isinstance(progress, str):
+        try:
+            progress = json.loads(progress)
+        except (TypeError, ValueError):
+            progress = {}
+    activity = progress.get("extraction_activity") if isinstance(progress, dict) else {}
+    if not isinstance(activity, dict):
+        activity = {}
     roster: list[dict] = []
+    saved_missing: list[dict] = []
     for index, group in enumerate(registered, 1):
         key = directory_key(group["directory"])
+        stat = stats_by_key.get(key)
+        known_files = int(stat.get("files") or 0) if stat else None
+        known_bytes = int(stat.get("bytes") or 0) if stat else None
         if key not in pending_keys:
             state = "saved"
             detail = "Saved and included in the combined file list."
@@ -136,19 +156,46 @@ def directory_roster(db, job_id: str, row: dict | None = None) -> list[dict]:
                 detail = f"Opening this image now. Worker heartbeat {age}s ago."
             else:
                 detail = "This image is opening now."
+            active_label = str(activity.get("directory_label") or "")
+            if active_label and active_label == str(group.get("label") or ""):
+                prior = int(manifest.get("files_extracted") or 0)
+                packed = activity.get("files_packed", activity.get("files_extracted"))
+                try:
+                    packed_n = int(packed) if packed is not None else None
+                except (TypeError, ValueError):
+                    packed_n = None
+                known_files = max(0, packed_n - prior) if packed_n is not None and packed_n >= prior else int(activity.get("files_found") or 0)
+                known_bytes = 0
+            else:
+                known_files = 0
+                known_bytes = 0
         else:
             state = "waiting"
             detail = "Previous directories are saved. This directory is next."
-        roster.append(
-            {
-                "index": index,
-                "total": len(registered),
-                "label": group["label"],
-                "segments": len(group["paths"]),
-                "state": state,
-                "detail": detail,
-            }
-        )
+            known_files = 0
+            known_bytes = 0
+        entry = {
+            "index": index,
+            "total": len(registered),
+            "label": group["label"],
+            "segments": len(group["paths"]),
+            "state": state,
+            "detail": detail,
+            "files": known_files,
+            "bytes": known_bytes,
+        }
+        if state == "saved" and known_files is None:
+            saved_missing.append(entry)
+        roster.append(entry)
+    if len(saved_missing) == 1:
+        only = saved_missing[0]
+        known_files = sum(int(entry.get("files") or 0) for entry in roster if entry is not only and entry.get("files") is not None)
+        known_bytes = sum(int(entry.get("bytes") or 0) for entry in roster if entry is not only and entry.get("bytes") is not None)
+        only["files"] = max(0, int(row.get("files_extracted") or manifest.get("files_extracted") or 0) - known_files)
+        only["bytes"] = max(0, int(row.get("bytes_extracted") or manifest.get("bytes_extracted") or 0) - known_bytes)
+    for entry in roster:
+        entry["files"] = int(entry.get("files") or 0)
+        entry["bytes"] = int(entry.get("bytes") or 0)
     return roster
 
 
@@ -676,6 +723,19 @@ def _publish_directory(
     files_total = int(published.get("files_extracted") or 0) + int(files_added)
     bytes_total = int(published.get("bytes_extracted") or 0) + int(bytes_added)
     skipped = int(published.get("files_skipped") or 0) + int(skipped_added)
+    directory_stats = [
+        item for item in (published.get("directory_stats") or [])
+        if isinstance(item, dict) and directory_key(str(item.get("directory") or "")) != directory_key(group["directory"])
+    ]
+    directory_stats.append(
+        {
+            "directory": group["directory"],
+            "label": group.get("label") or "",
+            "files": int(files_added),
+            "bytes": int(bytes_added),
+            "skipped": int(skipped_added),
+        }
+    )
     published.update(
         {
             "segment_paths": list(published.get("segment_paths") or []) + list(group["paths"]),
@@ -688,6 +748,7 @@ def _publish_directory(
             "parts": parts,
             "index_uri": index_uri,
             "extracted_directories": list(published.get("extracted_directories") or []) + [group["directory"]],
+            "directory_stats": directory_stats,
             "filter_stats": {**(published.get("filter_stats") or {}), "next_directory": filter_stats},
         }
     )

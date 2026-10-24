@@ -83,6 +83,10 @@ export interface PipelineProgress {
       segments: number;
       state: "saved" | "extracting" | "waiting" | string;
       detail: string;
+      /** Files extracted from this directory. Zero while the image is still opening. */
+      files?: number;
+      /** Bytes extracted from this directory. */
+      bytes?: number;
     }>;
     stages: Array<{
       id: string;
