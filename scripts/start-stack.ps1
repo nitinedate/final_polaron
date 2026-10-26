@@ -1,6 +1,6 @@
 ﻿# Start isolated Aetheris products plus the shared host-capacity coordinator.
 param(
-    [ValidateSet("forensic", "mobile-android", "mobile-ios", "mobile-extract", "vuln", "all")]
+    [ValidateSet("forensic", "mobile-android", "mobile-ios", "mobile-extract", "mobile-malware", "vuln", "all")]
     [string]$Service = "forensic",
     [switch]$NoScanners,
     [switch]$IncludeGvm,
@@ -72,6 +72,13 @@ function Start-AetherisService {
         $composeArgs += @("--project-name", "aetheris-mobile-extract", "-f", "services/mobile-extract/docker-compose.yml", "-f", $drivesFile)
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\ensure-examiner-kit.ps1")
     }
+    elseif ($Name -eq "mobile-malware") {
+        # Analysis-only product: no drive mounts, no USB helper, CPU-only in phase 1.
+        $composeArgs += @("--project-name", "aetheris-mobile-malware", "-f", "services/mobile-malware/docker-compose.yml")
+        if ($env:MALWARE_GPU_MODEL_ENABLED -eq "true") { $composeArgs += @("--profile", "gpu") }
+        $malwareData = Join-Path $(if ($env:AETHERIS_BACKUP_DIR) { $env:AETHERIS_BACKUP_DIR } else { Join-Path $root "backup" }) "forensic-data\mobile-malware"
+        New-Item -ItemType Directory -Force -Path $malwareData | Out-Null
+    }
     elseif ($Name -eq "vuln") {
         $composeArgs += @("--project-name", "aetheris-vuln", "-f", "services/vuln/docker-compose.yml")
         if (-not $NoScanners) {
@@ -118,6 +125,13 @@ function Start-AetherisService {
             @("api"),
             @("worker-mobile", "worker-beat", "worker-ocr-gpu", "worker-rag-gpu")
         )
+    }
+    elseif ($Name -eq "mobile-malware") {
+        $waves = @(
+            @("api"),
+            @("worker-scan", "worker-static", "worker-ai", "worker-progress", "worker-beat")
+        )
+        if ($env:MALWARE_GPU_MODEL_ENABLED -eq "true") { $waves += ,@("worker-ml-gpu") }
     }
     elseif ($Name -eq "vuln") {
         $infra = @()
@@ -226,6 +240,11 @@ function Start-AetherisService {
                 Write-Host "Greenbone did not become healthy. Recent gvmd and pg-gvm logs:" -ForegroundColor Yellow
                 (Invoke-NativeCapture -Exe $Docker -Arguments ($composeArgs + @("logs", "--tail", "40", "gvmd", "pg-gvm"))).Lines | ForEach-Object { Write-Host $_ }
             }
+            if ($Name -eq "mobile-malware") {
+                Write-Host "Malware Detection did not become healthy. Recent API log:" -ForegroundColor Yellow
+                (Invoke-NativeCapture -Exe $Docker -Arguments ($composeArgs + @("logs", "--tail", "60", "api"))).Lines | ForEach-Object { Write-Host $_ }
+                Write-Host "Full diagnosis (containers, API health, gateway route): .\scripts\check-malware-stack.ps1" -ForegroundColor Yellow
+            }
             throw "docker compose failed for $Name wave [$($durable -join ', ')] (exit $LASTEXITCODE)"
         }
     }
@@ -244,6 +263,9 @@ function Start-AetherisService {
     }
     elseif ($Name -eq "mobile-extract") {
         Write-Host "Legacy mobile extraction API started on http://localhost:8081"
+    }
+    elseif ($Name -eq "mobile-malware") {
+        Write-Host "Mobile Malware Detection API: http://localhost:8085 (UI: gateway > Malware Detection). Diagnose: .\scripts\check-malware-stack.ps1"
     }
     elseif ($Name -eq "vuln") {
         Write-Host "Vulnerabilities API started on http://localhost:8082"
@@ -295,7 +317,7 @@ try {
     }
     Write-Host "Shared infrastructure is up. Postgres 127.0.0.1:5434, Redis 127.0.0.1:6380, MinIO 127.0.0.1:9004, pgAdmin 127.0.0.1:5052." -ForegroundColor Green
 
-    $targets = if ($Service -eq "all") { @("forensic", "mobile-android", "mobile-ios", "vuln") } else { @($Service) }
+    $targets = if ($Service -eq "all") { @("forensic", "mobile-android", "mobile-ios", "mobile-malware", "vuln") } else { @($Service) }
     foreach ($name in $targets) {
         Start-AetherisService -Name $name -Docker $docker
     }
@@ -316,7 +338,9 @@ try {
             "-f", "services/gateway/docker-compose.yml"
         )
         Clear-OccupiedHostPorts -Docker $docker -ComposeArgs $gwCompose -Services @("gateway") -IncludeRunning
-        $gwArgs = $gwCompose + @("up", "-d", "--remove-orphans", "--wait", "--wait-timeout", "180")
+        # --force-recreate: nginx-gateway.conf is a single-file bind mount. Updating Polaron writes a new file, and a
+        # running gateway keeps the old one (old inode) until recreated, so new routes such as /api/malware/ stay missing.
+        $gwArgs = $gwCompose + @("up", "-d", "--remove-orphans", "--force-recreate", "--wait", "--wait-timeout", "180")
         if (-not $NoBuild) { $gwArgs += "--build" }
         & $docker @gwArgs
         if ($LASTEXITCODE -ne 0) {

@@ -58,7 +58,8 @@ function Find-KitPython {
             $err = Join-Path $env:TEMP ("aetheris_pyok_" + $tag + ".err")
             $proc = Start-Process -FilePath $c -ArgumentList @("-c", "print(1)") -PassThru -WindowStyle Hidden `
                 -RedirectStandardOutput $out -RedirectStandardError $err
-            if (-not $proc.WaitForExit(2500)) { try { $proc.Kill() } catch {}; Remove-Item $out, $err -Force -ErrorAction SilentlyContinue; continue }
+            $null = $proc.Handle  # Windows PowerShell 5.1: without a cached handle ExitCode reads as empty after exit
+            if (-not $proc.WaitForExit(6000)) { try { $proc.Kill() } catch {}; Remove-Item $out, $err -Force -ErrorAction SilentlyContinue; continue }
             $ok = ($proc.ExitCode -eq 0)
             Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
             if ($ok) { $script:CachedKitPython = $c; return $c }

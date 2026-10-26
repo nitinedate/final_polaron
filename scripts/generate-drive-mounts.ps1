@@ -671,7 +671,7 @@ function Write-VerifiedDriveOverride {
     Write-ScanNote ("Updated {0}: {1}" -f ([System.IO.Path]::GetFileName($Path)), ($letters -join ', '))
 }
 
-# All three product overlays must be derived from the SAME verified drive
+# All product overlays must be derived from the SAME verified drive
 # inventory. The former launcher refreshed only the unused generic override;
 # stale G:/ binds remained in docker-compose.drives.forensic.yml forever.
 Write-VerifiedDriveOverride -Path $out -Services $serviceNames
@@ -679,7 +679,10 @@ if ($WriteStartupStackOverrides) {
     $startupOverrides = @(
         @{ File = 'docker-compose.drives.forensic.yml'; Services = @('api', 'worker-disk', 'worker-parse', 'worker-report', 'worker-agent') },
         @{ File = 'docker-compose.drives.mobile-android.yml'; Services = @('api', 'worker-build', 'worker-parse') },
-        @{ File = 'docker-compose.drives.mobile-ios.yml'; Services = @('api', 'worker-build', 'worker-parse') }
+        @{ File = 'docker-compose.drives.mobile-ios.yml'; Services = @('api', 'worker-build', 'worker-parse') },
+        # Malware Detection reads evidence (read-only, like every overlay here) when a job has no
+        # MinIO copy and its bytes must come from the original disk image.
+        @{ File = 'docker-compose.drives.mobile-malware.yml'; Services = @('api', 'worker-scan', 'worker-static', 'worker-ml-gpu') }
     )
     foreach ($row in $startupOverrides) {
         Write-VerifiedDriveOverride -Path (Join-Path $root $row.File) -Services $row.Services

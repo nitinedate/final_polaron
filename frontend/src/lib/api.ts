@@ -267,12 +267,18 @@ export async function request<T = any>(path: string, opts: RequestOptions = {}):
     const err = data?.error;
     const fallback =
       res.status === 502
-        ? "Bad Gateway — the API is still starting (or was just restarted). Wait a few seconds and try again."
+        ? `Bad Gateway (502): the ${SERVICE_LABEL[inferApiService(path, opts.service)] ?? "product"} API is not reachable. ` +
+          "It is stopped, still starting, or failed to start; check its containers, then try again."
         : res.statusText;
     throw new ApiError(res.status, err?.code || "error", err?.message || fallback);
   }
   return (await parse(res)) as T;
 }
+
+const SERVICE_LABEL: Record<string, string> = {
+  forensic: "Disk Forensics", "mobile-android": "Android", "mobile-ios": "iOS", "mobile-extract": "Mobile extraction",
+  vuln: "Vulnerability", "mobile-malware": "Malware Detection",
+};
 
 export const api = {
   get: <T = any>(path: string, query?: RequestOptions["query"], extra?: Partial<RequestOptions>) =>

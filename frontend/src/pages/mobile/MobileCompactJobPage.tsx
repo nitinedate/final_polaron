@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { FileUp, ListChecks, Play, RefreshCw, Square, Trash2 } from "lucide-react";
 import { Badge, Button, Card, PageHeader } from "../../components/ui";
+import { Bug as MalwareScanIcon } from "lucide-react";
+import { isMalwareModuleEnabled } from "../../lib/malwareFlags";
+import { mobilePlatformService as malwarePlatformHint } from "../../lib/serviceMode";
 import { HostEvidencePanel, type HostEvidencePanelHandle } from "../../components/forensic/HostEvidencePanel";
 import { AgentPipelineBanner } from "../../components/forensic/AgentPipelineBanner";
 import { JobActivityPanel } from "../../components/forensic/JobActivityPanel";
@@ -181,6 +184,13 @@ export function MobileCompactJobPage() {
             >
               <FileUp className="h-4 w-4" /> Select folder & start
             </Button>
+            {isMalwareModuleEnabled() && jobId ? (
+              <Link to={`/mobile/malware/scans/new?job=${jobId}${malwarePlatformHint() ? `&platform=${malwarePlatformHint()}` : ""}`}>
+                <Button variant="outline">
+                  <MalwareScanIcon className="h-4 w-4" /> Scan for malware
+                </Button>
+              </Link>
+            ) : null}
             <Link to={`${base}/jobs/${jobId}/artifacts`}>
               <Button variant="outline">
                 <ListChecks className="h-4 w-4" /> Artifacts

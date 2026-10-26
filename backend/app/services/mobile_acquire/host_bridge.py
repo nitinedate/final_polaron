@@ -540,3 +540,43 @@ def host_run_acquire(
             "running, evidence may still be written — check 02_Original_Extraction."
         ],
     }
+
+
+# ---------------------------------------------------------------- Malware Detection live triage --
+def host_start_triage(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Ask the examiner-workstation helper to read the connected phone (read-only live triage)."""
+    return _post_json("/malware/triage", body, timeout_sec=60.0)
+
+
+def host_triage_status(triage_id: str) -> dict[str, Any] | None:
+    return _get_json(f"/malware/triage/{triage_id}", timeout_sec=20.0)
+
+
+def host_start_remediation(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Ask the helper to REMOVE malware from the connected phone (incident response; changes the phone)."""
+    return _post_json("/malware/remediate", body, timeout_sec=60.0)
+
+
+def host_remediation_status(job_id: str) -> dict[str, Any] | None:
+    return _get_json(f"/malware/remediate/{job_id}", timeout_sec=20.0)
+
+
+def host_triage_bundle(triage_id: str, dest: Path, *, max_bytes: int) -> int:
+    """Stream the finished triage bundle from the helper to ``dest``; refuse anything over ``max_bytes``."""
+    url = f"{helper_base_url()}/malware/triage/{triage_id}/bundle"
+    total = 0
+    with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=900) as resp, open(dest, "wb") as fh:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"triage bundle exceeds {max_bytes // 1048576} MB (MALWARE_LIVE_MAX_BUNDLE_MB)")
+            fh.write(chunk)
+    return total
+
+
+def helper_health() -> dict[str, Any] | None:
+    """The helper's /health (version, and capabilities such as ``malware_triage``)."""
+    return _get_json("/health", timeout_sec=3.0)

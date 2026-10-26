@@ -288,6 +288,13 @@ services:
       args:
         VITE_AETHERIS_SERVICE: mobile-android
         VITE_VULN_MODULE_ENABLED: "false"
+        VITE_MALWARE_MODULE_ENABLED: ${MALWARE_IN_MOBILE_UI:-true}
+    # Only aetheris-common: the product alias android-api and malware-api are unique there, whereas "api" is not.
+    networks:
+      - aetheris-common
+    environment:
+      AETHERIS_API_UPSTREAM: http://android-api:8080
+      AETHERIS_MALWARE_UPSTREAM: ${MALWARE_UI_UPSTREAM:-http://malware-api:8080}
     ports:
       - "3002:80"
     depends_on:

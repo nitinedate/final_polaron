@@ -10,8 +10,17 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $kit = Join-Path $root "scripts\ensure-examiner-kit.ps1"
 $networkConfig = Join-Path $root "scripts\configure-host-drive-helper-network.ps1"
 $helper = Join-Path $root "scripts\host-drive-helper.ps1"
+
+function Get-HelperScriptVersion {
+    # The version baked into the helper script this folder would launch.
+    try {
+        $line = Select-String -LiteralPath $helper -Pattern '\$script:HelperVersion\s*=\s*"([0-9.]+)"' -ErrorAction Stop | Select-Object -First 1
+        if ($line) { return $line.Matches[0].Groups[1].Value }
+    } catch { }
+    return $null
+}
 $agent = Join-Path $root "scripts\hostdrive-agent.ps1"
-$ExpectedHelperVersion = "5.52"
+$ExpectedHelperVersion = "5.56"
 
 function Test-IsAdministrator {
     try {
@@ -311,12 +320,36 @@ function Wait-HelperOnline {
     return $false
 }
 
+function Confirm-HelperVersion {
+    # The helper came online; make sure it is the version this release expects. If the host-drive-helper.ps1 on this
+    # workstation is older than the deployed release, the restart just relaunches the old file and the UI would keep
+    # asking for a restart forever. Detect that and say exactly what to do, instead of reporting a false success.
+    $h = Get-HelperHealth
+    if (-not $h) { return $true }
+    $running = [string]$h.helper_version
+    $onDisk = Get-HelperScriptVersion
+    if ($running -and $running -eq $ExpectedHelperVersion) { return $true }
+    Write-Host ""
+    Write-Host "The helper restarted but is still v$running, not the expected v$ExpectedHelperVersion." -ForegroundColor Red
+    if ($onDisk -and $onDisk -ne $ExpectedHelperVersion) {
+        Write-Host ("The helper script in this folder is v{0}:" -f $onDisk) -ForegroundColor Yellow
+        Write-Host ("    {0}" -f $helper) -ForegroundColor Yellow
+        Write-Host "This Polaron folder was not fully updated. Overlay the latest patch onto THIS folder (the one the" -ForegroundColor Yellow
+        Write-Host "helper runs from), then run this again. If you have more than one Polaron folder, update the one above." -ForegroundColor Yellow
+    } else {
+        Write-Host "Another host-drive-helper may be running from a different Polaron folder on this workstation." -ForegroundColor Yellow
+        Write-Host "Close it (or restart the workstation) and run this again from the current folder." -ForegroundColor Yellow
+    }
+    return $false
+}
+
 Write-Host "Starting host drive helper on port $Port in background..."
 $proc = Start-HelperBackground -RequestedBindHost $BindHost
 Set-Content -Path $pidFile -Value $proc.Id -Encoding ascii
 
 if (Wait-HelperOnline -Process $proc -RequestedBindHost $BindHost) {
-    exit 0
+    if (Confirm-HelperVersion) { exit 0 }
+    exit 2  # online but wrong version: the folder is stale, message above says how to fix
 }
 
 # If wildcard binding was blocked, keep the browser-side USB path functional by

@@ -63,6 +63,16 @@ import { Asset360Page } from "./pages/vuln/Asset360Page";
 import { AgentsPage } from "./pages/vuln/AgentsPage";
 import { CredentialsPage } from "./pages/vuln/CredentialsPage";
 import { isVulnModuleEnabled } from "./lib/vulnFlags";
+import { isMalwareModuleEnabled } from "./lib/malwareFlags";
+import { MalwareOverviewPage } from "./pages/mobile/malware/MalwareOverviewPage";
+import { MalwareNewScanPage } from "./pages/mobile/malware/MalwareNewScanPage";
+import { MalwareScansPage } from "./pages/mobile/malware/MalwareScansPage";
+import { MalwareScanDetailPage } from "./pages/mobile/malware/MalwareScanDetailPage";
+import { MalwareIntelPage } from "./pages/mobile/malware/MalwareIntelPage";
+import { MalwareModelsPage } from "./pages/mobile/malware/MalwareModelsPage";
+import { MalwareLivePage } from "./pages/mobile/malware/MalwareLivePage";
+import { MalwareWhatsAppPage } from "./pages/mobile/malware/MalwareWhatsAppPage";
+import { MalwareServiceGate } from "./components/malware/MalwareServiceGate";
 import { isDedicatedMobileService, isForensicService, isLegacyMobileExtractService, isUnifiedService } from "./lib/serviceMode";
 
 function FullScreenLoader() {
@@ -235,6 +245,19 @@ export default function App() {
             <Route path="mobile/ios/jobs/:jobId/intake" element={<RequireFirmScope><RequirePermission perm="job:run"><JobIntakePage /></RequirePermission></RequireFirmScope>} />
             <Route path="mobile/ios/jobs/:jobId/report" element={<RequireFirmScope><RequirePermission perm="job:read"><MobileReportPage /></RequirePermission></RequireFirmScope>} />
           </>
+        )}
+        {/* Malware Detection (mobile-malware service): every page sits behind the service gate */}
+        {isMalwareModuleEnabled() && (isUnifiedService() || isDedicatedMobileService()) && (
+          <Route element={<MalwareServiceGate />}>
+            <Route path="mobile/malware" element={<RequireFirmScope><RequirePermission perm="malware:read"><MalwareOverviewPage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/scans" element={<RequireFirmScope><RequirePermission perm="malware:read"><MalwareScansPage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/scans/new" element={<RequireFirmScope><RequirePermission perm="malware:scan"><MalwareNewScanPage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/scans/:scanId" element={<RequireFirmScope><RequirePermission perm="malware:read"><MalwareScanDetailPage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/intel" element={<RequireFirmScope><RequirePermission perm="malware:read"><MalwareIntelPage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/live" element={<RequireFirmScope><RequirePermission perm="malware:scan"><MalwareLivePage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/whatsapp" element={<RequireFirmScope><RequirePermission perm="malware:scan"><MalwareWhatsAppPage /></RequirePermission></RequireFirmScope>} />
+            <Route path="mobile/malware/models" element={<RequireFirmScope><RequirePermission perm="malware:read"><MalwareModelsPage /></RequirePermission></RequireFirmScope>} />
+          </Route>
         )}
         {isForensicService() && (
           <Route

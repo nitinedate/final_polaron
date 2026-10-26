@@ -85,6 +85,11 @@ The first build of the updated Dockerfiles installs any missing or newly
 changed dependencies. Later launches keep those layers cached. Removing Docker
 images/build cache or changing requirements/lockfiles requires rebuilding them.
 
+Mobile Malware Detection (`services/mobile-malware`) starts after the Android and iOS stacks with its own
+image (`backend/Dockerfile.malware`), its API on 127.0.0.1:8085 and the gateway route `/api/malware/`;
+set `MALWARE_GPU_MODEL_ENABLED=true` to also start its GPU worker. Diagnose it with
+`scripts/check-malware-stack.ps1`.
+
 The shared backend is compiled once, then tagged for Android and iOS. The
 launcher first verifies compatible backend context, Dockerfile and Torch
 channel settings. This prevents four duplicate backend application builds.

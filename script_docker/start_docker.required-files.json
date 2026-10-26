@@ -57,7 +57,13 @@
     "services/mobile-android/docker-compose.yml",
     "services/mobile-ios/docker-compose.yml",
     "services/vuln/docker-compose.yml",
-    "services/gateway/docker-compose.yml"
+    "services/gateway/docker-compose.yml",
+    "backend/Dockerfile.malware",
+    "backend/requirements-malware.txt",
+    "backend/app/main_mobile_malware.py",
+    "backend/app/celery_mobile_malware.py",
+    "services/mobile-malware/docker-compose.yml",
+    "scripts/check-malware-stack.ps1"
   ],
   "public": [
     "deployment/windows-ip-https/docker-compose.gateway-public-https.yml",

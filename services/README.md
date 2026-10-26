@@ -8,6 +8,7 @@ Aetheris runs Disk, Android, iOS, and Vulnerability workflows as independent pro
 | Disk Forensics | `services/forensic/docker-compose.yml` | gateway `:3000/:3001` | `:8083` | `disk-*` / forensic queues |
 | Android Forensics | `services/mobile-android/docker-compose.yml` | `:3002` | `:8081` | `android-*` |
 | iOS Forensics | `services/mobile-ios/docker-compose.yml` | `:3004` | `:8084` | `ios-*` |
+| Mobile Malware Detection | `services/mobile-malware/docker-compose.yml` | gateway: Mobile Forensics > Malware Detection | `:8085` | `malware-*` (Redis DB 5, bucket `mobile-malware`; reads Android/iOS evidence read-only) |
 | Vulnerabilities | `services/vuln/docker-compose.yml` | gateway | `:8082` | scanner queues |
 | Legacy mobile migration | `services/mobile-extract/docker-compose.yml` | — | legacy `:8081` | `mobile-*` |
 

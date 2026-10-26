@@ -434,7 +434,8 @@ class IosLockdownAdapter:
             crash_dir = dest / "crash_reports"
             crash_dir.mkdir(parents=True, exist_ok=True)
             try:
-                run_tool(["idevicecrashreport", "-u", device_id, "-e", str(crash_dir)],
+                # -k: copy only. Without it idevicecrashreport MOVES the reports, deleting them from the phone.
+                run_tool(["idevicecrashreport", "-u", device_id, "-k", "-e", str(crash_dir)],
                          timeout=900)
                 for path in crash_dir.rglob("*"):
                     if path.is_file():

@@ -1,6 +1,6 @@
 import { aetherisService } from "./serviceMode";
 
-export type ApiService = "forensic" | "mobile-android" | "mobile-ios" | "mobile-extract" | "vuln";
+export type ApiService = "forensic" | "mobile-android" | "mobile-ios" | "mobile-extract" | "vuln" | "mobile-malware";
 
 const VULN_PREFIXES = [
   "/api/vuln", "/api/scanners", "/api/scanner-agent", "/api/scan-jobs", "/api/scan-policies",
@@ -14,7 +14,7 @@ const memoryJobService = new Map<string, ApiService>();
 const goneJobIds = new Set<string>();
 
 function isJobApiService(value: unknown): value is ApiService {
-  return value === "forensic" || value === "mobile-android" || value === "mobile-ios" || value === "mobile-extract" || value === "vuln";
+  return value === "forensic" || value === "mobile-android" || value === "mobile-ios" || value === "mobile-extract" || value === "vuln" || value === "mobile-malware";
 }
 
 function pathIsVuln(path: string): boolean {
@@ -64,7 +64,8 @@ function persistJobServices(): void {
 }
 
 export function rememberJobService(jobId: string, service: ApiService): void {
-  if (!jobId || service === "vuln") return;
+  // Malware scans read Android/iOS jobs; they never own one, so never pin a job to it.
+  if (!jobId || service === "vuln" || service === "mobile-malware") return;
   memoryJobService.set(jobId, service);
   persistJobServices();
 }
@@ -103,6 +104,7 @@ export function serviceForJobCreate(type?: string | null, sourceType?: string | 
 /** Which physically isolated API should handle this request. */
 export function inferApiService(path: string, explicit?: ApiService): ApiService {
   if (explicit) return explicit;
+  if (path === "/api/malware" || path.startsWith("/api/malware/") || path.startsWith("/api/malware?")) return "mobile-malware";
   if (pathIsVuln(path)) return "vuln";
   const jobId = jobIdFromApiPath(path);
   if (jobId) {

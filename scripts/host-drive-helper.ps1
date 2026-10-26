@@ -32,7 +32,8 @@ function Test-PythonExe {
         $err = Join-Path $env:TEMP ("aetheris_pyok_" + $tag + ".err")
         $proc = Start-Process -FilePath $Exe -ArgumentList @("-c", "print(1)") -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $out -RedirectStandardError $err
-        if (-not $proc.WaitForExit(2000)) {
+        $null = $proc.Handle  # Windows PowerShell 5.1: without a cached handle ExitCode reads as empty after exit
+        if (-not $proc.WaitForExit(6000)) {  # a cold venv start with antivirus scanning often exceeds 2 s
             try { $proc.Kill() } catch {}
             Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
             return $false
@@ -42,6 +43,9 @@ function Test-PythonExe {
         return $ok
     } catch { return $false }
 }
+
+# Malware Detection live triage (read-only collection from a connected phone)
+. (Join-Path $PSScriptRoot 'host-malware-triage.ps1')
 
 function Get-HostPython {
     foreach ($c in @(
@@ -260,7 +264,7 @@ $script:AcquireJobs = @{}
 $script:RefreshStatusFile = Join-Path $env:TEMP ("aetheris_drive_refresh_{0}.json" -f $PID)
 $script:RefreshProcess = $null
 $refreshJobScript = Join-Path $root "scripts\refresh-drive-mounts-job.ps1"
-$script:HelperVersion = "5.52"  # V1.10.11: drive refresh starts on the accept thread, not behind a folder listing
+$script:HelperVersion = "5.56"  # V1.20.0: malware remediation (/malware/remediate); 5.55 triage budget
 $script:DeviceCacheAt = [datetime]::MinValue
 $script:DeviceCache = @()
 $script:DeviceScanBusy = $false
@@ -1990,6 +1994,8 @@ function Handle-Request {
             job_script         = $refreshJobScript
             job_script_version = (Get-JobScriptVersion)
             started_utc        = $script:HelperStartedUtc
+            malware_triage     = $true
+            malware_remediate  = $true
         }
         return
     }
@@ -2343,6 +2349,45 @@ function Handle-Request {
         return
     }
 
+    if ($request.HttpMethod -eq "POST" -and $path -eq "/malware/triage") {
+        if (Test-UsbAcquireInProgress) { Write-UsbBusyResponse -Response $response; return }
+        try {
+            $body = Start-MalwareTriage -Root $root -Payload (Read-RequestJson -Request $request)
+            $code = 409
+            if ($body.ok) { $code = 202 }
+            Write-JsonResponse -Response $response -StatusCode $code -Body $body
+        } catch {
+            Write-JsonResponse -Response $response -StatusCode 400 -Body @{ ok = $false; error = $_.Exception.Message }
+        }
+        return
+    }
+    if ($request.HttpMethod -eq "GET" -and $path -match '^/malware/triage/([0-9a-f]{32})(/bundle)?$') {
+        $tid = $Matches[1]
+        if ($Matches[2]) { Send-MalwareTriageBundle -Response $response -Root $root -Id $tid; return }
+        $st = Get-MalwareTriageStatus -Root $root -Id $tid
+        $code = 200
+        if ($st.status -eq 'unknown') { $code = 404 }
+        Write-JsonResponse -Response $response -StatusCode $code -Body $st
+        return
+    }
+    if ($request.HttpMethod -eq "POST" -and $path -eq "/malware/remediate") {
+        # Incident response: REMOVE malware from the connected phone. This CHANGES the phone (consent required).
+        if (Test-UsbAcquireInProgress) { Write-UsbBusyResponse -Response $response; return }
+        try {
+            $body = Start-MalwareRemediation -Root $root -Payload (Read-RequestJson -Request $request)
+            $code = if ($body.ok) { 202 } else { 409 }
+            Write-JsonResponse -Response $response -StatusCode $code -Body $body
+        } catch {
+            Write-JsonResponse -Response $response -StatusCode 400 -Body @{ ok = $false; error = $_.Exception.Message }
+        }
+        return
+    }
+    if ($request.HttpMethod -eq "GET" -and $path -match '^/malware/remediate/([0-9a-f]{32})$') {
+        $st = Get-MalwareRemediationStatus -Root $root -Id $Matches[1]
+        $code = if ($st.status -eq 'unknown') { 404 } else { 200 }
+        Write-JsonResponse -Response $response -StatusCode $code -Body $st
+        return
+    }
     if ($request.HttpMethod -eq "POST" -and $path -eq "/acquisition/run") {
         # Async: start Python and return immediately so /health and adapters stay up.
         # Browse / register stay available. Only a live USB acquire blocks another USB acquire.
@@ -3805,6 +3850,8 @@ $dispatcher.HealthJson = (@{
     job_script          = $refreshJobScript
     job_script_version  = (Get-JobScriptVersion)
     started_utc         = $script:HelperStartedUtc
+    malware_triage      = $true
+    malware_remediate   = $true
 } | ConvertTo-Json -Compress)
 $dispatcher.AdaptersJsonPath = $script:AdaptersCacheFile
 $dispatcher.DevicesJsonPath = $script:AcqDevicesCacheFile
@@ -3819,6 +3866,7 @@ $dispatcher.RefreshJobScript = $refreshJobScript
 $dispatcher.Start($listener)
 
 Write-Host "Host drive helper listening on $listenPrefix"
+Write-Host "Malware Detection live triage: POST /malware/triage, GET /malware/triage/{id}, GET /malware/triage/{id}/bundle"
 Write-Host "Endpoints: GET /health, GET /drives, GET /mobile-devices, GET /acquisition/adapters, GET /acquisition/devices, GET /acquisition/job, POST /acquisition/run, POST /acquisition/cancel, POST /acquisition/remove, POST /acquire, POST /refresh-drive-mounts, GET /refresh-drive-mounts, POST /resolve-folder, POST /list-dir"
 Write-Host "Project root: $root"
 Write-Host "Press Ctrl+C to stop."

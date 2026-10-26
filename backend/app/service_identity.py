@@ -16,6 +16,7 @@ ServiceName = Literal[
     "mobile-ios",
     "mobile-extract",
     "vuln",
+    "mobile-malware",
 ]
 
 FORENSIC: Final = "forensic"
@@ -25,12 +26,15 @@ MOBILE_IOS: Final = "mobile-ios"
 # services above; keeping this avoids breaking old recovery/upgrade scripts.
 MOBILE_EXTRACT: Final = "mobile-extract"
 VULN: Final = "vuln"
+# Malware Detection analyses finished Android/iOS jobs read-only. It owns no
+# jobs, acquisitions or evidence; only its own mw_* tables and bucket.
+MOBILE_MALWARE: Final = "mobile-malware"
 
 MOBILE_SERVICES: Final[frozenset[str]] = frozenset(
     {MOBILE_ANDROID, MOBILE_IOS, MOBILE_EXTRACT}
 )
 VALID_SERVICES: Final[frozenset[str]] = frozenset(
-    {FORENSIC, MOBILE_ANDROID, MOBILE_IOS, MOBILE_EXTRACT, VULN}
+    {FORENSIC, MOBILE_ANDROID, MOBILE_IOS, MOBILE_EXTRACT, VULN, MOBILE_MALWARE}
 )
 
 HEALTH_ROLES: Final[dict[str, str]] = {
@@ -39,6 +43,7 @@ HEALTH_ROLES: Final[dict[str, str]] = {
     MOBILE_IOS: "mobile-ios-api",
     MOBILE_EXTRACT: "mobile-extract-api",
     VULN: "vuln-api",
+    MOBILE_MALWARE: "mobile-malware-api",
 }
 
 ANDROID_JOB_TYPES: Final[frozenset[str]] = frozenset(
@@ -75,6 +80,9 @@ def current_service() -> ServiceName:
         "vulnerability": VULN,
         "volnureties": VULN,
         "scanner": VULN,
+        "mobile_malware": MOBILE_MALWARE,
+        "malware": MOBILE_MALWARE,
+        "malware-detection": MOBILE_MALWARE,
     }
     normalized = aliases.get(raw, raw)
     if normalized in VALID_SERVICES:

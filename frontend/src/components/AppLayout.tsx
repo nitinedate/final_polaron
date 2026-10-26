@@ -2,8 +2,13 @@ import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import clsx from "clsx";
 import {
+  Brain,
+  Bug,
   Building2,
   ChevronDown,
+  Database,
+  ListChecks,
+  ScanSearch,
   FileText,
   FolderSearch,
   HardDrive,
@@ -28,6 +33,7 @@ import { Brand } from "./Brand";
 import { useAuth } from "../lib/auth";
 import { tokenStore } from "../lib/api";
 import { isVulnModuleEnabled } from "../lib/vulnFlags";
+import { isMalwareModuleEnabled } from "../lib/malwareFlags";
 import { isDedicatedMobileService, isForensicService, isLegacyMobileExtractService, isUnifiedService, mobilePlatformService, serviceProductTitle } from "../lib/serviceMode";
 import { useTheme } from "../lib/theme";
 
@@ -40,12 +46,41 @@ interface NavItem {
   firmOnly?: boolean;
   platformOnly?: boolean;
   exact?: boolean;
-  work?: "acquire" | "images" | "jobs" | "artifacts" | "rag" | "reports";
+  work?: "acquire" | "images" | "jobs" | "artifacts" | "rag" | "reports" | "malware";
+  /** Renders the item as an expandable submenu. */
+  children?: NavItem[];
+  /** Exact highlight rule when a prefix match would light up siblings. */
+  match?: RegExp;
 }
 interface NavGroup {
   title: string;
   items: NavItem[];
 }
+
+/** Malware Detection: its own sidebar section (mobile-malware service), after the mobile forensics section. */
+const MALWARE_GROUPS: NavGroup[] = isMalwareModuleEnabled() && (isUnifiedService() || isDedicatedMobileService())
+  ? [
+      {
+        title: "Malware Detection",
+        items: [
+          { to: "/mobile/malware", label: "Malware Overview", icon: Bug, requiredPerm: "malware:read", firmOnly: true, exact: true },
+          { to: "/mobile/malware/scans/new", label: "New scan", icon: ScanSearch, requiredPerm: "malware:scan", firmOnly: true, exact: true },
+          { to: "/mobile/malware/live", label: "Scan a connected phone", icon: Smartphone, requiredPerm: "malware:scan", firmOnly: true },
+          { to: "/mobile/malware/whatsapp", label: "Mobile key (WhatsApp)", icon: KeyRound, requiredPerm: "malware:scan", firmOnly: true },
+          {
+            to: "/mobile/malware/scans",
+            label: "Scans and results",
+            icon: ListChecks,
+            requiredPerm: "malware:read",
+            firmOnly: true,
+            match: /^\/mobile\/malware\/scans(?:\/(?!new(?:\/|$))[^/]+)?\/?$/,
+          },
+          { to: "/mobile/malware/intel", label: "Threat intelligence", icon: Database, requiredPerm: "malware:read", firmOnly: true },
+          { to: "/mobile/malware/models", label: "Models and training", icon: Brain, requiredPerm: "malware:read", firmOnly: true },
+        ],
+      },
+    ]
+  : [];
 
 const GROUPS: NavGroup[] = [
   {
@@ -127,6 +162,7 @@ const GROUPS: NavGroup[] = [
           ] },
         ] as NavGroup[])
       : []),
+  ...MALWARE_GROUPS,
   ...(isVulnModuleEnabled()
     ? ([
         {
@@ -192,6 +228,12 @@ const TITLES: Record<string, string> = {
   "/mobile/reports": "Mobile Reports",
   "/mobile/new": "New Mobile Job",
   "/mobile/acquire": "Live Mobile Acquisition",
+  "/mobile/malware": "Malware Detection",
+  "/mobile/malware/scans": "Malware Scans",
+  "/mobile/malware/scans/new": "New Malware Scan",
+  "/mobile/malware/intel": "Threat Intelligence",
+  "/mobile/malware/whatsapp": "Mobile Key (WhatsApp)",
+  "/mobile/malware/models": "Models and Training",
   "/forensic/reports": "Report list",
   "/forensic/evidence-search": "Search evidence",
   "/vuln/dashboards": "Vulnerability Dashboards",
@@ -218,6 +260,13 @@ function resolveTitle(pathname: string): string {
   if (pathname === "/forensic/evidence-search") return "Search evidence";
   if (pathname === "/forensic/mobile") return "Mobile Extraction";
   if (pathname === "/forensic/mobile/new") return "New Mobile Extraction";
+  if (pathname === "/mobile/malware") return "Malware Detection";
+  if (pathname === "/mobile/malware/scans/new") return "New Malware Scan";
+  if (pathname === "/mobile/malware/scans") return "Malware Scans";
+  if (pathname === "/mobile/malware/intel") return "Threat Intelligence";
+  if (pathname === "/mobile/malware/whatsapp") return "Mobile Key (WhatsApp)";
+  if (pathname === "/mobile/malware/models") return "Models and Training";
+  if (pathname.startsWith("/mobile/malware/scans/")) return "Malware Scan";
   if (pathname === "/mobile") return isUnifiedService() ? "Mobile Forensics" : "Mobile Jobs";
   if (pathname === "/mobile/acquisition") return "Mobile Device → Image";
   if (pathname === "/mobile/images") return "Mobile Images → RAG";
@@ -336,14 +385,16 @@ function NavItems({
 }) {
   return (
     <div className="space-y-0.5">
-      {items.map((item) => (
+      {items.map((item) => item.children ? (
+        <NavSubmenu key={`submenu:${item.to}`} item={item} pathname={pathname} onNavigate={onNavigate} />
+      ) : (
         <NavLink
           key={item.to}
           to={item.to}
           end={item.exact || item.to === "/"}
           onClick={onNavigate}
           className={({ isActive }) => {
-            const active = isActive || itemMatchesPath(pathname, item);
+            const active = item.match ? itemMatchesPath(pathname, item) : isActive || itemMatchesPath(pathname, item);
             return clsx(
               "flex min-w-0 items-center gap-2 rounded-lg px-2 py-2 text-[13px] font-medium transition",
               active
@@ -353,7 +404,7 @@ function NavItems({
           }}
         >
           {({ isActive }) => {
-            const active = isActive || itemMatchesPath(pathname, item);
+            const active = item.match ? itemMatchesPath(pathname, item) : isActive || itemMatchesPath(pathname, item);
             return (
               <>
                 <item.icon
@@ -369,11 +420,45 @@ function NavItems({
   );
 }
 
+function NavSubmenu({ item, pathname, onNavigate }: { item: NavItem; pathname: string; onNavigate?: () => void }) {
+  const childActive = itemMatchesPath(pathname, item);
+  const [open, setOpen] = useState(childActive);
+  useEffect(() => {
+    if (childActive) setOpen(true);
+  }, [childActive]);
+  const panelId = `submenu-${item.to.replace(/[^a-z0-9]+/gi, "-")}`;
+  return (
+    <div>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen((v) => !v)}
+        className={clsx(
+          "flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-300",
+          childActive ? "text-brand-900" : "text-ink-500 hover:bg-accent-50/70 hover:text-ink-800"
+        )}
+      >
+        <item.icon className={clsx("h-4 w-4 shrink-0", childActive ? "text-brand-600" : "text-ink-400")} />
+        <span className="truncate">{item.label}</span>
+        <ChevronDown className={clsx("ml-auto h-3.5 w-3.5 shrink-0 text-ink-400 transition-transform", open && "rotate-180")} aria-hidden />
+      </button>
+      {open ? (
+        <div id={panelId} className="ml-[15px] mt-0.5 border-l border-ink-200 pl-2">
+          <NavItems items={item.children ?? []} pathname={pathname} onNavigate={onNavigate} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function mobileWorkSection(pathname: string): NavItem["work"] | null {
   const match = pathname.match(/^\/mobile(?:\/(android|ios))?(\/.*)?$/);
   if (!match) return null;
   const platform = match[1];
   const rest = match[2] || "";
+  // Before /report and /jobs: a malware page must never light up Mobile Reports or Jobs.
+  if (rest === "/malware" || rest.startsWith("/malware/")) return "malware";
   if (rest.includes("/artifacts")) return "artifacts";
   if (rest.includes("/report")) return "reports";
   if (rest === "/rag" || rest.startsWith("/rag/")) return "rag";
@@ -393,6 +478,8 @@ function mobileWorkSection(pathname: string): NavItem["work"] | null {
 }
 
 function itemMatchesPath(pathname: string, item: NavItem): boolean {
+  if (item.children) return item.children.some((child) => itemMatchesPath(pathname, child));
+  if (item.match) return item.match.test(pathname);
   if (item.work) return item.work === mobileWorkSection(pathname);
   if (item.exact || item.to === "/") return pathname === item.to;
   return pathname === item.to || pathname.startsWith(`${item.to}/`);
@@ -405,16 +492,22 @@ function groupMatchesPath(pathname: string, group: NavGroup): boolean {
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const location = useLocation();
   const { hasPermission, isPlatformScope } = useAuth();
+  const visible = (item: NavItem): boolean => {
+    if (item.firmOnly && isPlatformScope) return false;
+    if (item.platformOnly && !isPlatformScope) return false;
+    if (item.requiredAnyPerm && item.requiredAnyPerm.length > 0) {
+      return item.requiredAnyPerm.some((perm) => hasPermission(perm));
+    }
+    return !item.requiredPerm || hasPermission(item.requiredPerm);
+  };
+  const filterItems = (items: NavItem[]): NavItem[] =>
+    items
+      .filter(visible)
+      .map((item) => (item.children ? { ...item, children: filterItems(item.children) } : item))
+      .filter((item) => !item.children || item.children.length > 0);
   const groups = GROUPS.map((group) => ({
     ...group,
-    items: group.items.filter((item) => {
-      if (item.firmOnly && isPlatformScope) return false;
-      if (item.platformOnly && !isPlatformScope) return false;
-      if (item.requiredAnyPerm && item.requiredAnyPerm.length > 0) {
-        return item.requiredAnyPerm.some((perm) => hasPermission(perm));
-      }
-      return !item.requiredPerm || hasPermission(item.requiredPerm);
-    }),
+    items: filterItems(group.items),
   })).filter((group) => group.items.length > 0);
   const navGroups = groups.filter((group) => group.title !== "Account");
   const accountGroups = groups.filter((group) => group.title === "Account");

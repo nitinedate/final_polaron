@@ -13,6 +13,7 @@ from app.service_identity import (
     MOBILE_ANDROID,
     MOBILE_EXTRACT,
     MOBILE_IOS,
+    MOBILE_MALWARE,
     MOBILE_SERVICES,
     VULN,
     current_service,
@@ -112,6 +113,15 @@ VULN_ROUTES = {
     "app.tasks.pentest_job_task": {"queue": "nessus-sync"},
 }
 
+# Malware Detection: stage tasks carry an explicit queue at dispatch time; these
+# routes are the fallbacks. Queues never overlap with android-*/ios-*/disk-*.
+MALWARE_ROUTES = {
+    "app.malware.tasks.malware_stage_task": {"queue": "malware-static"},
+    "app.malware.tasks.malware_watchdog_task": {"queue": "malware-progress"},
+    "app.malware.tasks.malware_intel_sync_task": {"queue": "malware-progress"},
+    "app.malware.tasks.malware_narrative_task": {"queue": "malware-ai"},
+}
+
 _COMMON = {
     "task_serializer": "json",
     "result_serializer": "json",
@@ -152,6 +162,7 @@ def create_celery(service: str | None = None) -> Celery:
         MOBILE_IOS: IOS_ROUTES,
         MOBILE_EXTRACT: MOBILE_ROUTES,
         VULN: VULN_ROUTES,
+        MOBILE_MALWARE: MALWARE_ROUTES,
     }.get(svc, FORENSIC_ROUTES)
     celery.conf.update({**_COMMON, "task_routes": routes})
     # gdbm cannot lock celerybeat-schedule on a Windows Docker bind-mount (/app).
@@ -166,6 +177,21 @@ def create_celery(service: str | None = None) -> Celery:
                 "schedule": max(5,min(float(os.environ.get('PROGRESS_AGENT_INTERVAL_SECONDS','15')),30)),
                 "kwargs": {},
             },
+        }
+    elif svc == MOBILE_MALWARE:
+        celery.conf.beat_schedule = {
+            "malwareWatchdog": {
+                "task": "app.malware.tasks.malware_watchdog_task",
+                "schedule": max(10.0, float(os.environ.get("MALWARE_WATCHDOG_INTERVAL_SECONDS", "30"))),
+                "options": {"queue": "malware-progress"},
+            },
+        }
+        # Definition updates at fixed local times (MALWARE_INTEL_SYNC_TIMES / _TIMEZONE). A 5-minute tick decides,
+        # so a time missed while Polaron was stopped is caught up; the task itself honours MALWARE_INTEL_ONLINE_SYNC.
+        celery.conf.beat_schedule["malwareIntelSync"] = {
+            "task": "app.malware.tasks.malware_intel_sync_task",
+            "schedule": 300.0,
+            "options": {"queue": "malware-progress"},
         }
     register_shutdown_hooks(celery)
     return celery

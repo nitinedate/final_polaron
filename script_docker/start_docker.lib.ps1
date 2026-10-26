@@ -27,10 +27,15 @@ function Get-StackComposeArgs {
         'forensic' { 'docker-compose.drives.forensic.yml' }
         'mobile-android' { 'docker-compose.drives.mobile-android.yml' }
         'mobile-ios' { 'docker-compose.drives.mobile-ios.yml' }
+        'mobile-malware' { 'docker-compose.drives.mobile-malware.yml' }
         default { '' }
     }
     if ($drives -and (Test-Path -LiteralPath (Join-Path $Root $drives))) {
         $composeArgs += @('-f', $drives)
+    }
+    # The GPU sequence-model worker is opt-in (Compose profile 'gpu').
+    if ($Name -eq 'mobile-malware' -and "$env:MALWARE_GPU_MODEL_ENABLED" -eq 'true') {
+        $composeArgs += @('--profile', 'gpu')
     }
     return $composeArgs
 }
@@ -247,6 +252,8 @@ map `$http_x_aetheris_service `$hdr_upstream {
     mobile-extract http://android-api:8080;
     mobile http://android-api:8080;
     vuln http://vuln-api:8080;
+    mobile-malware http://malware-api:8080;
+    malware http://malware-api:8080;
 }
 server {
     listen 80 default_server;
@@ -363,7 +370,7 @@ function Get-StackContainerReport {
     $optionalServices = @("zap", "trivy", "gvmd", "openvas", "openvasd", "ospd-openvas", "redis-gvm", "pg-gvm", "gvm-tools", "vulnerability-tests", "notus-data", "scap-data", "cert-bund-data", "dfn-cert-data", "data-objects", "report-formats", "gpg-data", "configure-openvas", "pg-gvm-migrator")
     $warmupServices = @("gvmd", "openvasd", "ospd-openvas", "pg-gvm")
     $optionalFailed = @()
-    foreach ($project in @("aetheris-common", "aetheris-forensic", "aetheris-mobile-android", "aetheris-mobile-ios", "aetheris-vuln", "aetheris-gateway")) {
+    foreach ($project in @("aetheris-common", "aetheris-forensic", "aetheris-mobile-android", "aetheris-mobile-ios", "aetheris-mobile-malware", "aetheris-vuln", "aetheris-gateway")) {
         $ids = @(& docker ps -aq --filter "label=com.docker.compose.project=$project")
         if ($LASTEXITCODE -ne 0) { throw "Could not inspect containers for $project." }
         if (-not $ids.Count) { $missing += $project; continue }

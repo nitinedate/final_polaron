@@ -44,7 +44,7 @@ function Stop-PolaronStacks {
     # Before, the six projects were stopped one after another and the console
     # showed nothing while e.g. the 11 vulnerability containers shut down.
     Write-Step 'Stop existing Polaron project containers (preserve volumes/evidence)'
-    $names = @('aetheris-gateway','aetheris-vuln','aetheris-mobile-ios','aetheris-mobile-android','aetheris-forensic','aetheris-common')
+    $names = @('aetheris-gateway','aetheris-vuln','aetheris-mobile-malware','aetheris-mobile-ios','aetheris-mobile-android','aetheris-forensic','aetheris-common')
     $all = New-Object System.Collections.ArrayList
     foreach ($name in $names) {
         $ids = @(& docker ps -q --filter "label=com.docker.compose.project=$name")
@@ -116,7 +116,8 @@ function Assert-RuntimeHealth {
         @{ Project='aetheris-common'; Service='redis' },
         @{ Project='aetheris-forensic'; Service='api' },
         @{ Project='aetheris-mobile-android'; Service='api' },
-        @{ Project='aetheris-mobile-ios'; Service='api' }
+        @{ Project='aetheris-mobile-ios'; Service='api' },
+        @{ Project='aetheris-mobile-malware'; Service='api' }
     )
     foreach ($row in $required) {
         if (-not (Wait-ComposeServiceReady -ProjectName $row.Project -Service $row.Service -TimeoutSeconds 120)) {
@@ -158,7 +159,8 @@ function Invoke-DriveMountRefresh {
         'docker-compose.drives.generated.yml',
         'docker-compose.drives.forensic.yml',
         'docker-compose.drives.mobile-android.yml',
-        'docker-compose.drives.mobile-ios.yml'
+        'docker-compose.drives.mobile-ios.yml',
+        'docker-compose.drives.mobile-malware.yml'
     )
     $startedUtc = [DateTime]::UtcNow.AddSeconds(-2)
     Write-Host ("    Scanning drives for ALL product stacks (time limit {0}s)..." -f $timeoutSec)
@@ -191,7 +193,87 @@ function Invoke-DriveMountRefresh {
     $mapped = @([regex]::Matches($forensicText, "/host/([a-z])'") |
         ForEach-Object { $_.Groups[1].Value.ToUpper() } | Sort-Object -Unique)
     Write-Ok ("Current forensic drive mounts: {0}" -f $(if ($mapped.Count) { $mapped -join ', ' } else { 'none' }))
-    Write-Ok 'Generic, forensic, Android and iOS drive overlays refreshed from one verified scan.'
+    Write-Ok 'Generic, forensic, Android, iOS and Malware Detection drive overlays refreshed from one verified scan.'
+}
+
+function Show-NewLogLines {
+    # Print the complete lines a running process has added to its log since the last call; returns the new count.
+    # -Final also prints a last line that has no newline yet.
+    param([string]$Path, [int]$Shown, [switch]$Final)
+    if (-not (Test-Path -LiteralPath $Path)) { return $Shown }
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try { $text = (New-Object System.IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+    } catch { return $Shown }
+    if (-not $text) { return $Shown }
+    $lines = @($text -split "`r?`n")
+    if ($text.EndsWith("`n") -or -not $Final) { $lines = @($lines | Select-Object -First ([Math]::Max(0, $lines.Count - 1))) }
+    for ($i = $Shown; $i -lt $lines.Count; $i++) {
+        if ([string]$lines[$i]) { Write-Host ('    ' + $lines[$i]) }
+    }
+    return [Math]::Max($Shown, $lines.Count)
+}
+
+function Ensure-WorkstationHelper {
+    # Connected phones (detection, Device -> Image, and Malware Detection's "Scan a connected phone") need the
+    # Polaron host helper and the examiner kit (tools\host-python with pymobiledevice3, tools\platform-tools\adb)
+    # on this workstation. ensure-host-drive-helper.ps1 installs the kit when missing and restarts a helper that
+    # is older than this release, so a deployment never leaves phones on yesterday's helper. Never fatal.
+    Write-Step 'Ensure the workstation helper for connected phones (detection and direct malware scans)'
+    $ensure = Join-Path $root 'scripts/ensure-host-drive-helper.ps1'
+    if (-not (Test-Path -LiteralPath $ensure -PathType Leaf)) {
+        Write-Warn "Missing $ensure; connected phones cannot be detected or scanned directly."
+        return
+    }
+    # Wait for the setup script to EXIT, never for its output to END: the helper it starts keeps running in the
+    # background and inherits the script's output handles, so piping that output (| ForEach-Object) waits forever.
+    # The output goes to a log file instead, shown line by line while the script runs.
+    $log = Join-Path ([System.IO.Path]::GetTempPath()) ('aetheris-helper-setup-' + [guid]::NewGuid().ToString('N') + '.log')
+    $errLog = $log + '.err'
+    $code = $null
+    try {
+        $proc = Start-Process -FilePath 'powershell.exe' -NoNewWindow -PassThru -RedirectStandardOutput $log -RedirectStandardError $errLog `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ensure))
+        $null = $proc.Handle  # keeps ExitCode readable after exit in Windows PowerShell 5.1
+        $deadline = (Get-Date).AddMinutes(15)  # first run may download the examiner kit
+        $shown = 0
+        while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+            $shown = Show-NewLogLines -Path $log -Shown $shown
+            Start-Sleep -Milliseconds 500
+        }
+        $shown = Show-NewLogLines -Path $log -Shown $shown -Final
+        $null = Show-NewLogLines -Path $errLog -Shown 0 -Final
+        if ($proc.HasExited) { $code = $proc.ExitCode } else { Write-Warn "Helper setup is still running after 15 minutes; continuing. Its log: $log" }
+    } catch {
+        Write-Warn "Could not run the helper setup: $($_.Exception.Message)"
+    }
+    $port = 9876
+    if ("$env:HOST_DRIVE_HELPER_PORT" -match '^[0-9]+$') { $port = [int]$env:HOST_DRIVE_HELPER_PORT }
+    try {
+        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 10
+        $running = [string]$health.helper_version
+        $onDisk = $null
+        $helperFile = Join-Path $root 'scripts/host-drive-helper.ps1'
+        if (Test-Path -LiteralPath $helperFile) {
+            $m = Select-String -LiteralPath $helperFile -Pattern '\$script:HelperVersion\s*=\s*"([0-9.]+)"' | Select-Object -First 1
+            if ($m) { $onDisk = $m.Matches[0].Groups[1].Value }
+        }
+        if ($health.malware_triage) {
+            Write-Ok "Workstation helper v$running is running: phones are detected and can be scanned directly."
+        } elseif ($onDisk -and $running -and $onDisk -ne $running) {
+            # The helper is running an old version even though a newer script is on disk here: the setup could not
+            # replace the running one (another Polaron folder, or it is launched from elsewhere).
+            Write-Warn "Workstation helper is still v$running but this folder has v$onDisk. The old helper did not get replaced."
+            Write-Warn "Run scripts\ensure-host-drive-helper.ps1 -ForceRestart on the workstation. If it stays old, another"
+            Write-Warn "Polaron folder is running the helper - close it (or restart the workstation) and run from this folder."
+        } elseif ($onDisk -and $onDisk -ne '5.55' -and -not $health.malware_triage) {
+            Write-Warn "This Polaron folder's helper is v$onDisk, older than this release. Overlay the latest patch onto THIS folder, then run start_docker again."
+        } else {
+            Write-Warn "Workstation helper v$running cannot read phones for Malware Detection yet. Run scripts\ensure-host-drive-helper.ps1 -ForceRestart."
+        }
+    } catch {
+        Write-Warn "Workstation helper is not answering (setup exit $code). Phone detection and Scan a connected phone need it: run scripts\ensure-host-drive-helper.ps1."
+    }
 }
 
 function Assert-DockerReady {
@@ -215,7 +297,7 @@ function Get-ComposeConfig {
 
 function Get-AllStackDefinitions {
     $rows = @()
-    foreach ($name in @('common', 'forensic', 'mobile-android', 'mobile-ios', 'vuln')) {
+    foreach ($name in @('common', 'forensic', 'mobile-android', 'mobile-ios', 'mobile-malware', 'vuln')) {
         $rows += [pscustomobject]@{ Name = $name; Args = @(Get-StackComposeArgs -Root $root -Name $name) }
     }
     $gateway = @('compose', '--project-directory', $root, '--project-name', 'aetheris-gateway',
@@ -860,7 +942,8 @@ try {
     Ensure-CommonRedisHealthy -ComposeArgs $commonArgs
 
     Write-Step "Start product stacks"
-    foreach ($name in @('forensic', 'mobile-android', 'mobile-ios')) {
+    # mobile-malware reads finished Android/iOS jobs read-only, so it starts after them.
+    foreach ($name in @('forensic', 'mobile-android', 'mobile-ios', 'mobile-malware')) {
         $args = @(Get-StackComposeArgs -Root $root -Name $name)
         Invoke-StackUp -Name $name -ComposeArgs $args
         Ensure-MobileCoreWorkersStarted -Name $name -ComposeArgs $args
@@ -895,6 +978,7 @@ try {
     }
 
     Assert-RuntimeHealth
+    Ensure-WorkstationHelper
 
     Write-Host ''
     if ($isPublic) {
@@ -907,12 +991,16 @@ try {
         Write-Host "READY (frontend HTTP): http://localhost:3001/" -ForegroundColor Green
         Write-Host "READY (frontend HTTP on LAN): http://<WINDOWS_LAN_IP>:3001/ (requires LAN firewall access)" -ForegroundColor Yellow
     }
+    Write-Host "Malware Detection: sidebar > Malware Detection (API on http://localhost:8085)" -ForegroundColor Green
     Write-Host "Application build ID: $buildId" -ForegroundColor DarkGray
 }
 catch {
     $exitCode = 1
     Write-Host ''
     Write-Host "STARTUP ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    if ("$($_.Exception.Message)" -match 'malware') {
+        Write-Host 'Malware Detection diagnosis (containers, API log, gateway route): .\scripts\check-malware-stack.ps1' -ForegroundColor Yellow
+    }
     if ($isPublic -and $publicGatewayStarted) {
         Write-Host 'HTTPS gateway and certificate renewal remain running; product startup did not fully complete.' -ForegroundColor Yellow
     }

@@ -18,6 +18,7 @@ from app.service_identity import (
     MOBILE_ANDROID,
     MOBILE_EXTRACT,
     MOBILE_IOS,
+    MOBILE_MALWARE,
     MOBILE_SERVICES,
     VULN,
     current_service,
@@ -64,7 +65,7 @@ def _startup_catalog(*, load_forensic_catalogs: bool) -> None:
         db.close()
 
 
-def _make_lifespan(*, load_forensic_catalogs: bool, probe_perf: bool):
+def _make_lifespan(*, load_forensic_catalogs: bool, probe_perf: bool, recover_pipelines: bool = True):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         import asyncio
@@ -91,7 +92,12 @@ def _make_lifespan(*, load_forensic_catalogs: bool, probe_perf: bool):
         # persisted stage without redoing completed evidence.
         try:
             from app.services.restart_resume import recover_all_firms_for_current_service
-            recovery = await asyncio.wait_for(asyncio.to_thread(recover_all_firms_for_current_service), timeout=20)
+            # Malware Detection owns no extraction pipeline; its own watchdog resumes scans.
+            recovery = (
+                await asyncio.wait_for(asyncio.to_thread(recover_all_firms_for_current_service), timeout=20)
+                if recover_pipelines
+                else "skipped (service owns no forensic pipelines)"
+            )
             log.info("Startup pipeline recovery: %s", recovery)
         except TimeoutError:
             log.warning("Startup pipeline recovery timed out — progressAgent will continue recovery")
@@ -147,14 +153,19 @@ def create_app(service: str | None = None) -> FastAPI:
         MOBILE_IOS: "Aetheris iOS Forensics",
         MOBILE_EXTRACT: "Aetheris Mobile Extraction (Legacy)",
         VULN: "Aetheris Vulnerabilities",
+        MOBILE_MALWARE: "Aetheris Mobile Malware Detection",
     }
-    probe_perf = True
+    probe_perf = svc != MOBILE_MALWARE
     load_catalogs = svc == FORENSIC or svc in MOBILE_SERVICES
 
     app = FastAPI(
         title=titles.get(svc, "Aetheris"),
         version="0.4.0",
-        lifespan=_make_lifespan(load_forensic_catalogs=load_catalogs, probe_perf=probe_perf),
+        lifespan=_make_lifespan(
+            load_forensic_catalogs=load_catalogs,
+            probe_perf=probe_perf,
+            recover_pipelines=svc != MOBILE_MALWARE,
+        ),
     )
     app.add_middleware(
         CORSMiddleware,
@@ -194,6 +205,8 @@ def create_app(service: str | None = None) -> FastAPI:
         _mount_mobile_extract(app)
     elif svc == VULN:
         _mount_vuln(app)
+    elif svc == MOBILE_MALWARE:
+        _mount_malware(app)
 
     return app
 
@@ -250,3 +263,10 @@ def _mount_vuln(app: FastAPI) -> None:
     app.include_router(vuln_extended.router)
     app.include_router(vuln_orchestrator.router)
     app.include_router(scanner_agent.router)
+
+
+def _mount_malware(app: FastAPI) -> None:
+    """Malware Detection mounts only its own router; never jobs/acquisition/artifacts."""
+    from app.malware.router import router as malware_router
+
+    app.include_router(malware_router)

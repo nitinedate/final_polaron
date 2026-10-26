@@ -35,6 +35,13 @@ FIRM_PERMISSIONS: list[tuple[str, str, str, str]] = [
     # Forensic Agentic AI (distinct from Nessus agent:read / agent:manage)
     ("forensic_agent:read", "forensic_agent", "read", "View forensic AI agent runs and threads"),
     ("forensic_agent:run", "forensic_agent", "run", "Invoke forensic AI agents and tools"),
+    # Mobile Malware Detection (mobile-malware service)
+    ("malware:read", "malware", "read", "View mobile malware scans, findings and threat intelligence"),
+    ("malware:scan", "malware", "scan", "Start, cancel and re-run mobile malware scans"),
+    ("malware:review", "malware", "review", "Review findings and record false-positive suppressions"),
+    ("malware:intel_manage", "malware", "intel_manage", "Import and manage IOC feeds"),
+    ("malware:model_manage", "malware", "model_manage", "Register ML models, family references and export training data"),
+    ("malware:remediate", "malware", "remediate", "Remove malware from a consenting phone (incident response; CHANGES the device)"),
 ]
 
 PLATFORM_PERMISSIONS: list[tuple[str, str, str, str]] = [

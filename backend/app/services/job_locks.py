@@ -518,6 +518,8 @@ def _service_lane_prefix() -> str:
         return "mobile"
     if svc == "vuln":
         return "vuln"
+    if svc == "mobile-malware":
+        return "malware"
     return "forensic"
 
 
