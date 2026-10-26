@@ -556,6 +556,13 @@ function Wait-CommonRedisHealthy {
     return $false
 }
 
+function ConvertTo-LinuxShellScript {
+    param([Parameter(Mandatory = $true)][string]$Script)
+    # Here-strings keep this file's CR. Dash treats the CR in "set -eu" as an
+    # option and exits "set: Illegal option -" before redis-check-aof can run.
+    return (($Script -replace "`r", "").TrimEnd() + "`n")
+}
+
 function Backup-RedisVolume {
     param([Parameter(Mandatory = $true)][string]$VolumeName)
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
@@ -632,7 +639,8 @@ elif [ -f /data/appendonly.aof ]; then
 fi
 chown -R redis:redis /data || true
 '@
-    & docker run --rm --user root -v "$($state.Volume):/data" redis:7 sh -c $repairScript
+    $repairCommand = ConvertTo-LinuxShellScript $repairScript
+    & docker run --rm --user root -v "$($state.Volume):/data" redis:7 sh -c $repairCommand
     if ($LASTEXITCODE -ne 0) { Write-Warn 'Redis persistence repair command returned a warning; attempting restart before fallback reset.' }
 
     $redisUpArgs = @($ComposeArgs) + @('up', '-d', '--no-build', '--pull', 'missing', '--force-recreate', 'redis')
@@ -660,7 +668,8 @@ if [ -f /data/appendonly.aof ]; then mv /data/appendonly.aof "/data/recovery-$st
 if [ -f /data/dump.rdb ]; then mv /data/dump.rdb "/data/recovery-$stamp/dump.rdb"; fi
 chown -R redis:redis /data || true
 '@
-    & docker run --rm --user root -v "$($state.Volume):/data" redis:7 sh -c $quarantineScript
+    $quarantineCommand = ConvertTo-LinuxShellScript $quarantineScript
+    & docker run --rm --user root -v "$($state.Volume):/data" redis:7 sh -c $quarantineCommand
     if ($LASTEXITCODE -ne 0) { throw 'Redis persistence quarantine failed; see the Redis logs above.' }
 
     $redisUpArgs = @($ComposeArgs) + @('up', '-d', '--no-build', '--pull', 'missing', '--force-recreate', 'redis')

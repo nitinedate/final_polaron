@@ -40,6 +40,17 @@ def test_redis7_multipart_aof_repair_is_retained():
     assert "redis-check-aof --fix /data/appendonlydir/appendonly.aof.manifest" in TEXT
 
 
+def test_container_shell_strips_windows_carriage_return():
+    assert "function ConvertTo-LinuxShellScript" in TEXT
+    assert '-replace "`r", ""' in TEXT
+    start = TEXT.index("function Repair-CommonRedis")
+    end = TEXT.index("function Ensure-CommonRedisHealthy", start)
+    block = TEXT[start:end]
+    assert block.count("ConvertTo-LinuxShellScript") == 2
+    assert "sh -c $repairScript" not in block
+    assert "sh -c $quarantineScript" not in block
+
+
 def test_https_guidance_is_not_reported_as_universal_root_cause():
     assert "If the error above is HTTPS-related" in TEXT
     assert "If the error names Redis/Postgres/MinIO" in TEXT
